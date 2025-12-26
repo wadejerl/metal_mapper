@@ -1,0 +1,16 @@
+# Serial communication
+pyserial>=3.5
+
+# Web framework and mapping
+flask>=2.3.0
+folium>=0.14.0
+
+# Numerical computing
+numpy>=1.24.0
+
+# Real-time plotting (plot_serial_stream.py)
+pyqtgraph>=0.13.0
+PyQt6>=6.5.0
+
+# GNSS/NMEA message parsing (base_station.py, base_stn.py, run_rover.py)
+pynmeagps>=1.0.0

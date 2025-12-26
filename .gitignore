@@ -1,0 +1,9 @@
+**.elf
+**.o
+**.d
+**.cyclo
+**.su
+**.mk
+**.list
+**.map
+**.pyc
