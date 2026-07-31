@@ -1,0 +1,547 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>{{ study_name }} — Metal Mapper</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="/static/leaflet.css"/>
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    body { background: #111; }
+    #banner   { position:absolute; top:0; left:0; right:0; z-index:1100; }
+    #warnrow  { padding: 2px 14px; background: rgba(0,0,0,0.85); }
+    #warnrow:empty { display:none; }
+    #toolbar {
+      position:absolute; left:0; right:0; height:118px;
+      background:rgba(0,0,0,0.88); color:#fff; padding:6px 14px;
+      z-index:1000; display:flex; align-items:center; gap:14px; overflow:hidden;
+    }
+    #map { position:absolute; left:0; right:0; bottom:0; }
+    .toolbar-sep { width:1px; background:rgba(255,255,255,0.15);
+                   align-self:stretch; margin:4px 0; }
+    #title-block { display:flex; flex-direction:column; gap:4px; min-width:120px; }
+    #title-block .study-name { font-size:14px; font-weight:bold; max-width:150px;
+                               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .slider-row { display:flex; align-items:center; gap:6px; font-size:12px; }
+    .slider-row label { min-width:52px; }
+    .slider-row input[type=range] { width:110px; height:4px; }
+    .slider-row .sv { min-width:40px; font-family:monospace; }
+    .sliders-col { display:flex; flex-direction:column; gap:4px; }
+    /* per-channel toggles + readout */
+    #chan-grid { display:grid; grid-template-columns:repeat(4, auto);
+                 gap:3px 8px; font-size:11px; font-family:monospace; }
+    .ch-cell { display:flex; align-items:center; gap:4px; cursor:pointer;
+               user-select:none; }
+    .ch-val  { min-width:40px; text-align:right; font-weight:bold; }
+    /* info column */
+    .info-col { display:flex; flex-direction:column; gap:3px; font-size:12px;
+                min-width:110px; }
+    #fq-text  { font-weight:bold; }
+    /* timing panel */
+    #timing-panel {
+      background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.18);
+      border-radius:6px; padding:6px 12px; font-size:12px; min-width:170px;
+    }
+    #timing-panel h4 { margin:0 0 5px 0; color:#a5d6a7; font-size:10px;
+                       text-transform:uppercase; letter-spacing:.05em; }
+    .tm-row { display:flex; align-items:center; gap:5px; margin-bottom:3px; }
+    .tm-lbl  { min-width:60px; color:#aaa; }
+    .tm-val  { min-width:32px; font-family:monospace; color:#fff; }
+    .tm-btn  { background:#0d47a1; color:#fff; border:none; padding:1px 7px;
+               border-radius:3px; cursor:pointer; font-size:11px; }
+    .tm-btn:hover { background:#1565c0; }
+    .save-btn { background:#4a148c; color:#fff; border:none; padding:3px 10px;
+                border-radius:3px; cursor:pointer; font-size:11px;
+                font-weight:bold; margin-top:4px; width:100%; }
+    .save-btn:hover { background:#6a1b9a; }
+    #mapToggle { background:#37474f; color:#90a4ae; border:1px solid #546e7a;
+                 padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; }
+    #mapToggle.offline { background:#1a237e; color:#7986cb; border-color:#3949ab; }
+  </style>
+  <script src="/static/leaflet.js"></script>
+  <script src="/static/map_core.js"></script>
+</head>
+<body>
+<div id="banner">
+  <div class="status-banner st-stopped" id="statusBanner">◉ Saved study</div>
+  <div id="warnrow"></div>
+</div>
+
+<div id="toolbar">
+  <button class="btn btn-grey" onclick="location.href='/'">← Studies</button>
+
+  <div id="title-block">
+    <span class="study-name" title="{{ study_name }}">{{ study_name }}</span>
+    {% if is_live %}
+      <span class="badge badge-live">● LIVE</span>
+    {% else %}
+      <span class="badge badge-saved">◉ Saved</span>
+    {% endif %}
+    <button id="mapToggle" onclick="toggleMapLayer()">🌐 Map</button>
+  </div>
+
+  <div class="toolbar-sep"></div>
+
+  <div style="display:flex; flex-direction:column; gap:5px;">
+    <button class="btn btn-blue" onclick="recalibrate()">🎯 Re-zero</button>
+    <button id="pauseBtn" class="btn btn-green" onclick="togglePause()">⏸ Pause</button>
+  </div>
+
+  <div class="sliders-col">
+    <div class="slider-row">
+      <label>− Range</label>
+      <input type="range" id="minusSl" min="5" max="32000" step="5" value="1600"
+             oninput="onSliders()">
+      <span class="sv" id="minusV">1600</span>
+    </div>
+    <div class="slider-row">
+      <label>+ Range</label>
+      <input type="range" id="plusSl" min="5" max="32000" step="5" value="1600"
+             oninput="onSliders()">
+      <span class="sv" id="plusV">1600</span>
+    </div>
+    <div class="slider-row">
+      <label>Offset</label>
+      <input type="range" id="offSl" min="-16000" max="16000" step="10" value="0"
+             oninput="onSliders()">
+      <span class="sv" id="offV">0</span>
+    </div>
+    <div class="slider-row">
+      <label>Size</label>
+      <input type="range" id="sizeSl" min="1" max="6" step="1" value="2"
+             oninput="onSliders()">
+      <span class="sv" id="sizeV">2</span>
+    </div>
+    <div class="slider-row">
+      <label title="Added to the reported heading before drawing the coil array — corrects a GPS whose heading is antenna-baseline-aligned">Rot °</label>
+      <input type="number" id="rotIn" min="-180" max="360" step="1" value="270"
+             style="width:52px;" onchange="onRot()">
+      <button class="btn btn-blue"
+              style="font-size:11px;padding:2px 8px;margin-left:8px;"
+              onclick="saveSliders(this)">💾 Save View</button>
+    </div>
+  </div>
+
+  <div class="toolbar-sep"></div>
+
+  <div>
+    <div style="font-size:10px;color:#888;margin-bottom:3px;">
+      Channels (adc counts)</div>
+    <div id="chan-grid"></div>
+  </div>
+
+  <div class="toolbar-sep"></div>
+
+  <div class="info-col">
+    <div>Points: <span id="ptCount">0</span></div>
+    <div id="fq-text">—</div>
+    <div>Vin: <span id="vinVal">—</span>&nbsp; T: <span id="tempVal">—</span></div>
+    <div id="motion-row" style="display:none;">
+      Motion: <span id="motionVal" style="font-family:monospace;">—</span>
+    </div>
+    <div id="navLine" class="nav-chip nav-down">NAV ○</div>
+  </div>
+
+  <div id="timing-panel" style="display:none;">
+    <h4>Detector Timing</h4>
+    <div class="tm-row">
+      <span class="tm-lbl">Blanking</span>
+      <span class="tm-val" id="blankVal">—</span>µs
+      <button class="tm-btn" onclick="sendCmd('a')">+2</button>
+      <button class="tm-btn" onclick="sendCmd('z')">−2</button>
+    </div>
+    <div class="tm-row">
+      <span class="tm-lbl">RX Window</span>
+      <span class="tm-val" id="winVal">—</span>µs
+      <button class="tm-btn" onclick="sendCmd('s')">+1</button>
+      <button class="tm-btn" onclick="sendCmd('x')">−1</button>
+    </div>
+    <div class="tm-row">
+      <span class="tm-lbl">TX Pulse</span>
+      <span class="tm-val" id="txVal">—</span>µs
+      <button class="tm-btn" onclick="sendCmd('f')">+1</button>
+      <button class="tm-btn" onclick="sendCmd('v')">−1</button>
+    </div>
+    <button class="save-btn" onclick="sendCmd('S')">💾 Save Settings</button>
+  </div>
+</div>
+
+<div id="map"></div>
+
+<script>
+// ── Constants injected from Flask ─────────────────────────────────────────────
+const STUDY_ID      = {{ study_id      | tojson }};
+const IS_LIVE       = {{ is_live       | tojson }};
+const MAP_CENTER    = {{ map_center    | tojson }};
+const GEOJSON_FILES = {{ geojson_files | tojson }};
+
+const CH_COLORS = ['#e6194b','#f58231','#ffe119','#3cb44b',
+                   '#42d4f4','#4363d8','#911eb4','#f032e6'];
+
+// ── State ─────────────────────────────────────────────────────────────────────
+let allPoints  = [];
+let lastId     = 0;
+let isPaused   = false;
+let meta       = {};
+let calib      = {zero8: null, offset: 0, plusRange: 1600, minusRange: 1600,
+                  dotSize: 2};
+let geom       = {spacing_mm: 330, fore_mm: 0, right_mm: 500, rot_deg: 270};
+let adcLabels  = [];
+
+// ── Layout: keep banner/toolbar/map stacked whatever the banner height ───────
+function relayout() {
+  const bannerH  = document.getElementById('banner').offsetHeight;
+  const toolbar  = document.getElementById('toolbar');
+  toolbar.style.top = bannerH + 'px';
+  document.getElementById('map').style.top =
+    (bannerH + toolbar.offsetHeight) + 'px';
+  mapObj.invalidateSize();
+}
+
+// ── Map setup ─────────────────────────────────────────────────────────────────
+const mapObj = L.map('map', {maxZoom: 25}).setView(MAP_CENTER, 20);
+
+const BlankLayer = L.GridLayer.extend({
+  createTile: function() {
+    const s = this.getTileSize();
+    const c = document.createElement('canvas');
+    c.width = s.x; c.height = s.y;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#d8d8d0'; ctx.fillRect(0, 0, s.x, s.y);
+    ctx.strokeStyle = '#c8c8c0'; ctx.lineWidth = 1;
+    ctx.strokeRect(0, 0, s.x, s.y);
+    return c;
+  }
+});
+const blankLayer = new BlankLayer();
+const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+  {maxZoom: 25, maxNativeZoom: 19, attribution: '© OpenStreetMap contributors'});
+
+function applyMapMode(mode) {
+  const btn = document.getElementById('mapToggle');
+  if (mode === 'offline') {
+    osmLayer.remove(); blankLayer.addTo(mapObj);
+    btn.textContent = '✈ Offline'; btn.classList.add('offline');
+  } else {
+    blankLayer.remove(); osmLayer.addTo(mapObj);
+    btn.textContent = '🌐 Map'; btn.classList.remove('offline');
+  }
+  localStorage.setItem('mapMode', mode);
+}
+function toggleMapLayer() {
+  applyMapMode(localStorage.getItem('mapMode') === 'offline' ? 'online' : 'offline');
+}
+applyMapMode(localStorage.getItem('mapMode') || 'online');
+
+L.control.scale({imperial: true, metric: true, maxWidth: 200}).addTo(mapObj);
+
+GEOJSON_FILES.forEach(name => {
+  fetch('/geojson/' + name)
+    .then(r => r.json())
+    .then(d => L.geoJSON(d, {
+      style: {color: '#FF8800', weight: 2, opacity: 0.6, fillOpacity: 0},
+      onEachFeature: (f, l) => { if (f.properties?.Layer) l.bindPopup(f.properties.Layer); }
+    }).addTo(mapObj))
+    .catch(() => {});
+});
+
+const renderer = MM.ChannelRenderer(mapObj);
+const navLayer = MM.NavLayer(mapObj);
+
+// ── Channel toggle grid ───────────────────────────────────────────────────────
+function buildChanGrid() {
+  const grid = document.getElementById('chan-grid');
+  grid.innerHTML = '';
+  for (let ch = 0; ch < 8; ch++) {
+    const cell = document.createElement('label');
+    cell.className = 'ch-cell';
+    cell.title = adcLabels[ch] || ('ch' + ch);
+    cell.innerHTML =
+      `<input type="checkbox" id="chk${ch}" checked>` +
+      `<span style="color:${CH_COLORS[ch]};">${ch}</span>` +
+      `<span class="ch-val" id="chv${ch}">—</span>`;
+    cell.querySelector('input').addEventListener('change', e => {
+      renderer.setVisible(ch, e.target.checked);
+    });
+    grid.appendChild(cell);
+  }
+}
+
+function updateChanReadout(adc) {
+  if (!adc) return;
+  for (let ch = 0; ch < 8; ch++) {
+    const el = document.getElementById('chv' + ch);
+    if (!el || adc[ch] == null) continue;
+    el.textContent = adc[ch];
+    const zero = calib.zero8 ? calib.zero8[ch] : null;
+    el.style.color = MM.colorFor(adc[ch], zero, calib.offset,
+                                 calib.plusRange, calib.minusRange);
+  }
+}
+
+// ── Status banner (server-derived truth; render only) ─────────────────────────
+function updateStatus(st) {
+  const b = document.getElementById('banner');
+  const sb = document.getElementById('statusBanner');
+  sb.className = 'status-banner st-' + st.state;
+  if (st.state === 'recording') {
+    sb.textContent = '● RECORDING';
+  } else if (st.state === 'not_recording') {
+    sb.textContent = '▲ LIVE — NOT RECORDING: ' + MM.reasonText(st.reason);
+  } else if (st.state === 'wedged') {
+    sb.textContent = '✖ DAEMON WEDGED — no heartbeat for ' +
+                     (st.live_age_s != null ? st.live_age_s + ' s' : '?');
+  } else {
+    sb.textContent = '◉ Saved study';
+  }
+
+  const wr = document.getElementById('warnrow');
+  wr.innerHTML = '';
+  (st.warnings || []).forEach(w => {
+    const s = document.createElement('span');
+    s.className = 'warn-pill';
+    s.textContent = '⚠ ' + w;
+    wr.appendChild(s);
+  });
+
+  for (const [key, id] of [['blanking_us', 'blankVal'],
+                           ['rx_window_us', 'winVal'],
+                           ['tx_pulse_us', 'txVal']]) {
+    if (st.timing && st.timing[key] != null) {
+      document.getElementById(id).textContent = st.timing[key];
+    }
+  }
+
+  if (st.motion_mm != null) {
+    document.getElementById('motion-row').style.display = 'block';
+    const el = document.getElementById('motionVal');
+    if (st.motion_paused === '1') {
+      el.textContent = 'PAUSED'; el.style.color = '#ff8800';
+    } else {
+      el.textContent = Math.round(parseFloat(st.motion_mm)) + ' mm/pt';
+      el.style.color = '#a5d6a7';
+    }
+  }
+
+  if (st.live) {
+    updateChanReadout(st.live.adc);
+    const fq = document.getElementById('fq-text');
+    fq.textContent = MM.fixLabel(st.live.fix);
+    fq.style.color = MM.fixColor(st.live.fix);
+    if (st.live.vin != null)
+      document.getElementById('vinVal').textContent = st.live.vin.toFixed(2) + ' V';
+    if (st.live.temp != null)
+      document.getElementById('tempVal').textContent = st.live.temp.toFixed(1) + ' °C';
+  }
+  relayout();
+}
+
+function updateNav(nv) {
+  navLayer.update(nv);
+  const el = document.getElementById('navLine');
+  if (nv && nv.connected && nv.lat != null && !nv.stale) {
+    el.className = 'nav-chip nav-ok';
+    el.textContent = 'NAV ● ' + MM.fixLabel(nv.quality) +
+      (nv.speed_mps != null ? ' · ' + (nv.speed_mps * 3.6).toFixed(1) + ' km/h' : '');
+  } else if (nv && nv.connected) {
+    el.className = 'nav-chip nav-down';
+    el.textContent = 'NAV ◐ connected, no fix';
+  } else {
+    el.className = 'nav-chip nav-down';
+    el.textContent = 'NAV ○ ' + ((nv && nv.error) ? nv.error : 'down');
+  }
+}
+
+// ── Calibration / sliders ─────────────────────────────────────────────────────
+function readSliders() {
+  calib.minusRange = parseFloat(document.getElementById('minusSl').value);
+  calib.plusRange  = parseFloat(document.getElementById('plusSl').value);
+  calib.offset     = parseFloat(document.getElementById('offSl').value);
+  calib.dotSize    = parseInt(document.getElementById('sizeSl').value);
+  document.getElementById('minusV').textContent = calib.minusRange;
+  document.getElementById('plusV').textContent  = calib.plusRange;
+  document.getElementById('offV').textContent   = calib.offset;
+  document.getElementById('sizeV').textContent  = calib.dotSize;
+}
+
+function setSlider(id, valId, v) {
+  document.getElementById(id).value = v;
+  document.getElementById(valId).textContent = v;
+}
+
+function onSliders() {
+  readSliders();
+  renderer.setCalib(calib);
+  renderer.renderAll(allPoints);
+}
+
+function onRot() {
+  const v = parseFloat(document.getElementById('rotIn').value);
+  geom.rot_deg = Number.isFinite(v) ? v : 0;
+  renderer.setGeometry(geom);
+  renderer.renderAll(allPoints);
+}
+
+function autoZero(points) {
+  // Seed per-channel zeros from the first 10 points when nothing is saved.
+  if (!points.length) return null;
+  const n = Math.min(10, points.length);
+  const z = new Array(8).fill(0);
+  for (let i = 0; i < n; i++)
+    for (let ch = 0; ch < 8; ch++) z[ch] += points[i].adc[ch];
+  return z.map(v => Math.round(v / n * 10) / 10);
+}
+
+function recalibrate() {
+  fetch('/recalibrate/' + STUDY_ID, {method: 'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if (!d.success) return;
+      calib.zero8 = d.zero8;
+      renderer.setCalib(calib);
+      renderer.renderAll(allPoints);
+    });
+}
+
+function togglePause() {
+  isPaused = !isPaused;
+  const btn = document.getElementById('pauseBtn');
+  btn.textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+  btn.style.background = isPaused ? '#c62828' : '';
+}
+
+function saveSliders(btn) {
+  fetch('/settings/' + STUDY_ID, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      plus_range:     calib.plusRange,
+      minus_range:    calib.minusRange,
+      offset:         calib.offset,
+      dot_size:       calib.dotSize,
+      channels:       renderer.getVisible(),
+      zero8:          calib.zero8,
+      heading_offset: geom.rot_deg,
+    })
+  }).then(r => r.json()).then(d => {
+    if (d.ok && btn) {
+      const orig = btn.textContent;
+      btn.textContent = '✓ Saved';
+      setTimeout(() => { btn.textContent = orig; }, 1200);
+    }
+  }).catch(() => {});
+}
+
+function sendCmd(byte) {
+  fetch('/cmd', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cmd: byte})
+  }).catch(() => {});
+  // Panel values refresh via the SSE status ticks.
+}
+
+// ── Initial load, then SSE ────────────────────────────────────────────────────
+fetch('/data/' + STUDY_ID)
+  .then(r => r.json())
+  .then(d => {
+    allPoints = d.points;
+    lastId    = d.last_id;
+    meta      = d.meta || {};
+    adcLabels = (meta.adc_order || '').split(',');
+    buildChanGrid();
+
+    geom = MM.geomFromMeta(meta);         // includes saved sl_heading_offset_deg
+    document.getElementById('rotIn').value = geom.rot_deg;
+    renderer.setGeometry(geom);
+
+    // Restore persisted view settings; fall back to auto-zero.
+    const mf = k => meta[k] != null ? parseFloat(meta[k]) : null;
+    if (mf('sl_minus_range') != null) setSlider('minusSl', 'minusV', mf('sl_minus_range'));
+    if (mf('sl_plus_range')  != null) setSlider('plusSl', 'plusV', mf('sl_plus_range'));
+    if (mf('sl_offset')      != null) setSlider('offSl', 'offV', mf('sl_offset'));
+    if (mf('sl_dot_size')    != null) setSlider('sizeSl', 'sizeV', mf('sl_dot_size'));
+    readSliders();
+    try { calib.zero8 = meta.sl_zero8 ? JSON.parse(meta.sl_zero8) : null; }
+    catch (e) { calib.zero8 = null; }
+    if (!calib.zero8) calib.zero8 = autoZero(allPoints);
+    renderer.setCalib(calib);
+
+    let chans = null;
+    try { chans = meta.sl_channels ? JSON.parse(meta.sl_channels) : null; }
+    catch (e) {}
+    if (chans) chans.forEach((on, ch) => {
+      document.getElementById('chk' + ch).checked = on;
+      renderer.setVisible(ch, on);
+    });
+
+    renderer.renderAll(allPoints);
+    document.getElementById('ptCount').textContent = allPoints.length;
+
+    if (allPoints.length) {
+      const latest = allPoints[allPoints.length - 1];
+      updateChanReadout(latest.adc);
+      mapObj.setView([latest.lat, latest.lon], mapObj.getZoom());
+    }
+
+    updateStatus(d.status);
+    updateNav(d.nav);
+    document.getElementById('timing-panel').style.display =
+      (d.status.state !== 'stopped') ? 'block' : 'none';
+
+    openSSE();
+    relayout();
+  });
+
+// SSE runs for saved studies too: it carries nav fixes and status flips
+// (e.g. a daemon starting on this study while the page is open).
+function openSSE() {
+  const es = new EventSource('/stream/' + STUDY_ID + '?since_id=' + lastId);
+  es.onmessage = function(e) {
+    const d = JSON.parse(e.data);
+    // Belt & braces vs. the server's Last-Event-ID resume: never re-append
+    // a row we already hold (a reconnect replay would otherwise duplicate
+    // every dot on the map).
+    const rows = (d.rows || []).filter(p => p.id > lastId);
+    if (rows.length) {
+      lastId = rows[rows.length - 1].id;
+      const needSeed = !calib.zero8;
+      rows.forEach(p => allPoints.push(p));
+      if (needSeed && (calib.zero8 = autoZero(allPoints))) {
+        // First rows of a fresh study: seed zeros, then draw everything
+        // through the seeded palette (appendLive would have styled these
+        // rows grey with no later restyle).
+        renderer.setCalib(calib);
+        renderer.renderAll(allPoints);
+      } else {
+        rows.forEach(p => renderer.appendLive(p));
+      }
+      document.getElementById('ptCount').textContent = allPoints.length;
+      const latest = rows[rows.length - 1];
+      updateChanReadout(latest.adc);
+      if (!isPaused) mapObj.panTo([latest.lat, latest.lon],
+                                  {animate: true, duration: 0.25});
+    }
+    if (d.status) {
+      updateStatus(d.status);
+      document.getElementById('timing-panel').style.display =
+        (d.status.state !== 'stopped') ? 'block' : 'none';
+    }
+    if (d.nav) updateNav(d.nav);
+  };
+  es.onerror = () => {
+    // Transport drops auto-reconnect (resuming via Last-Event-ID). A non-200
+    // response (nginx 502 during a server restart) closes the stream for
+    // good — reopen ourselves with the CURRENT lastId or the view silently
+    // freezes while still saying RECORDING.
+    console.warn('[SSE] connection error');
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(openSSE, 2000);
+    }
+  };
+}
+
+window.addEventListener('resize', relayout);
+</script>
+</body>
+</html>

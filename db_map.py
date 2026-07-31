@@ -1,46 +1,138 @@
 #!/usr/bin/env python3
 """
-db_map.py — Metal Mapper web front-end with SQLite3 study storage.
+db_map.py — Metal Mapper web UI (detector3 schema, schema_version 3).
 
-Lists saved studies from ~/metal_mapper/studies/ and displays them on an
-interactive Leaflet map.  When a live recording daemon is running the map
-updates in real time and the detector timing controls (blanking / rx window)
-are shown.
+Single Flask app, multiple views over one core:
+    /               study list + daemon/system control      (engineering)
+    /view/<id>      full-control map view                    (engineering)
+    /run            operator kiosk view, 800x480             (planned next)
 
-Usage:
-    python db_map.py [--web-port 5000]
+The core reads study DBs written by serial_daemon.py (points/live/meta),
+derives ALL status truth server-side in derive_status() — views render
+it, they never re-derive — and folds in the optional nav-GPS subsystem
+(nav_gps.py, NMEA over TCP). The detector daemon and the nav GPS are
+each independently optional: with neither present this is a saved-study
+viewer, which is a fully supported mode.
+
+Configuration lives in ~/metal_mapper/config.json (serial_port, baud,
+nav_host, nav_port, studies_dir) and is editable from the index page;
+CLI flags override for bench runs, e.g. on a Mac with the hardware:
+
+    python3 db_map.py --serial-port /dev/cu.usbmodem1103 \\
+                      --nav-host 192.168.1.50 --nav-port 50012
+
+Deployment (Pi): gunicorn 'db_map:app' — workers=1, gthread. Every open
+map view holds one SSE thread, and a client that vanishes without FIN
+(WiFi drop, laptop lid) pins its thread until the next write fails —
+size threads well above the expected view count: 8 minimum, 16 is cheap.
 """
 
 import argparse
 import datetime
 import json
+import math
 import os
 import re
 import signal
 import sqlite3
 import subprocess
 import sys
-import time
 import threading
+import time
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
 
-from flask import (Flask, Response, jsonify, redirect,
-                   render_template_string, request, send_file,
+from flask import (Flask, Response, abort, jsonify, redirect,
+                   render_template, request, send_file,
                    stream_with_context, url_for)
 
-STUDIES_DIR   = Path.home() / 'metal_mapper' / 'studies'
+from nav_gps import NavReader
+
 CONFIG_FILE   = Path.home() / 'metal_mapper' / 'config.json'
 FIFO_PATH     = '/tmp/metal_detector_cmd.fifo'
 PID_FILE      = '/tmp/metal_detector_daemon.pid'
 DAEMON_SCRIPT = Path(__file__).parent / 'serial_daemon.py'
 STATIC_DIR    = Path(__file__).parent / 'static'
 
-_LEAFLET_VER = '1.9.4'
+LIVE_STALE_S  = 3.0    # live.updated_at older than this + PID alive = wedged
+SSE_PERIOD_S  = 0.5
+
+DEFAULT_CONFIG = {
+    'serial_port': '/dev/ttyACM0',
+    'baud':        460800,
+    'nav_host':    '127.0.0.1',
+    'nav_port':    50012,
+    'studies_dir': str(Path.home() / 'metal_mapper' / 'studies'),
+}
+
+# CLI overrides (bench runs); never written back to config.json.
+_cli_overrides = {}
+
+_config_lock = threading.Lock()
+
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    try:
+        loaded = json.loads(CONFIG_FILE.read_text())
+        if isinstance(loaded, dict):
+            cfg.update(loaded)
+    except Exception:
+        pass
+    cfg.update(_cli_overrides)
+    # A hand-edited config.json must never take the app down (the saved-study
+    # viewer has to work with NO working config): coerce or fall back per key.
+    for key in ('serial_port', 'nav_host', 'studies_dir'):
+        if not isinstance(cfg.get(key), str) or not cfg[key]:
+            cfg[key] = DEFAULT_CONFIG[key]
+    for key, hi in (('baud', 100_000_000), ('nav_port', 65535)):
+        try:
+            cfg[key] = int(cfg[key])
+            if not (0 < cfg[key] <= hi):
+                raise ValueError
+        except (TypeError, ValueError):
+            cfg[key] = DEFAULT_CONFIG[key]
+    return cfg
+
+
+def save_config(**kwargs):
+    """Merge kwargs into config.json. Returns False instead of raising on an
+    unwritable filesystem — persistence is best-effort, never a 500. The
+    write is tmp+rename so a power cut can't leave a truncated config."""
+    with _config_lock:
+        try:
+            cfg = json.loads(CONFIG_FILE.read_text())
+            if not isinstance(cfg, dict):
+                cfg = {}
+        except Exception:
+            cfg = {}
+        cfg.update(kwargs)
+        try:
+            CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CONFIG_FILE.with_suffix('.tmp')
+            tmp.write_text(json.dumps(cfg, indent=2))
+            os.replace(tmp, CONFIG_FILE)
+            return True
+        except OSError as e:
+            print(f'[db_map] WARNING: could not write {CONFIG_FILE}: {e}',
+                  flush=True)
+            return False
+
+
+def studies_dir():
+    d = Path(load_config()['studies_dir'])
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# ── Leaflet bootstrap (offline-friendly once cached) ─────────────────────────
+
+_LEAFLET_VER  = '1.9.4'
 _LEAFLET_BASE = f'https://unpkg.com/leaflet@{_LEAFLET_VER}/dist'
 
+
 def ensure_leaflet():
-    """Download Leaflet JS+CSS into static/ if not already present."""
     STATIC_DIR.mkdir(exist_ok=True)
     for fname in ('leaflet.js', 'leaflet.css'):
         dest = STATIC_DIR / fname
@@ -50,11 +142,14 @@ def ensure_leaflet():
             try:
                 urllib.request.urlretrieve(url, dest)
             except Exception as e:
-                print(f'[db_map] WARNING: could not download {fname}: {e}', flush=True)
+                print(f'[db_map] WARNING: could not download {fname}: {e}',
+                      flush=True)
+
 
 ensure_leaflet()
 
 _VERSION_FILE = Path(__file__).parent / 'version.txt'
+
 
 def _git_hash():
     try:
@@ -71,28 +166,48 @@ def _git_hash():
     except Exception:
         return 'unknown'
 
+
 GIT_HASH = _git_hash()
-
-
-def load_config():
-    try:
-        return json.loads(CONFIG_FILE.read_text())
-    except Exception:
-        return {}
-
-
-def save_config(**kwargs):
-    cfg = load_config()
-    cfg.update(kwargs)
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2))
 
 app = Flask(__name__)
 
-# In-memory calibration state keyed by study_id.
-# Resets on server restart — user re-zeros via button.
-_calib: dict      = {}
-_calib_lock       = threading.Lock()
+
+@app.before_request
+def _reject_cross_origin_posts():
+    """Browsers attach an Origin header to cross-site POSTs. This UI is
+    same-origin only, so a mismatched Origin means some other web page is
+    trying to drive the instrument (stop a recording, retune the detector).
+    Non-browser clients send no Origin and are unaffected.
+
+    Hostnames only — ports are deliberately ignored. A proxy that strips
+    the port from Host (nginx's $host, ssh -L tunnels) would otherwise 403
+    every legitimate POST, and a same-host-different-port 'attacker' is
+    already on the instrument itself."""
+    if request.method == 'POST':
+        origin = request.headers.get('Origin')
+        if origin:
+            o_host = (urlparse(origin).hostname or '').lower()
+            r_host = (urlparse('//' + request.host).hostname or '').lower()
+            if o_host != r_host:
+                abort(403)
+
+
+# ── Nav subsystem (lazy singleton — one reader thread per worker) ────────────
+
+_nav = None
+_nav_lock = threading.Lock()
+
+
+def nav():
+    global _nav
+    if _nav is None:
+        with _nav_lock:            # two first requests must not both start()
+            if _nav is None:
+                cfg = load_config()
+                reader = NavReader(cfg['nav_host'], cfg['nav_port'])
+                reader.start()
+                _nav = reader
+    return _nav
 
 
 # ── Template filters ──────────────────────────────────────────────────────────
@@ -110,7 +225,7 @@ def _ts_fmt(ts):
         return '—'
 
 
-# ── Daemon / liveness helpers ─────────────────────────────────────────────────
+# ── Daemon / liveness ─────────────────────────────────────────────────────────
 
 def get_daemon_status():
     """Read PID file; return {running, pid, db_path}."""
@@ -118,6 +233,14 @@ def get_daemon_status():
         content = Path(PID_FILE).read_text().strip()
         pid_str, db_path = content.split(':', 1)
         pid = int(pid_str)
+        try:
+            # A daemon we spawned that died hard (OOM, kill -9) is a zombie
+            # child of THIS process and would pass the kill(pid, 0) probe
+            # forever, wedging start/stop. Reap it here.
+            if os.waitpid(pid, os.WNOHANG)[0] == pid:
+                raise ProcessLookupError
+        except ChildProcessError:
+            pass                 # not our child — probe liveness normally
         os.kill(pid, 0)          # raises OSError if the process is gone
         return {'running': True, 'pid': pid, 'db_path': os.path.abspath(db_path)}
     except Exception:
@@ -125,19 +248,30 @@ def get_daemon_status():
 
 
 def is_live(db_path):
-    """True iff the daemon is actively writing to this specific db file."""
+    """True iff the daemon process is attached to this specific db file.
+    (Says nothing about whether data is flowing — derive_status does.)"""
     s = get_daemon_status()
     return s['running'] and s['db_path'] == os.path.abspath(str(db_path))
 
 
-# ── Database helpers ──────────────────────────────────────────────────────────
+# ── Study DB access ───────────────────────────────────────────────────────────
+
+_STUDY_ID_RE = re.compile(r'[A-Za-z0-9_\-.]+')
+
+
+def safe_study_id(study_id):
+    """Study ids map straight to filenames — reject anything path-like."""
+    if not _STUDY_ID_RE.fullmatch(study_id) or '..' in study_id:
+        abort(404)
+    return study_id
+
 
 def get_db_path(study_id):
-    return str(STUDIES_DIR / f'{study_id}.db')
+    return str(studies_dir() / f'{safe_study_id(study_id)}.db')
 
 
 def db_ro(db_path):
-    """Open db read-only; safe to use concurrently with the WAL-mode daemon."""
+    """Read-only open; safe concurrently with the WAL-mode daemon."""
     return sqlite3.connect(f'file:{db_path}?mode=ro', uri=True)
 
 
@@ -151,738 +285,184 @@ def read_meta(db_path):
         return {}
 
 
+_POINT_COLS = ('id', 'ts', 'lat', 'lon', 'heading', 'fix',
+               'adc0', 'adc1', 'adc2', 'adc3', 'adc4', 'adc5', 'adc6', 'adc7',
+               'gps_ts', 'vin', 'temp')
+
+
 def load_points(db_path, since_id=0):
-    """Return rows as dicts with value normalized to [0, 1] (adc_raw / 65535)."""
+    """Points as dicts; adc packed into a list, values left as raw counts —
+    all channel math (zeros, ranges, coil positions) happens client-side."""
     try:
         conn = db_ro(db_path)
         rows = conn.execute(
-            'SELECT id,ts,lat,lon,fix_quality,adc_raw,gps_ts '
-            'FROM detections WHERE id > ? ORDER BY id',
-            (since_id,)
-        ).fetchall()
+            f'SELECT {",".join(_POINT_COLS)} FROM points WHERE id > ? ORDER BY id',
+            (since_id,)).fetchall()
         conn.close()
     except Exception:
         return []
     return [
         {
-            'id':          r[0],
-            'ts':          r[1],
-            'lat':         r[2],
-            'lon':         r[3],
-            'fix_quality': r[4],
-            'value':       (r[5] or 0) / 65535.0,
-            'gps_ts':      r[6],
+            'id': r[0], 'ts': r[1], 'lat': r[2], 'lon': r[3],
+            'heading': r[4], 'fix': r[5],
+            'adc': list(r[6:14]),
+            'gps_ts': r[14], 'vin': r[15], 'temp': r[16],
         }
         for r in rows
     ]
 
 
-# ── Calibration state ─────────────────────────────────────────────────────────
-
-def get_calib(study_id):
-    with _calib_lock:
-        if study_id not in _calib:
-            _calib[study_id] = {
-                'zero_value':  None,
-                'plus_range':  0.04,
-                'minus_range': 0.04,
-            }
-        return dict(_calib[study_id])
+_LIVE_COLS = ('updated_at', 'data_at', 'lat', 'lon', 'fix', 'heading',
+              'adc0', 'adc1', 'adc2', 'adc3', 'adc4', 'adc5', 'adc6', 'adc7',
+              'vin', 'temp', 'gps_ts', 'recording', 'reason')
 
 
-def set_calib(study_id, **kwargs):
-    with _calib_lock:
-        if study_id not in _calib:
-            _calib[study_id] = {'zero_value': None, 'plus_range': 0.04, 'minus_range': 0.04}
-        _calib[study_id].update(kwargs)
+def read_live(db_path):
+    """The daemon's single live row, or None (pre-first-heartbeat)."""
+    try:
+        conn = db_ro(db_path)
+        r = conn.execute(
+            f'SELECT {",".join(_LIVE_COLS)} FROM live WHERE id=1').fetchone()
+        conn.close()
+    except Exception:
+        return None
+    if r is None:
+        return None
+    d = dict(zip(_LIVE_COLS, r))
+    d['adc'] = [d.pop(f'adc{i}') for i in range(8)]
+    return d
 
+
+# ── Status derivation — THE single source of truth for every view ────────────
+
+TIMING_KEYS = ('blanking_us', 'rx_window_us', 'tx_pulse_us')
+
+
+def derive_status(db_path, meta=None):
+    """Detector-side status for one study db. Views render this verbatim.
+
+    state: 'recording' | 'not_recording' | 'wedged' | 'stopped'
+      - wedged: daemon PID alive & attached but live.updated_at is stale
+        (or the row never appeared) — restart territory.
+      - stopped: no daemon attached to this db (saved-study view).
+    """
+    if meta is None:
+        meta = read_meta(db_path)
+    live = read_live(db_path)
+    now = time.time()
+    mine = is_live(db_path)
+
+    if mine:
+        if live is None or now - live['updated_at'] > LIVE_STALE_S:
+            state = 'wedged'
+        elif live['recording']:
+            state = 'recording'
+        else:
+            state = 'not_recording'
+    else:
+        state = 'stopped'
+
+    warnings = []
+    if meta:
+        if meta.get('gps_id') == '?' or meta.get('info_ok') == '0':
+            warnings.append('GPS / unit-identity failure — info line incomplete '
+                            'or GPS module not answering')
+        for kind in ('timing', 'geometry', 'fire'):
+            v = meta.get(kind + '_changed')
+            if v:
+                diffs = v.split(':', 1)[1] if ':' in v else v
+                warnings.append(f'{kind} changed mid-study ({diffs}) — '
+                                f'data before/after does not line up')
+
+    timing = {k: meta.get(k + '_current') or meta.get(k) for k in TIMING_KEYS}
+
+    return {
+        'state':         state,
+        'reason':        (live or {}).get('reason', ''),
+        'live':          live,
+        'live_age_s':    round(now - live['updated_at'], 1) if live else None,
+        'warnings':      warnings,
+        'timing':        timing,
+        'motion_mm':     meta.get('motion_mm'),
+        'motion_paused': meta.get('motion_paused'),
+    }
+
+
+# ── Coil geometry (Python reference; static/map_core.js mirrors this) ────────
+#
+# ASSUMED ARRAY MODEL: the 8 coils sit in a line PERPENDICULAR to the
+# direction of travel (cross-track), centered on the array center, which is
+# (coil_offset_fore_mm forward, coil_offset_right_mm starboard) of the GPS
+# antenna. adc index i = coil i, laid out port -> starboard, so coil 0 is
+# far left and coil 7 far right at offsets (i - 3.5) * spacing.
+#
+# The detector GPS may report heading along its antenna baseline rather than
+# the direction of travel — mounting-dependent, unknown until field test.
+# heading_off_deg (per-study meta sl_heading_offset_deg, set from the view)
+# is added to the reported heading before any of this math to absorb that.
+
+_M_PER_DEG_LAT = 111320.0
+
+
+def coil_positions(lat, lon, heading_deg, spacing_mm, fore_mm, right_mm,
+                   heading_off_deg=0.0):
+    """[[lat, lon] x 8] for one antenna fix. heading in true degrees."""
+    h = math.radians(heading_deg + heading_off_deg)
+    fwd_n, fwd_e = math.cos(h), math.sin(h)          # forward unit (N, E)
+    rgt_n, rgt_e = -math.sin(h), math.cos(h)         # starboard unit (N, E)
+    fore_m = fore_mm / 1000.0
+    m_per_deg_lon = _M_PER_DEG_LAT * math.cos(math.radians(lat))
+    out = []
+    for i in range(8):
+        right_m = (right_mm + (i - 3.5) * spacing_mm) / 1000.0
+        d_n = fore_m * fwd_n + right_m * rgt_n
+        d_e = fore_m * fwd_e + right_m * rgt_e
+        out.append([lat + d_n / _M_PER_DEG_LAT,
+                    lon + d_e / m_per_deg_lon])
+    return out
+
+
+# ── Study list ────────────────────────────────────────────────────────────────
 
 def list_studies():
-    STUDIES_DIR.mkdir(parents=True, exist_ok=True)
     studies = []
-    for p in sorted(STUDIES_DIR.glob('*.db'), key=lambda x: x.stat().st_mtime, reverse=True):
-        sid = p.stem
+    for p in sorted(studies_dir().glob('*.db'),
+                    key=lambda x: x.stat().st_mtime, reverse=True):
         try:
-            conn    = db_ro(str(p))
-            meta    = dict(conn.execute('SELECT key,value FROM meta').fetchall())
-            count   = conn.execute('SELECT COUNT(*) FROM detections').fetchone()[0]
-            latest  = conn.execute(
-                'SELECT ts FROM detections ORDER BY id DESC LIMIT 1'
-            ).fetchone()
+            conn = db_ro(str(p))
+            meta = dict(conn.execute('SELECT key,value FROM meta').fetchall())
+            count = conn.execute('SELECT COUNT(*) FROM points').fetchone()[0]
+            latest = conn.execute(
+                'SELECT ts FROM points ORDER BY id DESC LIMIT 1').fetchone()
             conn.close()
         except Exception:
             meta, count, latest = {}, 0, None
         studies.append({
-            'id':         sid,
-            'name':       meta.get('study_name', sid),
+            'id':         p.stem,
+            'name':       meta.get('study_name', p.stem),
             'created_at': meta.get('created_at', p.stat().st_ctime),
             'count':      count,
             'latest_ts':  latest[0] if latest else None,
             'live':       is_live(str(p)),
+            'fw':         meta.get('fw_git_hash', ''),
         })
     return studies
 
 
-# ── Index page ────────────────────────────────────────────────────────────────
-
-INDEX_TMPL = """<!DOCTYPE html>
-<html>
-<head>
-  <title>Metal Mapper — Studies</title>
-  <meta charset="utf-8">
-  <style>
-    body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee;
-           margin: 0; padding: 24px; }
-    h1   { color: #e94560; margin-top: 0; }
-    .daemon-box { padding: 8px 16px; border-radius: 6px; display: inline-flex;
-                  align-items: center; gap: 16px; margin-bottom: 22px;
-                  font-weight: bold; font-size: 13px; }
-    .daemon-on  { background: #1b5e20; color: #a5d6a7; }
-    .daemon-off { background: #37474f; color: #90a4ae; }
-    table { width: 100%; border-collapse: collapse; margin-bottom: 28px; }
-    th { background: #16213e; color: #a0a0c0; text-align: left; padding: 10px; }
-    td { padding: 9px 10px; border-bottom: 1px solid #252545; }
-    tr:hover td { background: #1f2b50; }
-    a.view-btn { background: #0f3460; color: #e94560; padding: 4px 14px;
-                 border-radius: 4px; text-decoration: none; font-size: 13px; }
-    a.view-btn:hover { background: #e94560; color: #fff; }
-    .live-badge { background: #1b5e20; color: #a5d6a7; padding: 2px 8px;
-                  border-radius: 10px; font-size: 11px; font-weight: bold;
-                  margin-left: 6px; }
-    .new-study { background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
-                 padding: 20px; max-width: 480px; }
-    .new-study h2 { color: #e94560; margin-top: 0; font-size: 16px; }
-    .new-study label { display: block; margin-top: 12px; color: #aaa; font-size: 12px; }
-    .new-study input { width: 100%; box-sizing: border-box; padding: 7px; margin-top: 4px;
-                       background: #0f3460; border: 1px solid #2a4080; color: #eee;
-                       border-radius: 4px; font-size: 14px; }
-    .new-study button { margin-top: 16px; background: #e94560; color: #fff; border: none;
-                        padding: 9px 24px; border-radius: 4px; cursor: pointer;
-                        font-size: 14px; font-weight: bold; }
-    .new-study button:hover { background: #c73652; }
-    .stop-btn { background: #b71c1c; color: #fff; border: none; padding: 5px 12px;
-                border-radius: 4px; cursor: pointer; font-size: 12px; }
-    .err { color: #ef9a9a; font-size: 13px; margin-top: 8px; }
-    .empty { color: #555; text-align: center; padding: 20px; }
-  </style>
-</head>
-<body>
-<h1>Metal Mapper</h1>
-<div style="color:#555; font-size:11px; font-family:monospace; margin-top:-14px; margin-bottom:18px;">{{ git_hash }}</div>
-
-{% set ds = daemon_status %}
-{% if ds.running %}
-  <div class="daemon-box daemon-on">
-    ● Daemon running — {{ ds.db_path | basename }}
-    <form method="post" action="/stop_daemon" style="display:inline;">
-      <button class="stop-btn">■ Stop</button>
-    </form>
-  </div>
-{% else %}
-  <div class="daemon-box daemon-off">○ No daemon running</div>
-{% endif %}
-
-{% if not ds.running %}
-<div class="new-study">
-  <h2>Start New Study</h2>
-  <form method="post" action="/start_daemon">
-    <label>Study Name</label>
-    <input name="study_name" value="{{ default_study_name }}">
-    <label>Serial Port</label>
-    <input name="port" value="{{ default_port }}" placeholder="/dev/ttyACM0">
-    <label>Min Distance (mm)</label>
-    <input name="min_dist" value="20" type="number" min="1" max="10000">
-    <button type="submit">▶ Start Recording</button>
-  </form>
-  {% if error %}<div class="err">{{ error }}</div>{% endif %}
-</div>
-{% endif %}
-
-<table>
-  <tr>
-    <th>Study</th>
-    <th>Created</th>
-    <th>Points</th>
-    <th>Last Activity</th>
-    <th></th>
-  </tr>
-  {% for s in studies %}
-  <tr>
-    <td>
-      {{ s.name }}
-      {% if s.live %}<span class="live-badge">● LIVE</span>{% endif %}
-    </td>
-    <td>{{ s.created_at | ts_fmt }}</td>
-    <td>{{ s.count }}</td>
-    <td>{{ s.latest_ts | ts_fmt if s.latest_ts else '—' }}</td>
-    <td><a class="view-btn" href="/view/{{ s.id }}">View Map</a></td>
-  </tr>
-  {% else %}
-  <tr><td colspan="5" class="empty">No studies yet — start one below.</td></tr>
-  {% endfor %}
-</table>
-
-</body>
-</html>"""
-
-
-# ── Map view page ─────────────────────────────────────────────────────────────
-
-VIEW_TMPL = """<!DOCTYPE html>
-<html>
-<head>
-  <title>{{ study_name }} — Metal Mapper</title>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="/static/leaflet.css"/>
-  <style>
-    body { margin:0; padding:0; font-family:Arial,sans-serif; background:#111; }
-    #map { position:absolute; top:120px; left:0; right:0; bottom:0; }
-    #toolbar {
-      position:absolute; top:0; left:0; right:0; height:120px;
-      background:rgba(0,0,0,0.88); color:#fff; padding:8px 14px;
-      z-index:1000; display:flex; align-items:center; gap:14px; overflow:hidden;
-    }
-    .toolbar-sep { width:1px; background:rgba(255,255,255,0.15); align-self:stretch; margin:4px 0; }
-    /* title / badges */
-    #title-block { display:flex; flex-direction:column; gap:4px; min-width:120px; }
-    #title-block .study-name { font-size:14px; font-weight:bold; max-width:160px;
-                               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .live-badge   { background:#1b5e20; color:#a5d6a7; padding:2px 8px;
-                    border-radius:10px; font-size:11px; font-weight:bold; display:inline-block; }
-    .saved-badge  { background:#37474f; color:#90a4ae; padding:2px 8px;
-                    border-radius:10px; font-size:11px; display:inline-block; }
-    /* buttons */
-    .btn { border:none; padding:5px 12px; border-radius:4px; cursor:pointer;
-           font-size:12px; font-weight:bold; color:#fff; }
-    .btn-green { background:#2e7d32; }
-    .btn-blue  { background:#1565c0; }
-    .btn-stack { display:flex; flex-direction:column; gap:5px; }
-    /* range bar */
-    .range-bar { width:440px; height:13px; position:relative;
-                 border:2px solid #fff; border-radius:4px; user-select:none; }
-    .zero-mark  { position:absolute; width:3px; height:100%; background:#fff;
-                  border:1px solid #000; top:0; z-index:10; pointer-events:none; }
-    .val-mark   { position:absolute; width:2px; height:100%;
-                  background:rgba(255,255,0,0.9); border:1px solid rgba(255,255,255,0.7);
-                  top:0; z-index:15; pointer-events:none; transition:left 0.1s ease-out; }
-    .slider-row { display:flex; align-items:center; gap:6px; font-size:12px; }
-    .slider-row label { min-width:56px; }
-    .slider-row input[type=range] { width:120px; height:4px; }
-    .slider-row .sv { min-width:36px; font-family:monospace; }
-    .sliders-col { display:flex; flex-direction:column; gap:4px; }
-    /* info */
-    .info-col { display:flex; flex-direction:column; gap:4px; font-size:12px;
-                min-width:90px; }
-    #last-val  { font-size:22px; font-family:monospace; font-weight:bold; }
-    #fq-text   { font-weight:bold; color:#ff0; font-size:12px; }
-    /* timing panel */
-    #timing-panel {
-      display:none;
-      background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.18);
-      border-radius:6px; padding:8px 12px; font-size:12px; min-width:160px;
-    }
-    #timing-panel h4 { margin:0 0 6px 0; color:#a5d6a7; font-size:10px;
-                       text-transform:uppercase; letter-spacing:.05em; }
-    .tm-row { display:flex; align-items:center; gap:5px; margin-bottom:4px; }
-    .tm-lbl  { min-width:62px; color:#aaa; }
-    .tm-val  { min-width:32px; font-family:monospace; color:#fff; }
-    .tm-btn  { background:#0d47a1; color:#fff; border:none; padding:1px 7px;
-               border-radius:3px; cursor:pointer; font-size:11px; }
-    .tm-btn:hover { background:#1565c0; }
-    .save-btn { background:#4a148c; color:#fff; border:none; padding:3px 10px;
-                border-radius:3px; cursor:pointer; font-size:11px;
-                font-weight:bold; margin-top:5px; width:100%; }
-    .save-btn:hover { background:#6a1b9a; }
-    /* back */
-    #back { background:#37474f; color:#ccc; border:none; padding:4px 10px;
-            border-radius:4px; cursor:pointer; font-size:12px; }
-    #back:hover { background:#546e7a; }
-    #mapToggle { background:#37474f; color:#90a4ae; border:1px solid #546e7a;
-                 padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; }
-    #mapToggle.offline { background:#1a237e; color:#7986cb; border-color:#3949ab; }
-  </style>
-  <script src="/static/leaflet.js"></script>
-</head>
-<body>
-<div id="toolbar">
-
-  <button id="back" onclick="location.href='/'">← Studies</button>
-
-  <div id="title-block">
-    <span class="study-name" title="{{ study_name }}">{{ study_name }}</span>
-    {% if is_live %}
-      <span class="live-badge">● LIVE</span>
-    {% else %}
-      <span class="saved-badge">◉ Saved</span>
-    {% endif %}
-    <button id="mapToggle" onclick="toggleMapLayer()">🌐 Map</button>
-  </div>
-
-  <div class="toolbar-sep"></div>
-
-  <div class="btn-stack">
-    <button class="btn btn-blue" onclick="recalibrate()">🎯 Re-zero</button>
-    <button id="pauseBtn" class="btn btn-green" onclick="togglePause()">⏸ Pause</button>
-  </div>
-
-  <div>
-    <div class="range-bar" id="rangeBar">
-      <div class="zero-mark" id="zeroMark"></div>
-      <div class="val-mark"  id="valMark"></div>
-    </div>
-    <div style="display:flex;gap:14px;margin-top:5px;align-items:flex-start;">
-      <div class="sliders-col">
-        <div class="slider-row">
-          <label>− Range</label>
-          <input type="range" id="minusSl" min="0.01" max="5" step="0.01"
-                 value="0.04" oninput="onRangeSlider()">
-          <span class="sv" id="minusV">0.04</span>
-        </div>
-        <div class="slider-row">
-          <label>+ Range</label>
-          <input type="range" id="plusSl" min="0.01" max="5" step="0.01"
-                 value="0.04" oninput="onRangeSlider()">
-          <span class="sv" id="plusV">0.04</span>
-        </div>
-        <div class="slider-row">
-          <label>Offset</label>
-          <input type="range" id="offSl" min="-2" max="2" step="0.005"
-                 value="0.674" oninput="onOffset()">
-          <span class="sv" id="offV">0.674</span>
-        </div>
-        <button class="btn btn-blue"
-                style="font-size:11px;padding:2px 8px;margin-top:3px;align-self:flex-start;"
-                onclick="saveSliders(this)">💾 Save View</button>
-      </div>
-      <div style="text-align:center;padding-top:4px;">
-        <div style="font-size:10px;color:#888;">Last ADC</div>
-        <div id="last-val" style="color:#fff;">—</div>
-      </div>
-    </div>
-  </div>
-
-  <div class="toolbar-sep"></div>
-
-  <div class="info-col">
-    <div>Points: <span id="ptCount">0</span></div>
-    <div>Zero: <span id="zeroDisp">—</span></div>
-    <div>Zoom: <span id="zoomDisp">—</span></div>
-    <div id="fq-text">No Fix</div>
-    <div id="motion-row" style="display:none;">
-      Motion: <span id="motionVal" style="font-family:monospace;">—</span>
-    </div>
-    <div class="slider-row" style="margin-top:4px;">
-      <label>Size</label>
-      <input type="range" id="sizeSl" min="1" max="6" step="1"
-             value="2" oninput="onSize()">
-      <span class="sv" id="sizeV">2</span>
-    </div>
-  </div>
-
-  <div id="timing-panel">
-    <h4>Detector Timing</h4>
-    <div class="tm-row">
-      <span class="tm-lbl">Blanking</span>
-      <span class="tm-val" id="blankVal">—</span>µs
-      <button class="tm-btn" onclick="sendCmd('a')">+2</button>
-      <button class="tm-btn" onclick="sendCmd('z')">−2</button>
-    </div>
-    <div class="tm-row">
-      <span class="tm-lbl">RX Window</span>
-      <span class="tm-val" id="winVal">—</span>µs
-      <button class="tm-btn" onclick="sendCmd('s')">+1</button>
-      <button class="tm-btn" onclick="sendCmd('x')">−1</button>
-    </div>
-    <button class="save-btn" onclick="sendCmd('S')">💾 Save Settings</button>
-  </div>
-
-</div>
-<div id="map"></div>
-
-<script>
-// ── Constants injected from Flask ─────────────────────────────────────────────
-const STUDY_ID      = {{ study_id      | tojson }};
-const IS_LIVE       = {{ is_live       | tojson }};
-const MAP_CENTER    = {{ map_center    | tojson }};
-const GEOJSON_FILES = {{ geojson_files | tojson }};
-const BAR_W      = 440;
-
-// ── State ─────────────────────────────────────────────────────────────────────
-let allPoints   = [];
-let markers     = [];
-let latestMkr   = null;
-let polyline    = null;
-let lastId      = 0;
-let isPaused    = false;
-let dotSize     = 2;
-let zeroVal     = null;
-let manualOff   = 0.674;
-let plusRange   = 0.04;
-let minusRange  = 0.04;
-let lastADC     = null;
-
-// ── Map setup ─────────────────────────────────────────────────────────────────
-const mapObj = L.map('map', {maxZoom:25}).setView(MAP_CENTER, 20);
-
-// ── Tile layer with manual online/offline toggle ──────────────────────────────
-const BlankLayer = L.GridLayer.extend({
-  createTile: function() {
-    const s   = this.getTileSize();
-    const c   = document.createElement('canvas');
-    c.width   = s.x;  c.height = s.y;
-    const ctx = c.getContext('2d');
-    ctx.fillStyle   = '#d8d8d0';
-    ctx.fillRect(0, 0, s.x, s.y);
-    ctx.strokeStyle = '#c8c8c0';
-    ctx.lineWidth   = 1;
-    ctx.strokeRect(0, 0, s.x, s.y);
-    return c;
-  }
-});
-const blankLayer = new BlankLayer();
-const osmLayer   = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-  maxZoom:25, maxNativeZoom:19,
-  attribution:'© OpenStreetMap contributors'
-});
-
-function applyMapMode(mode) {
-  const btn = document.getElementById('mapToggle');
-  if (mode === 'offline') {
-    osmLayer.remove();
-    blankLayer.addTo(mapObj);
-    btn.textContent = '✈ Offline';
-    btn.classList.add('offline');
-  } else {
-    blankLayer.remove();
-    osmLayer.addTo(mapObj);
-    btn.textContent = '🌐 Map';
-    btn.classList.remove('offline');
-  }
-  localStorage.setItem('mapMode', mode);
-}
-
-function toggleMapLayer() {
-  applyMapMode(localStorage.getItem('mapMode') === 'offline' ? 'online' : 'offline');
-}
-
-applyMapMode(localStorage.getItem('mapMode') || 'online');
-
-L.control.scale({imperial:true, metric:true, maxWidth:200}).addTo(mapObj);
-mapObj.on('zoomend', () => {
-  document.getElementById('zoomDisp').textContent = mapObj.getZoom();
-});
-
-// Load all .geojson files found alongside the server script
-GEOJSON_FILES.forEach(name => {
-  fetch('/geojson/' + name)
-    .then(r => r.json())
-    .then(d => L.geoJSON(d, {
-      style: {color:'#FF8800', weight:2, opacity:0.6, fillOpacity:0},
-      onEachFeature: (f, l) => { if (f.properties?.Layer) l.bindPopup(f.properties.Layer); }
-    }).addTo(mapObj))
-    .catch(() => {});
-});
-
-// ── Color mapping (same scheme as map_serial_stream.py) ───────────────────────
-function getColor(val) {
-  if (zeroVal === null) return 'rgb(128,128,128)';
-  const z = zeroVal + manualOff;
-  if (val <= z) {
-    const n = minusRange > 0 ? Math.max(0, Math.min(1, (val - (z - minusRange)) / minusRange)) : 0;
-    return `rgb(${Math.round(n*128)},${Math.round(255-n*127)},${Math.round(n*128)})`;
-  } else {
-    const n = plusRange  > 0 ? Math.max(0, Math.min(1, (val - z) / plusRange))  : 0;
-    return `rgb(${Math.round(128+n*127)},${Math.round(128-n*128)},${Math.round(128-n*128)})`;
-  }
-}
-
-// ── Range bar ─────────────────────────────────────────────────────────────────
-function refreshBar() {
-  if (zeroVal === null) return;
-  document.getElementById('zeroMark').style.left = (BAR_W * 0.5) + 'px';
-  document.getElementById('rangeBar').style.background =
-    'linear-gradient(to right, #00ff00, #808080 50%, #ff0000)';
-  refreshValMark();
-}
-
-function refreshValMark() {
-  if (lastADC === null || zeroVal === null) return;
-  const z = zeroVal + manualOff;
-  let pct;
-  if (lastADC <= z) {
-    pct = minusRange > 0 ? (lastADC - (z - minusRange)) / minusRange * 50 : 50;
-  } else {
-    pct = plusRange > 0 ? 50 + (lastADC - z) / plusRange * 50 : 50;
-  }
-  document.getElementById('valMark').style.left =
-    (Math.max(0, Math.min(100, pct)) / 100 * BAR_W) + 'px';
-}
-
-// ── Marker helpers ────────────────────────────────────────────────────────────
-function markerStyle(point, isLatest) {
-  const c = getColor(point.value);
-  return {
-    radius:      isLatest ? dotSize * 2 : dotSize,
-    fillColor:   c,
-    color:       isLatest ? '#fff' : c,
-    weight:      isLatest ? 1.5 : 0.3,
-    opacity:     1,
-    fillOpacity: isLatest ? 1.0 : 0.7,
-  };
-}
-
-function popupFor(p) {
-  return `ADC raw: ${Math.round(p.value * 65535)}<br>` +
-         `Lat: ${p.lat.toFixed(6)}<br>Lon: ${p.lon.toFixed(6)}`;
-}
-
-// Full re-render (called after range/offset/size/recalibrate change)
-function renderAll() {
-  markers.forEach(m => mapObj.removeLayer(m));
-  markers = []; latestMkr = null;
-  if (polyline) { mapObj.removeLayer(polyline); polyline = null; }
-  if (!allPoints.length) return;
-
-  polyline = L.polyline(allPoints.map(p => [p.lat, p.lon]),
-    {color:'#4444ff', weight:1, opacity:0.4}).addTo(mapObj);
-
-  allPoints.forEach((p, i) => {
-    const isLast = (i === allPoints.length - 1);
-    const m = L.circleMarker([p.lat, p.lon], markerStyle(p, isLast)).addTo(mapObj);
-    if (i >= allPoints.length - 200) m.bindPopup(popupFor(p));
-    markers.push(m);
-    if (isLast) latestMkr = m;
-  });
-  document.getElementById('ptCount').textContent = allPoints.length;
-}
-
-// Incremental add (called during live streaming)
-function addPoint(p) {
-  // Downgrade previous latest marker to normal style
-  if (latestMkr && allPoints.length > 0) {
-    latestMkr.setStyle(markerStyle(allPoints[allPoints.length - 1], false));
-  }
-  allPoints.push(p);
-  const m = L.circleMarker([p.lat, p.lon], markerStyle(p, true)).addTo(mapObj);
-  m.bindPopup(popupFor(p));
-  markers.push(m);
-  latestMkr = m;
-
-  if (polyline) {
-    polyline.addLatLng([p.lat, p.lon]);
-  } else {
-    polyline = L.polyline([[p.lat, p.lon]],
-      {color:'#4444ff', weight:1, opacity:0.4}).addTo(mapObj);
-  }
-
-  document.getElementById('ptCount').textContent = allPoints.length;
-  if (!isPaused) mapObj.panTo([p.lat, p.lon], {animate:true, duration:0.25});
-
-  lastADC = p.value;
-  const c = getColor(p.value);
-  const lv = document.getElementById('last-val');
-  lv.textContent = Math.round(p.value * 65535);
-  lv.style.color = c;
-  refreshValMark();
-
-  const fqLabels = ['No Fix','2D','3D','PPS','RTK Fixed','RTK Float'];
-  const fqEl = document.getElementById('fq-text');
-  fqEl.textContent = fqLabels[p.fix_quality] || 'No Fix';
-  fqEl.style.color = p.fix_quality === 0 ? '#ff4444'
-                   : p.fix_quality >= 4   ? '#44ff44' : '#ff0';
-}
-
-// ── Initial calibration from first 10 points ──────────────────────────────────
-function initCalib(points) {
-  if (!points.length) { zeroVal = 0.5; return; }
-  const sample = points.slice(0, Math.min(10, points.length));
-  zeroVal = sample.reduce((a, p) => a + p.value, 0) / sample.length;
-  document.getElementById('zeroDisp').textContent = zeroVal.toFixed(4);
-  refreshBar();
-}
-
-// ── Load all existing data then optionally open SSE ───────────────────────────
-fetch('/data/' + STUDY_ID)
-  .then(r => r.json())
-  .then(d => {
-    allPoints = d.points;
-    lastId    = d.last_id;
-
-    // Restore saved slider settings when present
-    if (d.sl_minus_range != null) {
-      minusRange = d.sl_minus_range;
-      document.getElementById('minusSl').value = minusRange;
-      document.getElementById('minusV').textContent = minusRange.toFixed(2);
-    }
-    if (d.sl_plus_range != null) {
-      plusRange = d.sl_plus_range;
-      document.getElementById('plusSl').value = plusRange;
-      document.getElementById('plusV').textContent = plusRange.toFixed(2);
-    }
-    if (d.sl_dot_size != null) {
-      dotSize = d.sl_dot_size;
-      document.getElementById('sizeSl').value = dotSize;
-      document.getElementById('sizeV').textContent = dotSize;
-    }
-    if (d.sl_offset != null) {
-      manualOff = d.sl_offset;
-      document.getElementById('offSl').value = manualOff;
-    }
-    if (d.sl_zero_value != null) {
-      zeroVal = d.sl_zero_value;
-      document.getElementById('zeroDisp').textContent = zeroVal.toFixed(4);
-      document.getElementById('offV').textContent = (zeroVal + manualOff).toFixed(3);
-      refreshBar();
-    } else {
-      initCalib(allPoints);
-    }
-
-    renderAll();
-
-    if (allPoints.length) {
-      const latest = allPoints[allPoints.length - 1];
-      lastADC = latest.value;
-      document.getElementById('last-val').textContent = Math.round(latest.value * 65535);
-      document.getElementById('last-val').style.color = getColor(latest.value);
-      refreshValMark();
-      mapObj.setView([latest.lat, latest.lon], 20);
-    }
-
-    if (d.is_live) {
-      document.getElementById('timing-panel').style.display = 'block';
-      document.getElementById('motion-row').style.display   = 'block';
-      if (d.blanking_us)  document.getElementById('blankVal').textContent = d.blanking_us;
-      if (d.rx_window_us) document.getElementById('winVal').textContent   = d.rx_window_us;
-      openSSE();
-    }
-  });
-
-// ── SSE (live studies only) ───────────────────────────────────────────────────
-function openSSE() {
-  const es = new EventSource('/stream/' + STUDY_ID + '?since_id=' + lastId);
-  es.onmessage = function(e) {
-    const d = JSON.parse(e.data);
-    if (d.type === 'complete') { es.close(); return; }
-    if (d.blanking_us)  document.getElementById('blankVal').textContent = d.blanking_us;
-    if (d.rx_window_us) document.getElementById('winVal').textContent   = d.rx_window_us;
-    if (d.motion_mm != null) updateMotion(d.motion_mm, d.motion_paused);
-    if (d.type === 'rows' && d.rows && d.rows.length) {
-      lastId = d.rows[d.rows.length - 1].id;
-      if (!isPaused) d.rows.forEach(addPoint);
-    }
-  };
-  es.onerror = () => console.warn('[SSE] connection error');
-}
-
-// ── Toolbar controls ──────────────────────────────────────────────────────────
-function togglePause() {
-  isPaused = !isPaused;
-  const btn = document.getElementById('pauseBtn');
-  btn.textContent    = isPaused ? '▶ Resume' : '⏸ Pause';
-  btn.style.background = isPaused ? '#c62828' : '';
-}
-
-function recalibrate() {
-  fetch('/recalibrate/' + STUDY_ID, {method:'POST'})
-    .then(r => r.json())
-    .then(d => {
-      if (!d.success) return;
-      zeroVal = d.zero_value;
-      manualOff = 0;
-      document.getElementById('zeroDisp').textContent = zeroVal.toFixed(4);
-      document.getElementById('offSl').value = 0;
-      document.getElementById('offV').textContent  = '0.000';
-      refreshBar();
-      renderAll();
-    });
-}
-
-function onRangeSlider() {
-  minusRange = parseFloat(document.getElementById('minusSl').value);
-  plusRange  = parseFloat(document.getElementById('plusSl').value);
-  document.getElementById('minusV').textContent = minusRange.toFixed(2);
-  document.getElementById('plusV').textContent  = plusRange.toFixed(2);
-  refreshBar();
-  renderAll();
-}
-
-function onOffset() {
-  manualOff = parseFloat(document.getElementById('offSl').value);
-  const adjZ = zeroVal !== null ? zeroVal + manualOff : manualOff;
-  document.getElementById('offV').textContent = adjZ.toFixed(3);
-  refreshBar();
-  renderAll();
-}
-
-function onSize() {
-  dotSize = parseInt(document.getElementById('sizeSl').value);
-  document.getElementById('sizeV').textContent = dotSize;
-  renderAll();
-}
-
-function updateMotion(mm, paused) {
-  const el = document.getElementById('motionVal');
-  if (!el) return;
-  if (paused === '1') {
-    el.textContent  = 'PAUSED';
-    el.style.color  = '#ff8800';
-  } else {
-    el.textContent  = Math.round(parseFloat(mm)) + ' mm/pt';
-    el.style.color  = '#a5d6a7';
-  }
-}
-
-function saveSliders(btn) {
-  fetch('/settings/' + STUDY_ID, {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({
-      plus_range:  plusRange,
-      minus_range: minusRange,
-      offset:      manualOff,
-      dot_size:    dotSize,
-      zero_value:  zeroVal,
-    })
-  }).then(r => r.json()).then(d => {
-    if (d.ok && btn) {
-      const orig = btn.textContent;
-      btn.textContent = '✓ Saved';
-      setTimeout(() => { btn.textContent = orig; }, 1200);
-    }
-  }).catch(() => {});
-}
-
-function sendCmd(byte) {
-  fetch('/cmd', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({cmd: byte})
-  })
-  .then(r => r.json())
-  .then(d => {
-    if (d.blanking_us)  document.getElementById('blankVal').textContent = d.blanking_us;
-    if (d.rx_window_us) document.getElementById('winVal').textContent   = d.rx_window_us;
-  })
-  .catch(() => {});
-}
-</script>
-</body>
-</html>"""
-
-
-# ── Routes ────────────────────────────────────────────────────────────────────
+# ── Views ─────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
     cfg = load_config()
     default_name = datetime.datetime.now().strftime('geo_%Y%m%d_%H%M%S')
-    return render_template_string(INDEX_TMPL,
+    return render_template(
+        'index.html',
         studies=list_studies(),
         daemon_status=get_daemon_status(),
+        nav=nav().snapshot(),
+        cfg=cfg,
         error=request.args.get('error'),
         default_study_name=default_name,
-        default_port=cfg.get('last_port', '/dev/cu.usbmodem1103'),
         git_hash=GIT_HASH,
     )
 
@@ -894,23 +474,25 @@ def view_study(study_id):
         return redirect(url_for('index'))
     meta = read_meta(db_path)
     try:
-        conn  = db_ro(db_path)
-        first = conn.execute(
-            'SELECT lat,lon FROM detections ORDER BY id LIMIT 1'
-        ).fetchone()
+        conn = db_ro(db_path)
+        first = conn.execute('SELECT lat,lon FROM points ORDER BY id LIMIT 1').fetchone()
         conn.close()
         center = [first[0], first[1]] if first else [37.7749, -122.4194]
     except Exception:
         center = [37.7749, -122.4194]
     geojson_files = sorted(p.name for p in Path(__file__).parent.glob('*.geojson'))
-    return render_template_string(VIEW_TMPL,
+    return render_template(
+        'view.html',
         study_id=study_id,
         study_name=meta.get('study_name', study_id),
         is_live=is_live(db_path),
         map_center=center,
         geojson_files=geojson_files,
+        git_hash=GIT_HASH,
     )
 
+
+# ── JSON API ──────────────────────────────────────────────────────────────────
 
 @app.route('/data/<study_id>')
 def get_data(study_id):
@@ -918,62 +500,54 @@ def get_data(study_id):
     if not os.path.exists(db_path):
         return jsonify({'error': 'Not found'}), 404
     points = load_points(db_path)
-    meta   = read_meta(db_path)
-    calib  = get_calib(study_id)
-
-    # Seed zero from first 10 points if not yet set
-    if calib['zero_value'] is None and points:
-        sample = [p['value'] for p in points[:10]]
-        set_calib(study_id, zero_value=sum(sample) / len(sample))
-        calib = get_calib(study_id)
-
-    z = calib['zero_value'] or 0.5
-
-    def _f(key):
-        v = meta.get(key)
-        return float(v) if v is not None else None
-
+    meta = read_meta(db_path)
     return jsonify({
-        'points':        points,
-        'last_id':       points[-1]['id'] if points else 0,
-        'is_live':       is_live(db_path),
-        'zero_value':    z,
-        'value_min':     z - calib['minus_range'],
-        'value_max':     z + calib['plus_range'],
-        'blanking_us':   meta.get('blanking_us'),
-        'rx_window_us':  meta.get('rx_window_us'),
-        'study_name':    meta.get('study_name', study_id),
-        'sl_plus_range':  _f('sl_plus_range'),
-        'sl_minus_range': _f('sl_minus_range'),
-        'sl_offset':      _f('sl_offset'),
-        'sl_dot_size':    int(_f('sl_dot_size')) if _f('sl_dot_size') is not None else None,
-        'sl_zero_value':  _f('sl_zero_value'),
+        'points':  points,
+        'last_id': points[-1]['id'] if points else 0,
+        'is_live': is_live(db_path),
+        'meta':    meta,
+        'status':  derive_status(db_path, meta),
+        'nav':     nav().snapshot(),
     })
+
+
+@app.route('/navfix')
+def navfix():
+    return jsonify(nav().snapshot())
 
 
 @app.route('/stream/<study_id>')
 def stream_study(study_id):
-    db_path  = get_db_path(study_id)
-    since_id = int(request.args.get('since_id', 0))
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        abort(404)
+
+    def as_id(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    # The browser's SSE auto-reconnect re-requests the SAME URL, so the
+    # query param alone would replay the whole session. Each tick carries
+    # an 'id:' field and reconnects resume from Last-Event-ID instead.
+    since_id = as_id(request.headers.get('Last-Event-ID',
+                                         request.args.get('since_id', 0)))
 
     def gen():
         nonlocal since_id
         while True:
             rows = load_points(db_path, since_id)
-            meta = read_meta(db_path)
-            motion = {
-                'motion_mm':     meta.get('motion_mm'),
-                'motion_paused': meta.get('motion_paused'),
-            }
             if rows:
                 since_id = rows[-1]['id']
-                yield f"data: {json.dumps({'type': 'rows', 'rows': rows, 'blanking_us': meta.get('blanking_us'), 'rx_window_us': meta.get('rx_window_us'), **motion})}\n\n"
-            elif not is_live(db_path):
-                yield f"data: {json.dumps({'type': 'complete'})}\n\n"
-                return
-            else:
-                yield f"data: {json.dumps({'type': 'heartbeat', **motion})}\n\n"
-            time.sleep(0.5)
+            payload = {
+                'type':   'tick',
+                'rows':   rows,
+                'status': derive_status(db_path),
+                'nav':    nav().snapshot(),
+            }
+            yield f'id: {since_id}\ndata: {json.dumps(payload)}\n\n'
+            time.sleep(SSE_PERIOD_S)
 
     return Response(
         stream_with_context(gen()),
@@ -982,110 +556,9 @@ def stream_study(study_id):
     )
 
 
-@app.route('/start_daemon', methods=['POST'])
-def start_daemon():
-    if get_daemon_status()['running']:
-        return redirect(url_for('index', error='Daemon is already running'))
-
-    port     = request.form.get('port', '/dev/ttyACM0').strip()
-    min_dist = request.form.get('min_dist', '20').strip()
-    name     = request.form.get('study_name', '').strip()
-
-    safe    = re.sub(r'[^\w-]', '_', name) if name else 'study'
-    ts      = int(time.time())
-    db_path = str(STUDIES_DIR / f'{safe}_{ts}.db')
-    STUDIES_DIR.mkdir(parents=True, exist_ok=True)
-
-    log_path = str(STUDIES_DIR / f'{safe}_{ts}.log')
-    cmd = [sys.executable, str(DAEMON_SCRIPT),
-           '--port', port, '--baud', '460800',
-           '--db', db_path, '--study-name', name or safe,
-           '--min-dist', min_dist]
-    save_config(last_port=port)
-    print(f'[web] launching daemon: {" ".join(cmd)}', flush=True)
-    print(f'[web] daemon log: {log_path}', flush=True)
-    subprocess.Popen(
-        cmd,
-        stdout=open(log_path, 'w'),
-        stderr=subprocess.STDOUT,
-        close_fds=True,
-    )
-
-    # Wait up to 3s for the daemon to write its PID file rather than a blind sleep.
-    deadline = time.time() + 3.0
-    while time.time() < deadline:
-        if get_daemon_status()['running']:
-            print(f'[web] daemon up (pid={get_daemon_status()["pid"]})', flush=True)
-            break
-        time.sleep(0.1)
-    else:
-        print(f'[web] WARNING: daemon did not appear in PID file — check {log_path}', flush=True)
-
-    return redirect(url_for('view_study', study_id=f'{safe}_{ts}'))
-
-
-@app.route('/stop_daemon', methods=['POST'])
-def stop_daemon():
-    status = get_daemon_status()
-    if status['running']:
-        try:
-            os.kill(status['pid'], signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-    return redirect(url_for('index'))
-
-
-@app.route('/cmd', methods=['POST'])
-def send_cmd():
-    data = request.get_json(force=True)
-    cmd  = str(data.get('cmd', ''))[:1]
-    if not cmd:
-        return jsonify({'error': 'No command'}), 400
-    try:
-        fd = os.open(FIFO_PATH, os.O_WRONLY | os.O_NONBLOCK)
-        os.write(fd, cmd.encode())
-        os.close(fd)
-    except OSError:
-        return jsonify({'error': 'Daemon not running'}), 503
-
-    # Return whatever meta is currently in the db (daemon updates it asynchronously)
-    status = get_daemon_status()
-    meta   = read_meta(status['db_path']) if status['db_path'] else {}
-    return jsonify({
-        'ok':          True,
-        'blanking_us':  meta.get('blanking_us'),
-        'rx_window_us': meta.get('rx_window_us'),
-    })
-
-
-@app.route('/recalibrate/<study_id>', methods=['POST'])
-def recalibrate(study_id):
-    db_path = get_db_path(study_id)
-    try:
-        conn = db_ro(db_path)
-        rows = conn.execute(
-            'SELECT adc_raw FROM detections ORDER BY id DESC LIMIT 10'
-        ).fetchall()
-        conn.close()
-    except Exception:
-        return jsonify({'success': False, 'error': 'DB error'})
-    if not rows:
-        return jsonify({'success': False, 'error': 'No data yet'})
-
-    vals = [(r[0] or 0) / 65535.0 for r in rows]
-    zero = sum(vals) / len(vals)
-    set_calib(study_id, zero_value=zero)
-    calib = get_calib(study_id)
-    return jsonify({
-        'success':    True,
-        'zero_value': zero,
-        'value_min':  zero - calib['minus_range'],
-        'value_max':  zero + calib['plus_range'],
-    })
-
-
 @app.route('/settings/<study_id>', methods=['POST'])
 def save_settings(study_id):
+    """Persist per-study view settings (sliders, channel mask, zeros)."""
     db_path = get_db_path(study_id)
     if not os.path.exists(db_path):
         return jsonify({'error': 'Not found'}), 404
@@ -1095,14 +568,17 @@ def save_settings(study_id):
         'sl_minus_range': data.get('minus_range'),
         'sl_offset':      data.get('offset'),
         'sl_dot_size':    data.get('dot_size'),
-        'sl_zero_value':  data.get('zero_value'),
+        'sl_channels':    json.dumps(data['channels']) if data.get('channels') is not None else None,
+        'sl_zero8':       json.dumps(data['zero8']) if data.get('zero8') is not None else None,
+        'sl_heading_offset_deg': data.get('heading_offset'),
     }
     try:
         conn = sqlite3.connect(db_path)
         conn.execute('PRAGMA busy_timeout=1000')
         for key, val in mapping.items():
             if val is not None:
-                conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', (key, str(val)))
+                conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
+                             (key, str(val)))
         conn.commit()
         conn.close()
     except Exception as e:
@@ -1110,10 +586,183 @@ def save_settings(study_id):
     return jsonify({'ok': True})
 
 
+@app.route('/recalibrate/<study_id>', methods=['POST'])
+def recalibrate(study_id):
+    """Per-channel zero baselines from the last 20 points (bench: park the
+    array over clean ground, hit re-zero). Persisted immediately."""
+    db_path = get_db_path(study_id)
+    try:
+        conn = db_ro(db_path)
+        rows = conn.execute(
+            'SELECT adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7 '
+            'FROM points ORDER BY id DESC LIMIT 20').fetchall()
+        conn.close()
+    except Exception:
+        return jsonify({'success': False, 'error': 'DB error'})
+    if not rows:
+        return jsonify({'success': False, 'error': 'No data yet'})
+    zero8 = [round(sum(r[i] for r in rows) / len(rows), 1) for i in range(8)]
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute('PRAGMA busy_timeout=1000')
+        conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
+                     ('sl_zero8', json.dumps(zero8)))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+    return jsonify({'success': True, 'zero8': zero8})
+
+
+# ── Daemon control ────────────────────────────────────────────────────────────
+
+def new_study_id(name):
+    """Study id from a user-entered name. ASCII-only by construction — the
+    id doubles as the db filename and must always satisfy safe_study_id()."""
+    safe = re.sub(r'[^A-Za-z0-9_-]', '_', name).strip('_-') if name else ''
+    return f'{safe or "study"}_{int(time.time())}'
+
+
+@app.route('/start_daemon', methods=['POST'])
+def start_daemon():
+    if get_daemon_status()['running']:
+        return redirect(url_for('index', error='Daemon is already running'))
+
+    cfg      = load_config()
+    port     = request.form.get('port', cfg['serial_port']).strip()
+    baud     = request.form.get('baud', str(cfg['baud'])).strip()
+    min_dist = request.form.get('min_dist', '20').strip()
+    name     = request.form.get('study_name', '').strip()
+    no_gate  = request.form.get('no_gate') == 'on'
+
+    # Validate HERE: a value the daemon's argparse rejects would kill it
+    # before the db exists, and the operator would get no feedback at all.
+    if not port:
+        return redirect(url_for('index', error='Serial port is required'))
+    try:
+        # NOT isdigit(): it accepts Unicode digits like '²' that int() rejects
+        if int(baud) <= 0:
+            raise ValueError
+    except ValueError:
+        return redirect(url_for('index', error=f'Bad baud rate: {baud!r}'))
+    try:
+        float(min_dist)
+    except ValueError:
+        return redirect(url_for('index', error=f'Bad min distance: {min_dist!r}'))
+
+    sid = new_study_id(name)
+    db_path = str(studies_dir() / f'{sid}.db')
+    log_path = str(studies_dir() / f'{sid}.log')
+
+    # --opt=value form so a study name (or port) starting with '-' can't be
+    # eaten by argparse as an option.
+    cmd = [sys.executable, str(DAEMON_SCRIPT),
+           '--port=' + port, '--baud=' + baud,
+           '--db=' + db_path, '--study-name=' + (name or sid),
+           '--min-dist=' + min_dist]
+    if no_gate:
+        cmd.append('--no-gate')
+    save_config(serial_port=port, baud=int(baud))
+    print(f'[web] launching daemon: {" ".join(cmd)}', flush=True)
+    print(f'[web] daemon log: {log_path}', flush=True)
+    try:
+        log_fh = open(log_path, 'w')
+    except OSError as e:
+        return redirect(url_for('index', error=f'Cannot write study log: {e}'))
+    subprocess.Popen(cmd, stdout=log_fh,
+                     stderr=subprocess.STDOUT, close_fds=True)
+
+    # Wait briefly for the PID file rather than a blind sleep.
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if get_daemon_status()['running']:
+            print(f'[web] daemon up (pid={get_daemon_status()["pid"]})', flush=True)
+            break
+        time.sleep(0.1)
+    else:
+        return redirect(url_for('index', error=(
+            f'Daemon did not start — see {os.path.basename(log_path)} '
+            f'in the studies folder')))
+
+    return redirect(url_for('view_study', study_id=sid))
+
+
+@app.route('/stop_daemon', methods=['POST'])
+def stop_daemon():
+    status = get_daemon_status()
+    if status['running']:
+        # A stale PID file (daemon killed -9 outside our process tree) can
+        # name a recycled pid owned by an unrelated process — never signal
+        # anything that isn't actually serial_daemon.
+        try:
+            cmdline = subprocess.check_output(
+                ['ps', '-p', str(status['pid']), '-o', 'command='],
+                stderr=subprocess.DEVNULL).decode()
+        except subprocess.CalledProcessError:
+            cmdline = ''                 # ps ran: pid is gone or recycled
+        except OSError:
+            # ps itself could not run (fork failure on a loaded Pi). The PID
+            # file says this is our daemon — fail SAFE and signal it rather
+            # than unlinking the file and orphaning a live recording.
+            cmdline = 'serial_daemon'
+        if 'serial_daemon' in cmdline:
+            try:
+                os.kill(status['pid'], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+        else:
+            try:
+                os.unlink(PID_FILE)      # stale — clear it so the UI recovers
+            except OSError:
+                pass
+    return redirect(url_for('index'))
+
+
+@app.route('/cmd', methods=['POST'])
+def send_cmd():
+    """Forward one tuning key to the firmware via the daemon's FIFO."""
+    data = request.get_json(force=True)
+    # Encode FIRST: slicing the str keeps one codepoint, which can be up to
+    # 4 UTF-8 bytes — the firmware must see exactly one key byte.
+    cmd = str(data.get('cmd', '')).encode('ascii', errors='ignore')[:1]
+    if not cmd:
+        return jsonify({'error': 'No command'}), 400
+    try:
+        fd = os.open(FIFO_PATH, os.O_WRONLY | os.O_NONBLOCK)
+        os.write(fd, cmd)
+        os.close(fd)
+    except OSError:
+        return jsonify({'error': 'Daemon not running'}), 503
+    # Current values land in meta asynchronously; SSE refreshes the panel.
+    status = get_daemon_status()
+    timing = {}
+    if status['db_path']:
+        meta = read_meta(status['db_path'])
+        timing = {k: meta.get(k + '_current') or meta.get(k)
+                  for k in TIMING_KEYS}
+    return jsonify({'ok': True, 'timing': timing})
+
+
+@app.route('/nav_config', methods=['POST'])
+def nav_config():
+    data = request.get_json(force=True)
+    host = str(data.get('host', '')).strip()
+    try:
+        port = int(data.get('port', 0))
+    except (TypeError, ValueError):
+        port = 0
+    if not host or not (0 < port < 65536):
+        return jsonify({'error': 'need host and port 1-65535'}), 400
+    nav().configure(host, port)      # runtime switch first — persistence is
+    persisted = save_config(nav_host=host, nav_port=port)   # best-effort
+    return jsonify({'ok': True, 'persisted': persisted,
+                    'nav': nav().snapshot()})
+
+
 @app.route('/geojson/<path:filename>')
 def serve_geojson(filename):
     p = Path(__file__).parent / filename
-    if p.exists() and p.suffix == '.geojson':
+    if p.exists() and p.suffix == '.geojson' and p.parent == Path(__file__).parent:
         return send_file(str(p), mimetype='application/json')
     return '', 404
 
@@ -1123,9 +772,21 @@ def serve_geojson(filename):
 if __name__ == '__main__':
     ap = argparse.ArgumentParser(description='Metal Mapper web front-end')
     ap.add_argument('--web-port', type=int, default=5000)
+    ap.add_argument('--studies-dir', help='override studies directory')
+    ap.add_argument('--serial-port', help='default serial port for new studies')
+    ap.add_argument('--baud', type=int, help='default baud for new studies')
+    ap.add_argument('--nav-host', help='NMEA-over-TCP host for the nav GPS')
+    ap.add_argument('--nav-port', type=int, help='NMEA-over-TCP port')
     args = ap.parse_args()
 
-    STUDIES_DIR.mkdir(parents=True, exist_ok=True)
+    for k in ('studies_dir', 'serial_port', 'baud', 'nav_host', 'nav_port'):
+        v = getattr(args, k)
+        if v is not None:
+            _cli_overrides[k] = v
+
     print(f'Metal Mapper starting on http://localhost:{args.web_port}')
-    print(f'Studies directory: {STUDIES_DIR}')
+    print(f'Studies directory: {studies_dir()}')
+    cfg = load_config()
+    print(f'Nav GPS source: {cfg["nav_host"]}:{cfg["nav_port"]} (NMEA over TCP)')
+    nav()   # start the reader up front so the first page shows real state
     app.run(host='0.0.0.0', port=args.web_port, debug=False, threaded=True)

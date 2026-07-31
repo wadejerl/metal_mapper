@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Metal Mapper — Studies</title>
+  <meta charset="utf-8">
+  <link rel="stylesheet" href="/static/style.css">
+  <style>
+    body { padding: 24px; }
+    h1   { color: #e94560; margin-top: 0; }
+    .daemon-box { padding: 8px 16px; border-radius: 6px; display: inline-flex;
+                  align-items: center; gap: 16px; margin: 0 12px 22px 0;
+                  font-weight: bold; font-size: 13px; }
+    .daemon-on  { background: #1b5e20; color: #a5d6a7; }
+    .daemon-off { background: #37474f; color: #90a4ae; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 28px; }
+    th { background: #16213e; color: #a0a0c0; text-align: left; padding: 10px; }
+    td { padding: 9px 10px; border-bottom: 1px solid #252545; }
+    tr:hover td { background: #1f2b50; }
+    a.view-btn { background: #0f3460; color: #e94560; padding: 4px 14px;
+                 border-radius: 4px; text-decoration: none; font-size: 13px; }
+    a.view-btn:hover { background: #e94560; color: #fff; }
+    .panel { background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
+             padding: 20px; max-width: 480px; display: inline-block;
+             vertical-align: top; margin-right: 20px; }
+    .panel h2 { color: #e94560; margin-top: 0; font-size: 16px; }
+    .panel label { display: block; margin-top: 12px; color: #aaa; font-size: 12px; }
+    .panel input[type=text], .panel input[type=number] {
+      width: 100%; box-sizing: border-box; padding: 7px; margin-top: 4px;
+      background: #0f3460; border: 1px solid #2a4080; color: #eee;
+      border-radius: 4px; font-size: 14px; }
+    .panel .chk { margin-top: 12px; font-size: 13px; color: #ccc; }
+    .panel button { margin-top: 16px; background: #e94560; color: #fff; border: none;
+                    padding: 9px 24px; border-radius: 4px; cursor: pointer;
+                    font-size: 14px; font-weight: bold; }
+    .panel button:hover { background: #c73652; }
+    .err { color: #ef9a9a; font-size: 13px; margin-top: 8px; }
+    .empty { color: #555; text-align: center; padding: 20px; }
+    .fwcol { color: #667; font-family: monospace; font-size: 11px; }
+  </style>
+</head>
+<body>
+<h1>Metal Mapper</h1>
+<div style="color:#555; font-size:11px; font-family:monospace; margin-top:-14px; margin-bottom:18px;">{{ git_hash }}</div>
+
+{% set ds = daemon_status %}
+{% if ds.running %}
+  <div class="daemon-box daemon-on">
+    ● Daemon running — {{ ds.db_path | basename }}
+    <form method="post" action="/stop_daemon" style="display:inline;">
+      <button class="btn btn-red">■ Stop</button>
+    </form>
+  </div>
+{% else %}
+  <div class="daemon-box daemon-off">○ No daemon running</div>
+{% endif %}
+{# top-level so errors show whether or not the start panel is rendered #}
+{% if error %}<div class="err">⚠ {{ error }}</div>{% endif %}
+
+<span id="navChip" class="nav-chip {{ 'nav-ok' if nav.connected else 'nav-down' }}">
+  {% if nav.connected %}
+    NAV GPS ● {{ nav.host }}:{{ nav.port }}
+  {% else %}
+    NAV GPS ○ {{ nav.host }}:{{ nav.port }} — {{ nav.error or 'down' }}
+  {% endif %}
+</span>
+
+<table>
+  <tr>
+    <th>Study</th>
+    <th>Created</th>
+    <th>Points</th>
+    <th>Last Activity</th>
+    <th>FW</th>
+    <th></th>
+  </tr>
+  {% for s in studies %}
+  <tr>
+    <td>
+      {{ s.name }}
+      {% if s.live %}<span class="badge badge-live">● LIVE</span>{% endif %}
+    </td>
+    <td>{{ s.created_at | ts_fmt }}</td>
+    <td>{{ s.count }}</td>
+    <td>{{ s.latest_ts | ts_fmt if s.latest_ts else '—' }}</td>
+    <td class="fwcol">{{ s.fw }}</td>
+    <td><a class="view-btn" href="/view/{{ s.id }}">View Map</a></td>
+  </tr>
+  {% else %}
+  <tr><td colspan="6" class="empty">No studies yet — start one below.</td></tr>
+  {% endfor %}
+</table>
+
+{% if not ds.running %}
+<div class="panel">
+  <h2>Start New Study</h2>
+  <form method="post" action="/start_daemon">
+    <label>Study Name</label>
+    <input type="text" name="study_name" value="{{ default_study_name }}">
+    <label>Serial Port</label>
+    <input type="text" name="port" value="{{ cfg.serial_port }}" placeholder="/dev/ttyACM0">
+    <label>Baud</label>
+    <input type="number" name="baud" value="{{ cfg.baud }}">
+    <label>Min Distance (mm)</label>
+    <input type="number" name="min_dist" value="20" min="1" max="10000">
+    <div class="chk">
+      <label style="display:inline; color:#ccc;">
+        <input type="checkbox" name="no_gate">
+        Record without RTK+heading gate (bench mode)
+      </label>
+    </div>
+    <button type="submit">▶ Start Recording</button>
+  </form>
+</div>
+{% endif %}
+
+<div class="panel">
+  <h2>Nav GPS Source</h2>
+  <div style="color:#889; font-size:12px;">NMEA over TCP (PyGPSClient socket
+    server, gpsd raw port, socat, …)</div>
+  <label>Host</label>
+  <input type="text" id="navHost" value="{{ cfg.nav_host }}">
+  <label>Port</label>
+  <input type="number" id="navPort" value="{{ cfg.nav_port }}">
+  <button onclick="saveNav(this)">Apply</button>
+  <div class="err" id="navErr"></div>
+</div>
+
+<script>
+function saveNav(btn) {
+  fetch('/nav_config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({
+      host: document.getElementById('navHost').value,
+      port: parseInt(document.getElementById('navPort').value, 10),
+    })
+  }).then(r => r.json()).then(d => {
+    if (d.error) { document.getElementById('navErr').textContent = d.error; return; }
+    btn.textContent = '✓ Applied';
+    setTimeout(() => location.reload(), 800);
+  }).catch(e => { document.getElementById('navErr').textContent = e; });
+}
+</script>
+</body>
+</html>

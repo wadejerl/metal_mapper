@@ -27,7 +27,8 @@ lat,lon,fix_quality,adc_raw,gps_timestamp
 ```
 
 - `fix_quality`: 0 = no fix, 2 = 2D, 3 = 3D, 4 = RTK fixed, 5 = RTK float
-- `adc_raw`: 16-bit unsigned (0–65535); normalized to 0.0–1.0 in the web UI
+- `adc_raw`: 16-bit unsigned; hardware sum of 16 oversampled 12-bit conversions
+  (0–65520). The web UI colors in raw counts — nothing is normalized.
 - Status lines prefixed with `#` carry blanking/window echoes: `# blanking=16us rx_window=3us`
 
 ---
@@ -89,17 +90,17 @@ Open: `http://localhost:5000`
 | Control | What it does |
 |---------|-------------|
 | ← Studies | Back to study list |
-| 🎯 Re-zero | Set zero baseline from average of last 10 points |
+| 🎯 Re-zero | Set per-channel zero baselines from average of last 20 points |
 | ⏸ Pause / ▶ Resume | Freeze map pan/add; data still streams |
-| − Range slider | Normalized units below zero that map to full green (default 0.2) |
-| + Range slider | Normalized units above zero that map to full red (default 0.2) |
-| Offset slider | Shifts effective zero without re-averaging (default 0.661) |
+| − Range slider | ADC counts below zero that map to full green (default 1600) |
+| + Range slider | ADC counts above zero that map to full red (default 1600) |
+| Offset slider | Shifts effective zero of all channels, in counts (default 0) |
 | 💾 Save View | Persists slider/zero settings into the study's meta table |
 | Size slider | Dot radius in pixels |
 
-**Color scheme**: zero → green, above zero → red, below zero → gray.
-The zero baseline is the average `value` of the first 10 points, or whatever
-Re-zero last set it to.
+**Color scheme**: at zero → gray, above zero → red, below zero → green,
+in raw ADC counts. Zero is per channel; offset/ranges are shared. Baselines
+auto-seed from the study's first 10 points until Re-zero sets them.
 
 **Toolbar controls (live sessions only):**
 

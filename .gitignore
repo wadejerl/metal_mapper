@@ -7,3 +7,7 @@
 **.list
 **.map
 **.pyc
+.DS_Store
+stm_detector3/Core/Inc/fw_version.h
+bench/studies/
+bench/*.log
