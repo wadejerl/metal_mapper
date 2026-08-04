@@ -21,18 +21,26 @@
                    align-self:stretch; margin:4px 0; }
     #title-block { display:flex; flex-direction:column; gap:4px; min-width:120px; }
     #title-block .study-name { font-size:14px; font-weight:bold; max-width:150px;
-                               overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+                               overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+                               cursor:pointer; }
+    #title-block .study-name:hover { text-decoration:underline dotted #888; }
+    #studyNameIn { font-size:14px; font-weight:bold; width:150px;
+                   background:#222; color:#fff; border:1px solid #666;
+                   border-radius:3px; padding:1px 4px; }
     .slider-row { display:flex; align-items:center; gap:6px; font-size:12px; }
     .slider-row label { min-width:52px; }
     .slider-row input[type=range] { width:110px; height:4px; }
     .slider-row .sv { min-width:40px; font-family:monospace; }
     .sliders-col { display:flex; flex-direction:column; gap:4px; }
-    /* per-channel toggles + readout */
-    #chan-grid { display:grid; grid-template-columns:repeat(4, auto);
-                 gap:3px 8px; font-size:11px; font-family:monospace; }
-    .ch-cell { display:flex; align-items:center; gap:4px; cursor:pointer;
-               user-select:none; }
-    .ch-val  { min-width:40px; text-align:right; font-weight:bold; }
+    /* per-channel strip chart + readout */
+    #strip-wrap { display:flex; gap:6px; align-items:stretch; }
+    #stripChart { background:rgba(255,255,255,0.05);
+                  border:1px solid rgba(255,255,255,0.15); border-radius:3px; }
+    #strip-vals { display:flex; flex-direction:column;
+                  justify-content:space-between; font-size:10px;
+                  font-family:monospace; }
+    .ch-row  { display:flex; gap:4px; justify-content:flex-end; }
+    .ch-val  { min-width:38px; text-align:right; font-weight:bold; }
     /* info column */
     .info-col { display:flex; flex-direction:column; gap:3px; font-size:12px;
                 min-width:110px; }
@@ -57,6 +65,21 @@
     #mapToggle { background:#37474f; color:#90a4ae; border:1px solid #546e7a;
                  padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; }
     #mapToggle.offline { background:#1a237e; color:#7986cb; border-color:#3949ab; }
+    #metaBtn   { background:#37474f; color:#90a4ae; border:1px solid #546e7a;
+                 padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; }
+    /* collapsible study-metadata panel (acquisition provenance) */
+    #metaPanel { position:absolute; left:8px; z-index:1050; display:none;
+                 background:rgba(0,0,0,0.92); color:#ddd;
+                 border:1px solid rgba(255,255,255,0.25); border-radius:6px;
+                 padding:10px 14px; font-size:11px; font-family:monospace;
+                 max-width:420px; max-height:70vh; overflow-y:auto;
+                 box-shadow:0 4px 16px rgba(0,0,0,0.5); }
+    #metaPanel h4 { margin:9px 0 3px 0; color:#a5d6a7; font-size:10px;
+                    text-transform:uppercase; letter-spacing:.05em; }
+    .meta-row  { display:flex; gap:10px; line-height:1.5; }
+    .meta-key  { color:#888; min-width:120px; flex:none; }
+    .meta-val  { color:#eee; word-break:break-all; }
+    .meta-warn { color:#ffab91; }
   </style>
   <script src="/static/leaflet.js"></script>
   <script src="/static/map_core.js"></script>
@@ -71,13 +94,16 @@
   <button class="btn btn-grey" onclick="location.href='/'">← Studies</button>
 
   <div id="title-block">
-    <span class="study-name" title="{{ study_name }}">{{ study_name }}</span>
+    <span class="study-name" id="studyName" onclick="editName()"
+          title="{{ study_name }} — click to rename">{{ study_name }}</span>
+    <input type="text" id="studyNameIn" maxlength="120" style="display:none;">
     {% if is_live %}
       <span class="badge badge-live">● LIVE</span>
     {% else %}
       <span class="badge badge-saved">◉ Saved</span>
     {% endif %}
     <button id="mapToggle" onclick="toggleMapLayer()">🌐 Map</button>
+    <button id="metaBtn" onclick="toggleMetaPanel()">ⓘ Meta</button>
   </div>
 
   <div class="toolbar-sep"></div>
@@ -90,32 +116,32 @@
   <div class="sliders-col">
     <div class="slider-row">
       <label>− Range</label>
-      <input type="range" id="minusSl" min="5" max="32000" step="5" value="1600"
+      <input type="range" id="minusSl" min="5" max="2000" step="5" value="450"
              oninput="onSliders()">
-      <span class="sv" id="minusV">1600</span>
+      <span class="sv" id="minusV">450</span>
     </div>
     <div class="slider-row">
       <label>+ Range</label>
-      <input type="range" id="plusSl" min="5" max="32000" step="5" value="1600"
+      <input type="range" id="plusSl" min="5" max="2000" step="5" value="450"
              oninput="onSliders()">
-      <span class="sv" id="plusV">1600</span>
+      <span class="sv" id="plusV">450</span>
     </div>
     <div class="slider-row">
       <label>Offset</label>
-      <input type="range" id="offSl" min="-16000" max="16000" step="10" value="0"
+      <input type="range" id="offSl" min="-2000" max="2000" step="10" value="-140"
              oninput="onSliders()">
-      <span class="sv" id="offV">0</span>
+      <span class="sv" id="offV">-140</span>
     </div>
     <div class="slider-row">
-      <label>Size</label>
-      <input type="range" id="sizeSl" min="1" max="6" step="1" value="2"
-             oninput="onSliders()">
-      <span class="sv" id="sizeV">2</span>
+      <label title="Δ array: subtract the mean of the enabled coils at each instant — hides rises/falls common to the whole array, keeps differential (target) response">Filter</label>
+      <select id="filterSel" onchange="onFilter()">
+        <option value="abs">absolute</option>
+        <option value="cm">Δ array mean</option>
+      </select>
     </div>
     <div class="slider-row">
-      <label title="Added to the reported heading before drawing the coil array — corrects a GPS whose heading is antenna-baseline-aligned">Rot °</label>
-      <input type="number" id="rotIn" min="-180" max="360" step="1" value="270"
-             style="width:52px;" onchange="onRot()">
+      <label title="On: overlapping passes combine — nothing is painted over, and a signal seen on multiple passes adds up (extra confidence). Off: classic view, newest dots cover older ones.">Combine</label>
+      <input type="checkbox" id="combineChk" checked onchange="onCombine()">
       <button class="btn btn-blue"
               style="font-size:11px;padding:2px 8px;margin-left:8px;"
               onclick="saveSliders(this)">💾 Save View</button>
@@ -127,7 +153,10 @@
   <div>
     <div style="font-size:10px;color:#888;margin-bottom:3px;">
       Channels (adc counts)</div>
-    <div id="chan-grid"></div>
+    <div id="strip-wrap">
+      <canvas id="stripChart"></canvas>
+      <div id="strip-vals"></div>
+    </div>
   </div>
 
   <div class="toolbar-sep"></div>
@@ -166,6 +195,8 @@
   </div>
 </div>
 
+<div id="metaPanel"></div>
+
 <div id="map"></div>
 
 <script>
@@ -179,12 +210,11 @@ const CH_COLORS = ['#e6194b','#f58231','#ffe119','#3cb44b',
                    '#42d4f4','#4363d8','#911eb4','#f032e6'];
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let allPoints  = [];
+const store    = MM.PointStore();   // columnar; no per-point JS objects
 let lastId     = 0;
 let isPaused   = false;
 let meta       = {};
-let calib      = {zero8: null, offset: 0, plusRange: 1600, minusRange: 1600,
-                  dotSize: 2};
+let calib      = {zero8: null, offset: -140, plusRange: 450, minusRange: 450};
 let geom       = {spacing_mm: 330, fore_mm: 0, right_mm: 500, rot_deg: 270};
 let adcLabels  = [];
 
@@ -193,8 +223,9 @@ function relayout() {
   const bannerH  = document.getElementById('banner').offsetHeight;
   const toolbar  = document.getElementById('toolbar');
   toolbar.style.top = bannerH + 'px';
-  document.getElementById('map').style.top =
-    (bannerH + toolbar.offsetHeight) + 'px';
+  const mapTop = bannerH + toolbar.offsetHeight;
+  document.getElementById('map').style.top = mapTop + 'px';
+  document.getElementById('metaPanel').style.top = (mapTop + 8) + 'px';
   mapObj.invalidateSize();
 }
 
@@ -246,25 +277,110 @@ GEOJSON_FILES.forEach(name => {
 });
 
 const renderer = MM.ChannelRenderer(mapObj);
+renderer.setStore(store);
 const navLayer = MM.NavLayer(mapObj);
 
-// ── Channel toggle grid ───────────────────────────────────────────────────────
-function buildChanGrid() {
-  const grid = document.getElementById('chan-grid');
-  grid.innerHTML = '';
+// Click → nearest dot (renderer hit-test; every dot inspectable).
+mapObj.on('click', e => {
+  const hit = renderer.hitTest(e.containerPoint);
+  if (!hit) return;
+  const html = (hit.ch == null)
+    ? `antenna · no heading — coils not drawn<br>` +
+      `${hit.latlng[0].toFixed(7)}, ${hit.latlng[1].toFixed(7)}<br>` +
+      `fix ${MM.fixLabel(hit.fix)}`
+    : `ch${hit.ch} · adc ${hit.val}` +
+      (hit.dev != null ? ` · Δ ${hit.dev >= 0 ? '+' : ''}${hit.dev.toFixed(0)}` : '') +
+      `<br>` +
+      `${hit.latlng[0].toFixed(7)}, ${hit.latlng[1].toFixed(7)}<br>` +
+      `heading ${hit.heading.toFixed(1)}°  fix ${MM.fixLabel(hit.fix)}`;
+  L.popup().setLatLng(hit.latlng).setContent(html).openOn(mapObj);
+});
+
+// ── Channel strip chart (one shared scale, newest sample at the right) ───────
+const STRIP_W = 220, STRIP_H = 88;
+const STRIP_N = 240;                 // samples kept (~12 s at 20 Hz)
+const stripBuf = [];                 // rows of adc[8], newest last
+const stripCv  = document.getElementById('stripChart');
+const stripCtx = stripCv.getContext('2d');
+{
+  const dpr = window.devicePixelRatio || 1;
+  stripCv.width  = STRIP_W * dpr;
+  stripCv.height = STRIP_H * dpr;
+  stripCv.style.width  = STRIP_W + 'px';
+  stripCv.style.height = STRIP_H + 'px';
+  stripCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+function buildStripVals() {
+  const col = document.getElementById('strip-vals');
+  col.innerHTML = '';
   for (let ch = 0; ch < 8; ch++) {
-    const cell = document.createElement('label');
-    cell.className = 'ch-cell';
-    cell.title = adcLabels[ch] || ('ch' + ch);
-    cell.innerHTML =
-      `<input type="checkbox" id="chk${ch}" checked>` +
+    const row = document.createElement('div');
+    row.className = 'ch-row';
+    row.title = adcLabels[ch] || ('ch' + ch);
+    row.innerHTML =
       `<span style="color:${CH_COLORS[ch]};">${ch}</span>` +
       `<span class="ch-val" id="chv${ch}">—</span>`;
-    cell.querySelector('input').addEventListener('change', e => {
-      renderer.setVisible(ch, e.target.checked);
-    });
-    grid.appendChild(cell);
+    col.appendChild(row);
   }
+}
+
+function stripAppend(adc) {
+  if (!adc) return;
+  stripBuf.push(Array.from(adc));
+  if (stripBuf.length > STRIP_N) stripBuf.shift();
+}
+
+function drawStrip() {
+  const ctx = stripCtx;
+  ctx.clearRect(0, 0, STRIP_W, STRIP_H);
+  const n = stripBuf.length;
+  if (n < 2) return;
+  // Plot each channel's deviation from its zero baseline, not raw counts:
+  // the per-channel DC offsets would otherwise fan the lines out into what
+  // looks like 8 stacked traces. Zeroed, the lines overlay and only
+  // real signal (or drift) separates them.
+  const z = calib.zero8;
+  const devOf = (row, ch) => z ? row[ch] - z[ch] : row[ch];
+  let lo = Infinity, hi = -Infinity;
+  for (let i = 0; i < n; i++) {
+    const row = stripBuf[i];
+    for (let ch = 0; ch < 8; ch++) {
+      const v = devOf(row, ch);
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+  }
+  if (hi - lo < 1) { hi += 1; lo -= 1; }
+  const pad = (hi - lo) * 0.06;
+  const top = hi + pad, bot = lo - pad;
+  const step = STRIP_W / (STRIP_N - 1);
+  const x0   = STRIP_W - (n - 1) * step;   // newest anchored at the right edge
+  const yOf  = v => (top - v) / (top - bot) * STRIP_H;
+  if (z && top > 0 && bot < 0) {           // zero-baseline reference line
+    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(0, yOf(0)); ctx.lineTo(STRIP_W, yOf(0));
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+  ctx.lineWidth = 1;
+  for (let ch = 0; ch < 8; ch++) {
+    ctx.beginPath();
+    for (let i = 0; i < n; i++) {
+      const x = x0 + i * step, y = yOf(devOf(stripBuf[i], ch));
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = CH_COLORS[ch];
+    ctx.stroke();
+  }
+  // the shared scale's bounds (Δ counts once zeroed), so spread reads as counts
+  ctx.fillStyle = '#999';
+  ctx.font = '9px monospace';
+  ctx.fillText(Math.round(hi), 2, 9);
+  ctx.fillText(Math.round(lo), 2, STRIP_H - 2);
 }
 
 function updateChanReadout(adc) {
@@ -276,6 +392,116 @@ function updateChanReadout(adc) {
     const zero = calib.zero8 ? calib.zero8[ch] : null;
     el.style.color = MM.colorFor(adc[ch], zero, calib.offset,
                                  calib.plusRange, calib.minusRange);
+  }
+}
+
+// ── Meta panel: acquisition provenance stamped by the daemon ─────────────────
+// Curated view of the study's meta table. [meta key, label, formatter?].
+// Timing/geometry/fire keys are drift-aware: if the daemon recorded a
+// <key>_current diverging from the stamped header, both values show.
+const META_GROUPS = [
+  ['Recording', [
+    ['study_name',     'name'],
+    ['created_at',     'created',      v => fmtEpoch(v)],
+    ['gate',           'gate'],
+    ['min_dist_mm',    'min distance', v => v + ' mm'],
+    ['serial_port',    'serial port'],
+    ['schema_version', 'schema'],
+  ]],
+  ['Detector firmware', [
+    ['fw_git_hash',    'fw build'],
+    ['fire_mode',      'fire mode'],
+    ['adc_oversample', 'adc oversample', v => v + '×'],
+    ['adc_order',      'adc order'],
+    ['info_at',        'header stamped', v => fmtEpoch(v)],
+  ]],
+  ['GPS', [
+    ['gps_id',  'id'],
+    ['gps_ver', 'version'],
+  ]],
+  ['Timing (µs)', [
+    ['blanking_us',  'blanking'],
+    ['rx_window_us', 'rx window'],
+    ['tx_pulse_us',  'tx pulse'],
+  ]],
+  ['Coil geometry (mm)', [
+    ['coil_spacing_mm',      'spacing'],
+    ['coil_offset_fore_mm',  'fore offset'],
+    ['coil_offset_right_mm', 'right offset'],
+  ]],
+];
+const META_DRIFT_FLAGS = ['timing_changed', 'geometry_changed', 'fire_changed'];
+
+function fmtEpoch(v) {
+  const t = parseFloat(v);
+  if (!Number.isFinite(t)) return v;
+  const d = new Date(t * 1000);
+  return d.toLocaleDateString() + ' ' + d.toLocaleTimeString();
+}
+
+function escMeta(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;');
+}
+
+function renderMetaPanel() {
+  const seen = new Set(META_DRIFT_FLAGS.concat(['info_ok']));
+  let html = '<div style="display:flex;justify-content:space-between;' +
+             'align-items:center;gap:16px;">' +
+             '<b style="color:#fff;">Study metadata</b>' +
+             '<button onclick="toggleMetaPanel()" style="background:none;' +
+             'border:none;color:#aaa;cursor:pointer;font-size:13px;">✕</button>' +
+             '</div>';
+
+  // Header health first: these mean the provenance below needs a second look.
+  if (meta.info_ok === '0') {
+    html += '<div class="meta-row meta-warn">⚠ header incomplete — the ' +
+            'detector info line was never fully received</div>';
+  }
+  for (const flag of META_DRIFT_FLAGS) {
+    if (meta[flag] == null) continue;
+    const [at, diffs] = String(meta[flag]).split(/:(.*)/s);
+    html += `<div class="meta-row meta-warn">⚠ ${flag.replace('_changed', '')}` +
+            ` changed mid-study (${escMeta(diffs || meta[flag])})` +
+            ` at ${escMeta(fmtEpoch(at))}</div>`;
+  }
+
+  for (const [title, rows] of META_GROUPS) {
+    html += `<h4>${title}</h4>`;
+    for (const [key, label, fmt] of rows) {
+      seen.add(key);
+      seen.add(key + '_current');
+      const raw = meta[key];
+      let val = raw == null ? '—' : escMeta(fmt ? fmt(raw) : raw);
+      const cur = meta[key + '_current'];
+      if (raw != null && cur != null && cur !== raw) {
+        val += ` <span class="meta-warn">→ ${escMeta(cur)} now</span>`;
+      }
+      html += `<div class="meta-row"><span class="meta-key">${label}</span>` +
+              `<span class="meta-val">${val}</span></div>`;
+    }
+  }
+
+  // Anything stamped that this panel doesn't know about yet — never hide it.
+  // (sl_* view settings excluded: they ARE the toolbar controls.)
+  const other = Object.keys(meta)
+    .filter(k => !seen.has(k) && !k.startsWith('sl_')).sort();
+  if (other.length) {
+    html += '<h4>Other</h4>';
+    for (const k of other) {
+      html += `<div class="meta-row"><span class="meta-key">${escMeta(k)}</span>` +
+              `<span class="meta-val">${escMeta(meta[k])}</span></div>`;
+    }
+  }
+  document.getElementById('metaPanel').innerHTML = html;
+}
+
+function toggleMetaPanel() {
+  const p = document.getElementById('metaPanel');
+  if (p.style.display === 'block') {
+    p.style.display = 'none';
+  } else {
+    renderMetaPanel();               // rebuilt on every open: cheap, current
+    p.style.display = 'block';
   }
 }
 
@@ -357,11 +583,9 @@ function readSliders() {
   calib.minusRange = parseFloat(document.getElementById('minusSl').value);
   calib.plusRange  = parseFloat(document.getElementById('plusSl').value);
   calib.offset     = parseFloat(document.getElementById('offSl').value);
-  calib.dotSize    = parseInt(document.getElementById('sizeSl').value);
   document.getElementById('minusV').textContent = calib.minusRange;
   document.getElementById('plusV').textContent  = calib.plusRange;
   document.getElementById('offV').textContent   = calib.offset;
-  document.getElementById('sizeV').textContent  = calib.dotSize;
 }
 
 function setSlider(id, valId, v) {
@@ -371,24 +595,26 @@ function setSlider(id, valId, v) {
 
 function onSliders() {
   readSliders();
-  renderer.setCalib(calib);
-  renderer.renderAll(allPoints);
+  renderer.setCalib(calib);   // repaint only — O(dots in view), not a rebuild
 }
 
-function onRot() {
-  const v = parseFloat(document.getElementById('rotIn').value);
-  geom.rot_deg = Number.isFinite(v) ? v : 0;
-  renderer.setGeometry(geom);
-  renderer.renderAll(allPoints);
+function onFilter() {
+  renderer.setFilter(document.getElementById('filterSel').value);
 }
 
-function autoZero(points) {
+function onCombine() {
+  renderer.setCombine(document.getElementById('combineChk').checked);
+}
+
+function autoZero() {
   // Seed per-channel zeros from the first 10 points when nothing is saved.
-  if (!points.length) return null;
-  const n = Math.min(10, points.length);
+  if (!store.length) return null;
+  const n = Math.min(10, store.length);
   const z = new Array(8).fill(0);
-  for (let i = 0; i < n; i++)
-    for (let ch = 0; ch < 8; ch++) z[ch] += points[i].adc[ch];
+  for (let i = 0; i < n; i++) {
+    const row = store.adcRow(i);
+    for (let ch = 0; ch < 8; ch++) z[ch] += row[ch];
+  }
   return z.map(v => Math.round(v / n * 10) / 10);
 }
 
@@ -399,7 +625,7 @@ function recalibrate() {
       if (!d.success) return;
       calib.zero8 = d.zero8;
       renderer.setCalib(calib);
-      renderer.renderAll(allPoints);
+      drawStrip();               // strip plots deviations from these zeros
     });
 }
 
@@ -410,6 +636,50 @@ function togglePause() {
   btn.style.background = isPaused ? '#c62828' : '';
 }
 
+// ── Study rename (label only — the .db filename / URL never changes) ─────────
+function editName() {
+  const span = document.getElementById('studyName');
+  const inp  = document.getElementById('studyNameIn');
+  inp.value = span.textContent;
+  span.style.display = 'none';
+  inp.style.display = '';
+  inp.focus();
+  inp.select();
+}
+
+function endEditName(commit) {
+  const span = document.getElementById('studyName');
+  const inp  = document.getElementById('studyNameIn');
+  inp.style.display = 'none';
+  span.style.display = '';
+  const name = inp.value.trim();
+  if (!commit || !name || name === span.textContent) return;
+  fetch('/rename/' + STUDY_ID, {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name})
+  }).then(r => r.json()).then(d => {
+    if (!d.ok) return;
+    span.textContent = d.name;
+    span.title = d.name + ' — click to rename';
+    document.title = d.name + ' — Metal Mapper';
+    meta.study_name = d.name;        // keep the meta panel in step
+  }).catch(() => {});
+}
+
+(() => {
+  const inp = document.getElementById('studyNameIn');
+  inp.addEventListener('keydown', e => {
+    if (e.key === 'Enter') inp.blur();                          // blur commits
+    else if (e.key === 'Escape') { inp.dataset.cancel = '1'; inp.blur(); }
+  });
+  inp.addEventListener('blur', () => {
+    const cancel = inp.dataset.cancel === '1';
+    delete inp.dataset.cancel;
+    endEditName(!cancel);
+  });
+})();
+
 function saveSliders(btn) {
   fetch('/settings/' + STUDY_ID, {
     method: 'POST',
@@ -418,10 +688,9 @@ function saveSliders(btn) {
       plus_range:     calib.plusRange,
       minus_range:    calib.minusRange,
       offset:         calib.offset,
-      dot_size:       calib.dotSize,
-      channels:       renderer.getVisible(),
+      filter:         document.getElementById('filterSel').value,
+      combine:        document.getElementById('combineChk').checked ? '1' : '0',
       zero8:          calib.zero8,
-      heading_offset: geom.rot_deg,
     })
   }).then(r => r.json()).then(d => {
     if (d.ok && btn) {
@@ -445,14 +714,15 @@ function sendCmd(byte) {
 fetch('/data/' + STUDY_ID)
   .then(r => r.json())
   .then(d => {
-    allPoints = d.points;
+    store.fillColumns(d.points);   // /data is columnar: arrays per field
     lastId    = d.last_id;
     meta      = d.meta || {};
     adcLabels = (meta.adc_order || '').split(',');
-    buildChanGrid();
+    buildStripVals();
 
-    geom = MM.geomFromMeta(meta);         // includes saved sl_heading_offset_deg
-    document.getElementById('rotIn').value = geom.rot_deg;
+    // Rotation comes with meta: config.json's heading_offset_deg, unless
+    // this study saved its own before the move to config.
+    geom = MM.geomFromMeta(meta);
     renderer.setGeometry(geom);
 
     // Restore persisted view settings; fall back to auto-zero.
@@ -460,28 +730,32 @@ fetch('/data/' + STUDY_ID)
     if (mf('sl_minus_range') != null) setSlider('minusSl', 'minusV', mf('sl_minus_range'));
     if (mf('sl_plus_range')  != null) setSlider('plusSl', 'plusV', mf('sl_plus_range'));
     if (mf('sl_offset')      != null) setSlider('offSl', 'offV', mf('sl_offset'));
-    if (mf('sl_dot_size')    != null) setSlider('sizeSl', 'sizeV', mf('sl_dot_size'));
+    if (meta.sl_filter) {
+      document.getElementById('filterSel').value = meta.sl_filter;
+      renderer.setFilter(meta.sl_filter);
+    }
+    if (meta.sl_combine != null) {
+      const on = meta.sl_combine === '1';
+      document.getElementById('combineChk').checked = on;
+      renderer.setCombine(on);
+    }
     readSliders();
     try { calib.zero8 = meta.sl_zero8 ? JSON.parse(meta.sl_zero8) : null; }
     catch (e) { calib.zero8 = null; }
-    if (!calib.zero8) calib.zero8 = autoZero(allPoints);
+    if (!calib.zero8) calib.zero8 = autoZero();
     renderer.setCalib(calib);
 
-    let chans = null;
-    try { chans = meta.sl_channels ? JSON.parse(meta.sl_channels) : null; }
-    catch (e) {}
-    if (chans) chans.forEach((on, ch) => {
-      document.getElementById('chk' + ch).checked = on;
-      renderer.setVisible(ch, on);
-    });
+    renderer.markDirty();
+    document.getElementById('ptCount').textContent = store.length;
 
-    renderer.renderAll(allPoints);
-    document.getElementById('ptCount').textContent = allPoints.length;
-
-    if (allPoints.length) {
-      const latest = allPoints[allPoints.length - 1];
-      updateChanReadout(latest.adc);
-      mapObj.setView([latest.lat, latest.lon], mapObj.getZoom());
+    if (store.length) {
+      const last = store.view();
+      for (let i = Math.max(0, store.length - STRIP_N); i < store.length; i++)
+        stripAppend(store.adcRow(i));
+      drawStrip();
+      updateChanReadout(store.adcRow(store.length - 1));
+      mapObj.setView([last.lat[store.length - 1], last.lon[store.length - 1]],
+                     mapObj.getZoom());
     }
 
     updateStatus(d.status);
@@ -505,19 +779,18 @@ function openSSE() {
     const rows = (d.rows || []).filter(p => p.id > lastId);
     if (rows.length) {
       lastId = rows[rows.length - 1].id;
-      const needSeed = !calib.zero8;
-      rows.forEach(p => allPoints.push(p));
-      if (needSeed && (calib.zero8 = autoZero(allPoints))) {
-        // First rows of a fresh study: seed zeros, then draw everything
-        // through the seeded palette (appendLive would have styled these
-        // rows grey with no later restyle).
+      rows.forEach(p => store.push(p));
+      if (!calib.zero8 && (calib.zero8 = autoZero())) {
+        // First rows of a fresh study: seed zeros. Colors are computed at
+        // draw time, so a repaint is all it takes. (The strip redraws with
+        // these zeros on this same tick, below.)
         renderer.setCalib(calib);
-        renderer.renderAll(allPoints);
-      } else {
-        rows.forEach(p => renderer.appendLive(p));
       }
-      document.getElementById('ptCount').textContent = allPoints.length;
+      renderer.markDirty();
+      document.getElementById('ptCount').textContent = store.length;
       const latest = rows[rows.length - 1];
+      rows.forEach(p => stripAppend(p.adc));
+      drawStrip();
       updateChanReadout(latest.adc);
       if (!isPaused) mapObj.panTo([latest.lat, latest.lon],
                                   {animate: true, duration: 0.25});

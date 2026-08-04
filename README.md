@@ -76,6 +76,14 @@ Open: `http://localhost:5000`
 **Studies directory**: `~/metal_mapper/studies/*.db`  
 **Config (sticky port etc.)**: `~/metal_mapper/config.json`
 
+`config.json` also holds `heading_offset_deg` (default 270): added to the
+GPS-reported heading before the coil array is drawn, correcting a heading
+aligned to the antenna baseline instead of the direction of travel. It is a
+property of the vehicle mounting, so it lives in config rather than in the
+web UI; edit the file and reload. A study saved with its own rotation
+(`sl_heading_offset_deg` in its meta, from before this moved to config)
+keeps that value.
+
 #### Study list page
 
 - Shows all `.db` files in the studies directory, newest first
@@ -90,17 +98,50 @@ Open: `http://localhost:5000`
 | Control | What it does |
 |---------|-------------|
 | ← Studies | Back to study list |
+| Study name | Click to rename (Enter saves, Esc cancels) — changes the label shown everywhere; the `.db` filename and URL stay the same |
+| ⓘ Meta | Collapsible panel of the study's acquisition provenance: recording setup (gate, min distance, serial port), firmware build, fire mode, ADC oversample and channel order, GPS id/version, PI timing, and coil geometry. Values that drifted mid-study show `stamped → current` and an incomplete header is flagged |
 | 🎯 Re-zero | Set per-channel zero baselines from average of last 20 points |
 | ⏸ Pause / ▶ Resume | Freeze map pan/add; data still streams |
-| − Range slider | ADC counts below zero that map to full green (default 1600) |
-| + Range slider | ADC counts above zero that map to full red (default 1600) |
-| Offset slider | Shifts effective zero of all channels, in counts (default 0) |
+| − Range slider | ADC counts below zero that map to full green (default 450, max 2000) |
+| + Range slider | ADC counts above zero that map to full red (default 450, max 2000) |
+| Offset slider | Shifts effective zero of all channels, in counts (default −140, range ±2000) |
 | 💾 Save View | Persists slider/zero settings into the study's meta table |
-| Size slider | Dot radius in pixels |
+| Filter | `absolute` (raw counts vs zero) or `Δ array mean` (common-mode rejection) |
+| Combine | on: overlapping passes accumulate (re-pass adds); off: newest dots cover older |
+| Channel strip chart | scrolling graph of all 8 channels' deviation from their zero baselines (so the lines overlay instead of fanning out by DC offset), one shared scale, one line color per channel, newest samples at the right; current raw values listed vertically beside it, colored by the map's value color |
 
 **Color scheme**: at zero → gray, above zero → red, below zero → green,
 in raw ADC counts. Zero is per channel; offset/ranges are shared. Baselines
 auto-seed from the study's first 10 points until Re-zero sets them.
+
+**Δ array mean filter**: subtracts the mean zeroed deviation of the coils
+at each instant before coloring. Anything that moves the whole array
+together — thermal drift, bulk ground response — cancels to gray instead of
+striping whole passes red/green; only differential (target-like) signal keeps
+color, with a faint opposite-sign halo on neighboring coils (inherent to mean
+subtraction). Trade-off: a response that lifts all 8 coils equally is itself
+common-mode and is suppressed — hence a toggle, not a replacement. Click
+popups show both the raw ADC and the filtered Δ that drives the color.
+
+**Rendering at scale**: all dots draw onto a single canvas from columnar
+typed arrays (~90 B/point) — no per-dot map objects — so studies of
+hundreds of thousands of points load in about a second and stay
+responsive. Zoomed out past ~30k in-view points the renderer switches to
+peak-preserving binning: each screen cell shows its strongest deviation,
+so a hit can never be averaged away; zooming in returns to per-coil dots.
+Dots are sized automatically — exactly one coil spacing wide on screen —
+so the 8 coil tracks tile into a seamless swath at every zoom.
+Click any dot (old or new) for its channel, raw ADC, position, heading,
+and fix. Points recorded without a heading draw as hollow blue antenna
+dots — coil positions are never guessed.
+
+**Combine (multi-pass accumulation)**: with Combine checked (default),
+overlapping dots merge in the value domain instead of painting over each
+other — an earlier pass is never hidden or washed out by a later one, and
+ground covered on multiple passes shows the *sum* of what each visit saw:
+a target seen twice reads roughly twice as strong. Overlap within a single
+visit doesn't add (a pixel keeps its extreme value), so slow driving gains
+nothing. Unchecked: classic painting, newest dots cover older ones.
 
 **Toolbar controls (live sessions only):**
 
@@ -115,9 +156,10 @@ auto-seed from the study's first 10 points until Re-zero sets them.
 delivers only new rows every 0.5 s. The heartbeat event also carries motion status
 so the display updates even when no new points are being saved.
 
-**Per-study slider persistence**: `+ Range`, `− Range`, `Offset`, dot size, and the
-re-zeroed baseline are saved to the study's `meta` table when you click 💾 Save View,
-and restored automatically the next time you open that study.
+**Per-study slider persistence**: `+ Range`, `− Range`, `Offset`, the filter
+mode, the Combine switch, and the re-zeroed baseline are saved to the study's
+`meta` table when you click 💾 Save View, and restored automatically the next
+time you open that study.
 
 ---
 
@@ -128,7 +170,11 @@ and restored automatically the next time you open that study.
 Copy to `/opt/metal_mapper/` on the Pi:
 - `db_map.py`
 - `serial_daemon.py`
+- `nav_gps.py`
 - `gunicorn_config.py`
+- `templates/` (whole directory — a missing `templates/index.html` is the
+  classic 500 `TemplateNotFound` in `/var/log/metal_mapper/error.log`)
+- `static/` (whole directory — vendored Leaflet + `map_core.js`; no CDN)
 - `camp_outlines_2025.geojson` (optional GeoJSON overlay)
 
 ### `gunicorn_config.py`

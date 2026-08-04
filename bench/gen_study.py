@@ -83,9 +83,14 @@ def gen_serpentine():
             xs = [38.0 - (x - 2.0) for x in xs]
         for x in xs:
             lat, lon = ll(x, y)
+            # slow common-mode drift: lifts ALL channels together (like temp /
+            # ground response) — makes abs-mode striping the Δ-filter removes
+            cm = int(300 * math.sin(n / 40.0))
             pt = {'lat': round(lat, 9), 'lon': round(lon, 9),
                   'heading': heading + 2.0 * math.sin(x / 5.0),
-                  'fix': 4, 'adc': adc_at(lat, lon, heading),
+                  'fix': 4,
+                  'adc': [max(0, min(65535, a + cm))
+                          for a in adc_at(lat, lon, heading)],
                   'gps_ts': f'{gps_s:.2f}',
                   'vin': round(12.3 + 0.05 * math.sin(n / 40.0), 3) if n % 10 == 0 else None,
                   'temp': round(38.0 + 0.3 * math.sin(n / 60.0), 1) if n % 10 == 0 else None}
@@ -133,5 +138,58 @@ def gen_warn():
     conn.close()
     print('warn_demo: 60 points with drift + identity warnings')
 
+def gen_big(n_target=400_000):
+    """Scale test: a long serpentine at real field density (~400k points ≈
+    5.5 h of 20 Hz recording). Only built on request ('big' argv) — it takes
+    ~a minute and ~50 MB. Same targets/noise model as serpentine_demo so the
+    renderer's LOD can be eyeballed against known hits."""
+    path = os.path.join(OUT, 'big_demo.db')
+    if os.path.exists(path):
+        os.unlink(path)
+    conn = sd.db_open(path)
+    sd.meta_set(conn, 'study_name', 'big_demo')
+    sd.meta_set(conn, 'created_at', str(time.time()))
+    for k, v in HEADER.items():
+        sd.meta_set(conn, k, v)
+
+    speed, hz = 2.0, 20.0                      # field cadence
+    step = speed / hz
+    field_w = 400.0                            # a real-sized survey field
+    per_pass = int(field_w / step)
+    passes = max(1, round(n_target / per_pass))
+    t = time.time() - n_target / hz
+    n = 0
+    conn.execute('BEGIN')
+    for row in range(passes):
+        east = (row % 2 == 0)
+        heading = 90.0 if east else 270.0
+        y = 2.0 + row * 3.5
+        for j in range(per_pass):
+            x = 2.0 + j * step if east else 2.0 + field_w - j * step
+            lat, lon = ll(x, y)
+            # adc_at is too slow at 400k×8 coils; cheap per-point signal:
+            # baseline + the two demo targets sampled at the antenna.
+            adc = []
+            for ch in range(8):
+                v = 52000.0 + ch * 190
+                for tx, ty, amp, rad in TARGETS:
+                    d2 = (x - tx % field_w) ** 2 + (y - ty) ** 2
+                    v += 16 * amp * math.exp(-d2 / (2 * rad * rad))
+                v += 40.0 * math.sin(x * 7.3 + y * 3.1 + ch)
+                adc.append(max(0, min(65520, int(v))))
+            conn.execute(
+                'INSERT INTO points (ts,lat,lon,heading,fix,'
+                'adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7,gps_ts,vin,temp) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                (t, lat, lon, heading + 2.0 * math.sin(x / 5.0), 4,
+                 *adc, f'{(120000 + n / hz):.2f}', None, None))
+            t += 1 / hz
+            n += 1
+    conn.commit()
+    conn.close()
+    print(f'big_demo: {n} points ({passes} passes over {field_w:.0f} m)')
+
 gen_serpentine()
 gen_warn()
+if 'big' in sys.argv[1:]:
+    gen_big()

@@ -64,6 +64,10 @@ DEFAULT_CONFIG = {
     'nav_host':    '127.0.0.1',
     'nav_port':    50012,
     'studies_dir': str(Path.home() / 'metal_mapper' / 'studies'),
+    # Added to the GPS-reported heading before coil geometry — corrects a
+    # heading aligned to the antenna baseline instead of direction of travel.
+    # A property of the vehicle mounting, so it lives here, not per study.
+    'heading_offset_deg': 270,
 }
 
 # CLI overrides (bench runs); never written back to config.json.
@@ -93,6 +97,13 @@ def load_config():
                 raise ValueError
         except (TypeError, ValueError):
             cfg[key] = DEFAULT_CONFIG[key]
+    try:
+        h = float(cfg['heading_offset_deg'])
+        if not math.isfinite(h):
+            raise ValueError
+        cfg['heading_offset_deg'] = int(h) if h.is_integer() else h
+    except (TypeError, ValueError):
+        cfg['heading_offset_deg'] = DEFAULT_CONFIG['heading_offset_deg']
     return cfg
 
 
@@ -290,6 +301,31 @@ _POINT_COLS = ('id', 'ts', 'lat', 'lon', 'heading', 'fix',
                'gps_ts', 'vin', 'temp')
 
 
+def load_columns(db_path):
+    """Bulk study points as parallel column arrays for /data. The browser
+    fills typed arrays straight from these; dict-per-point at 20 Hz study
+    sizes is megabytes of JSON key overhead and object churn on both ends.
+    adc is 8 arrays (one per channel), values raw counts. Only the fields
+    the renderer/popups need — ts/gps_ts/vin/temp stay row-level (/stream).
+    """
+    empty = {'id': [], 'lat': [], 'lon': [], 'heading': [], 'fix': [],
+             'adc': [[] for _ in range(8)]}
+    try:
+        conn = db_ro(db_path)
+        rows = conn.execute(
+            'SELECT id,lat,lon,heading,fix,'
+            'adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7 '
+            'FROM points ORDER BY id').fetchall()
+        conn.close()
+    except Exception:
+        return empty
+    if not rows:
+        return empty
+    t = list(zip(*rows))                     # transpose at C speed
+    return {'id': t[0], 'lat': t[1], 'lon': t[2], 'heading': t[3],
+            'fix': t[4], 'adc': t[5:13]}
+
+
 def load_points(db_path, since_id=0):
     """Points as dicts; adc packed into a list, values left as raw counts —
     all channel math (zeros, ranges, coil positions) happens client-side."""
@@ -398,8 +434,10 @@ def derive_status(db_path, meta=None):
 #
 # The detector GPS may report heading along its antenna baseline rather than
 # the direction of travel — mounting-dependent, unknown until field test.
-# heading_off_deg (per-study meta sl_heading_offset_deg, set from the view)
-# is added to the reported heading before any of this math to absorb that.
+# heading_off_deg is added to the reported heading before any of this math to
+# absorb that. It comes from config.json (heading_offset_deg — a vehicle
+# mounting property); a study whose meta saved its own sl_heading_offset_deg
+# before the move to config keeps that value.
 
 _M_PER_DEG_LAT = 111320.0
 
@@ -499,11 +537,15 @@ def get_data(study_id):
     db_path = get_db_path(study_id)
     if not os.path.exists(db_path):
         return jsonify({'error': 'Not found'}), 404
-    points = load_points(db_path)
+    points = load_columns(db_path)
     meta = read_meta(db_path)
+    # Rotation follows config.json unless this study saved its own value
+    # (pre-move studies); the client reads it out of meta either way.
+    meta.setdefault('sl_heading_offset_deg',
+                    str(load_config()['heading_offset_deg']))
     return jsonify({
         'points':  points,
-        'last_id': points[-1]['id'] if points else 0,
+        'last_id': points['id'][-1] if points['id'] else 0,
         'is_live': is_live(db_path),
         'meta':    meta,
         'status':  derive_status(db_path, meta),
@@ -567,10 +609,9 @@ def save_settings(study_id):
         'sl_plus_range':  data.get('plus_range'),
         'sl_minus_range': data.get('minus_range'),
         'sl_offset':      data.get('offset'),
-        'sl_dot_size':    data.get('dot_size'),
-        'sl_channels':    json.dumps(data['channels']) if data.get('channels') is not None else None,
+        'sl_filter':      data.get('filter'),
+        'sl_combine':     data.get('combine'),
         'sl_zero8':       json.dumps(data['zero8']) if data.get('zero8') is not None else None,
-        'sl_heading_offset_deg': data.get('heading_offset'),
     }
     try:
         conn = sqlite3.connect(db_path)
@@ -584,6 +625,30 @@ def save_settings(study_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     return jsonify({'ok': True})
+
+
+@app.route('/rename/<study_id>', methods=['POST'])
+def rename_study(study_id):
+    """Update the study's human label (meta study_name). The .db filename —
+    and with it the study id and URL — never changes: it is the daemon's
+    open path while a study is live, and the stable id everywhere else."""
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        return jsonify({'error': 'Not found'}), 404
+    data = request.get_json(force=True)
+    name = str(data.get('name') or '').strip()
+    if not name or len(name) > 120:
+        return jsonify({'error': 'name must be 1-120 characters'}), 400
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.execute('PRAGMA busy_timeout=1000')
+        conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
+                     ('study_name', name))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'name': name})
 
 
 @app.route('/recalibrate/<study_id>', methods=['POST'])

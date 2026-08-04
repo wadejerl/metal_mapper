@@ -286,11 +286,26 @@ check('view of missing study redirects', r.status_code == 302)
 r = client.get('/data/saved1')
 d = r.get_json()
 check('data 200', r.status_code == 200)
-check('data points shape', len(d['points']) == 5
-      and len(d['points'][0]['adc']) == 8 and d['points'][0]['heading'] == 90.0,
-      repr(d['points'][:1]))
+cols = d['points']
+check('data is columnar', len(cols['lat']) == 5 and len(cols['adc']) == 8
+      and len(cols['adc'][0]) == 5 and cols['heading'][0] == 90.0,
+      repr({k: (v if k != 'adc' else v[0]) for k, v in cols.items()}))
+check('data last_id from id column', d['last_id'] == cols['id'][-1] == 5)
 check('data carries meta + status + nav',
       'meta' in d and d['status']['state'] == 'stopped' and 'connected' in d['nav'])
+
+# Columns must agree with the row loader (the SSE path still uses rows —
+# a divergence would render live points differently from loaded ones).
+rows = db_map.load_points(os.path.join(STUDIES, 'saved1.db'))
+colsd = db_map.load_columns(os.path.join(STUDIES, 'saved1.db'))
+check('rows/columns equivalent',
+      all(colsd['id'][i] == p['id'] and colsd['lat'][i] == p['lat']
+          and colsd['lon'][i] == p['lon'] and colsd['heading'][i] == p['heading']
+          and colsd['fix'][i] == p['fix']
+          and [colsd['adc'][ch][i] for ch in range(8)] == p['adc']
+          for i, p in enumerate(rows)))
+check('columns empty on missing db',
+      db_map.load_columns('/nonexistent.db')['id'] == [])
 
 # Path traversal must 404, never touch the filesystem.
 r = client.get('/data/..%2f..%2fetc%2fpasswd')
@@ -300,20 +315,64 @@ check('traversal blocked (view)', r.status_code == 404, r.status_code)
 r = client.get('/geojson/../serial_daemon.py')
 check('traversal blocked (geojson)', r.status_code == 404, r.status_code)
 
-# Settings roundtrip (channels + zero8 as JSON).
+# Settings roundtrip (zero8 as JSON). channels/heading_offset are obsolete
+# (channel toggles removed; rotation lives in config.json) — a stale client
+# still sending them must not write those keys.
 r = client.post('/settings/saved1', json={
-    'plus_range': 250, 'minus_range': 50, 'offset': -10, 'dot_size': 3,
-    'channels': [True, True, False, True, True, True, True, False],
+    'plus_range': 250, 'minus_range': 50, 'offset': -10,
+    'filter': 'cm', 'combine': '0',
     'zero8': [1000.5] * 8,
+    'channels': [True, True, False, True, True, True, True, False],
     'heading_offset': -90,
 })
 check('settings saved', r.get_json().get('ok') is True)
 m = db_map.read_meta(p_saved)
 check('settings persisted', m.get('sl_plus_range') == '250'
-      and json.loads(m['sl_channels']) == [True, True, False, True, True, True, True, False]
       and json.loads(m['sl_zero8']) == [1000.5] * 8, repr(m))
-check('heading offset persisted', m.get('sl_heading_offset_deg') == '-90',
-      repr(m.get('sl_heading_offset_deg')))
+check('obsolete channel/rotation keys ignored',
+      'sl_channels' not in m and 'sl_heading_offset_deg' not in m,
+      repr(sorted(m)))
+check('filter persisted', m.get('sl_filter') == 'cm',
+      repr(m.get('sl_filter')))
+check('combine persisted', m.get('sl_combine') == '0',
+      repr(m.get('sl_combine')))
+
+# Rotation: /data serves config.json's heading_offset_deg unless the study
+# saved its own sl_heading_offset_deg before the move to config.
+d = client.get('/data/saved1').get_json()
+check('data serves default rotation',
+      d['meta'].get('sl_heading_offset_deg') == '270',
+      repr(d['meta'].get('sl_heading_offset_deg')))
+db_map.CONFIG_FILE.write_text(json.dumps({'heading_offset_deg': 90}))
+d = client.get('/data/saved1').get_json()
+check('data follows config rotation',
+      d['meta'].get('sl_heading_offset_deg') == '90',
+      repr(d['meta'].get('sl_heading_offset_deg')))
+db_map.CONFIG_FILE.unlink()
+make_study('rot1', meta={'sl_heading_offset_deg': '0'})
+d = client.get('/data/rot1').get_json()
+check('study meta rotation beats config',
+      d['meta'].get('sl_heading_offset_deg') == '0',
+      repr(d['meta'].get('sl_heading_offset_deg')))
+
+# Rename updates the label (meta study_name); the .db filename is untouched.
+r = client.post('/rename/saved1', json={'name': 'Renamed Run'})
+check('rename ok', r.get_json().get('ok') is True, repr(r.get_json()))
+m = db_map.read_meta(p_saved)
+check('rename persisted', m.get('study_name') == 'Renamed Run',
+      repr(m.get('study_name')))
+check('rename keeps filename', os.path.exists(p_saved))
+r = client.get('/view/saved1')
+check('view shows new name', b'Renamed Run' in r.data)
+check('view has meta panel', b'metaPanel' in r.data and b'META_GROUPS' in r.data)
+r = client.get('/')
+check('index shows new name', b'Renamed Run' in r.data)
+r = client.post('/rename/saved1', json={'name': '   '})
+check('rename rejects blank', r.status_code == 400, r.status_code)
+r = client.post('/rename/saved1', json={'name': 'x' * 121})
+check('rename rejects overlong', r.status_code == 400, r.status_code)
+r = client.post('/rename/no_such_study', json={'name': 'x'})
+check('rename missing study 404', r.status_code == 404, r.status_code)
 
 # Re-zero computes per-channel means over the last points.
 r = client.post('/recalibrate/saved1')
@@ -416,12 +475,14 @@ orig_cfg_text = (db_map.CONFIG_FILE.read_text()
                  if db_map.CONFIG_FILE.exists() else None)
 saved_overrides = dict(db_map._cli_overrides)
 db_map.CONFIG_FILE.write_text(json.dumps(
-    {'nav_port': None, 'baud': 'fast', 'studies_dir': 123, 'nav_host': ''}))
+    {'nav_port': None, 'baud': 'fast', 'studies_dir': 123, 'nav_host': '',
+     'heading_offset_deg': 'north'}))
 db_map._cli_overrides.clear()
 cfg = db_map.load_config()
 check('config type fallback',
       cfg['nav_port'] == 50012 and cfg['baud'] == 460800
-      and isinstance(cfg['studies_dir'], str) and cfg['nav_host'] == '127.0.0.1',
+      and isinstance(cfg['studies_dir'], str) and cfg['nav_host'] == '127.0.0.1'
+      and cfg['heading_offset_deg'] == 270,
       repr(cfg))
 db_map._cli_overrides.update(saved_overrides)
 if orig_cfg_text is not None:
