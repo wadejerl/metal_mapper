@@ -47,49 +47,79 @@ extern volatile int32_t  md_coil_offset_right_mm;  /* + starboard          */
 /* Completed-cycle counter (incremented when a full ADC frame lands) */
 extern volatile uint32_t md_cycle_count;
 
-/* All 8 analog inputs, converted every cycle regardless of fire mode
+/* All 8 analog inputs, converted every cycle
  * (adjacent coils read each other's pulses — cross-interpolation data).
  * Each value is the hardware SUM of 16 12-bit conversions (0..65520,
  * see md_adc_init): ~2 extra effective bits from oversampling.
  * Order: [0]=PA0 [1]=PA1 (ADC1), [2]=PA6 [3]=PA7 (ADC2),
- *        [4]=PB1 [5]=PB13 (ADC3), [6]=PB12 [7]=PB14 (ADC4). */
+ *        [4]=PB1 [5]=PB13 (ADC3), [6]=PB12 [7]=PB14 (ADC4).
+ * Live view of the most recent frame (debug aid); reporting reads the
+ * frame ring below instead, so no frame is lost while printf blocks. */
 #define MD_ADC_COUNT 8U
 extern volatile uint16_t md_adc[MD_ADC_COUNT];
-extern volatile uint8_t  md_adc_frame_ready;   /* set per frame; pacer re-clears */
 
 /* GPS-synchronised cycle pacing (TIM7 one-shot, 0.1 ms ticks).
  *
  * The GPS fix interval is the master cadence: every valid GGA re-arms TIM7
- * so the next cycle completes MD_SAMPLE_LEAD_MS before the following fix
- * arrives — each CSV line then carries a frame measured just before its
- * fix. Without a valid fix the timer re-arms itself at MD_IDLE_PERIOD_MS,
- * so idle lines stay fresh and the coils rest between samples (duty cycle
- * is the point: the front end runs warm when cycles free-run).
+ * so md_samples_per_period cycles spread evenly across the fix interval,
+ * the first firing MD_SAMPLE_LEAD_MS before the interval's even grid —
+ * the last frame of each interval then completes just before the next fix
+ * arrives. Without a valid fix the timer re-arms itself at the same
+ * sample interval, so the stream free-runs at the full configured rate:
+ * bench tools see all 8 channels at rate with no GPS attached, and the
+ * analog front end holds the same thermal duty cycle on the bench as in
+ * the field (it runs warm — that IS the surveying operating point; an
+ * idle rest would make bench baselines lie about field baselines).
  *
- * MD_SAMPLES_PER_GPS_PERIOD > 1 spreads that many cycles evenly across the
- * fix interval (the last still lands MD_SAMPLE_LEAD_MS early) for future
- * interpolation work — the extra frames overwrite md_adc[] and are NOT
- * reported; consuming them needs host-side changes too. */
+ * Every completed frame is queued (see md_frame_pop) and reported as its
+ * own CSV sample line carrying a sample tick; GPS fixes are reported as
+ * separate anchor lines carrying the tick of the last completed frame.
+ * The host interpolates sample positions between anchor ticks, so the
+ * rate is fixed per study — never speed-adaptive, which would turn speed
+ * changes into coil duty-cycle (thermal, baseline) changes. */
 #define MD_GPS_PERIOD_MS          50U   /* Quectel fix interval (20 Hz)    */
-#define MD_SAMPLES_PER_GPS_PERIOD 1U    /* cycles per fix interval (>= 1)  */
-#define MD_SAMPLE_LEAD_MS         2U    /* cycle-to-fix lead time          */
-#define MD_IDLE_PERIOD_MS         500U  /* no-fix sampling/reporting rate  */
+#define MD_SAMPLES_PER_GPS_PERIOD 25U   /* default cycles per fix (500 Hz) */
+#define MD_SAMPLE_LEAD_MS         1U    /* cycle-to-fix lead time          */
 
 #if MD_SAMPLES_PER_GPS_PERIOD < 1U
 # error "MD_SAMPLES_PER_GPS_PERIOD must be >= 1"
 #endif
 #if (MD_GPS_PERIOD_MS % MD_SAMPLES_PER_GPS_PERIOD) != 0U
-# error "MD_SAMPLES_PER_GPS_PERIOD must divide MD_GPS_PERIOD_MS (1, 2, 5, 10)"
+# error "MD_SAMPLES_PER_GPS_PERIOD must divide MD_GPS_PERIOD_MS (1, 2, 5, 10, 25)"
 #endif
 #if (MD_GPS_PERIOD_MS / MD_SAMPLES_PER_GPS_PERIOD) <= MD_SAMPLE_LEAD_MS
 # error "MD_SAMPLES_PER_GPS_PERIOD too high: first fire delay would be <= 0"
 #endif
 
-/* Set by the pacer when an idle-cadence cycle starts (no valid fix armed
- * the timer); with md_adc_frame_ready it tells the app task to emit an
- * idle CSV line from the fresh frame. Consumer clears md_idle_line_due;
- * md_adc_frame_ready is re-cleared by the pacer at the next cycle start. */
-extern volatile uint8_t md_idle_line_due;
+/* Runtime sample rate: cycles per GPS period, g/b console keys stepping
+ * through {1, 2, 5, 10, 25} (20..500 Hz), persisted with the settings.
+ * 50 (1000 Hz) is deliberately absent: sample lines would exceed the
+ * 460800-baud console link (~46 kB/s), and the interval would equal
+ * MD_SAMPLE_LEAD_MS, making the post-fix arm delay zero. */
+extern volatile uint8_t md_samples_per_period;
+
+/* Sample ticks: the pacer numbers every fire (skipped slots burn their
+ * tick, so a gap in reported ticks is a real gap in time), and each
+ * completed frame carries its fire's tick. Ticks are the protocol's only
+ * time axis — frames are evenly spaced within a fix interval, so the
+ * host interpolates positions linearly in tick space between anchors.
+ * md_tick_completed is the tick of the newest completed frame; the GGA
+ * path stamps it into the fix anchor (one atomic uint32 read). */
+extern volatile uint32_t md_tick_completed;
+
+/* Completed-frame ring: written by the last JEOS ISR, drained by the app
+ * task (single writer / single reader, free-running indices). Sized for
+ * ~64 ms of 500 Hz backlog — printf blocks ~1.3 ms per line, so depth
+ * beyond a few covers only pathological stalls; an overrun drops that
+ * frame (its tick gap tells the host) and counts md_frame_overruns. */
+typedef struct {
+  uint32_t tick;
+  uint16_t adc[MD_ADC_COUNT];
+} md_frame_t;
+
+/* Dequeue the oldest completed frame into *out; 0 if the ring is empty.
+ * Task context only. */
+uint8_t md_frame_pop(md_frame_t *out);
 
 /* Re-sync the pacer to a just-received valid GGA fix. USART2 IRQ context;
  * TIM7 runs at the same NVIC priority so the two arm sites never nest. */
@@ -98,23 +128,6 @@ void md_pace_on_fix(void);
 /* TIM7 expiry hook — called from TIM7_DAC_IRQHandler in stm32g4xx_it.c.
  * Starts the cycle and re-arms (fix-interval subdivision or idle rate). */
 void md_pace_fired(void);
-
-/* Which coil(s) fire this cycle. This gates ONLY the TX channels: the
- * gain/integ/RX signals on both sets run the identical dual-mode timeline
- * every cycle, and all 8 ADC inputs are read regardless. Single-coil
- * operation alternates MD_FIRE_A / MD_FIRE_B on successive cycles. */
-typedef enum {
-  MD_FIRE_A    = 1,
-  MD_FIRE_B    = 2,
-  MD_FIRE_BOTH = 3,
-} md_fire_t;
-
-/* Which set(s) the pacer fires each cycle (keys 1/2/3, persisted with the
- * settings record). Console vocabulary: 1 = odd (set A, PA5 strobes),
- * 2 = even (set B, PB4), 3 = both (default). Gates ONLY the TX strobes —
- * all other control lines and all 8 ADC reads run identically regardless.
- * uint8_t (md_fire_t values) so the pacer-ISR read is one atomic load. */
-extern volatile uint8_t md_fire_mode;
 
 /* One-time hardware setup; call after MX_ inits, before md_start_cycle.
  * Loads saved settings from flash first. */
@@ -140,7 +153,7 @@ uint32_t MD_Settings_ECC_NMI(void);
  * capitals are saves/toggles/specials.
  *   a/z blanking +-2us (0..200)      s/x rx window +-1us (1..50)
  *   d/c coil spacing +-10mm (50..5000)  f/v tx pulse +-1us (10..120)
- *   1/2/3 fire mode: odd (A) / even (B) / both
+ *   g/b sample rate up/down (20/40/100/200/500 Hz)
  *   S save   D restore+save defaults   I info line
  *   G toggle GPS passthrough (# PQTMTXT/PQTMTAR/THS lines, default off) */
 void md_console_poll(void);
@@ -159,12 +172,11 @@ void md_print_keys(void);
  * Blocking ~18 us injected read; task context only. */
 void md_status_read(float *vin_volts, float *temp_c);
 
-/* Pacer IRQ context (md_pace_fired): arm both sets (TX gated by `which`)
- * and start the master. All timers start on one hardware trigger, aligned
- * to a single timer clock (~6 ns). Returns 1 if the cycle started, 0 if
- * skipped because the previous cycle (timers or ADC) is still running —
- * alternating callers should only advance on 1. */
-uint8_t md_start_cycle(md_fire_t which);
+/* Pacer IRQ context (md_pace_fired): arm both sets and start the master.
+ * All timers start on one hardware trigger, aligned to a single timer
+ * clock (~6 ns). Returns 1 if the cycle started, 0 if skipped because
+ * the previous cycle (timers or ADC) is still running. */
+uint8_t md_start_cycle(void);
 
 /* OPM-expiry hooks (TIM1/TIM8 UIE) — called from
  * HAL_TIM_PeriodElapsedCallback in main.c. TIM1's starts the ADC reads. */

@@ -14,8 +14,9 @@ it, they never re-derive — and folds in the optional nav-GPS subsystem
 each independently optional: with neither present this is a saved-study
 viewer, which is a fully supported mode.
 
-Configuration lives in ~/metal_mapper/config.json (serial_port, baud,
+Configuration lives in ~/metal_mapper/config.json (serial_port,
 nav_host, nav_port, studies_dir) and is editable from the index page;
+baud is fixed in serial_daemon.py (custom system, one console rate);
 CLI flags override for bench runs, e.g. on a Mac with the hardware:
 
     python3 db_map.py --serial-port /dev/cu.usbmodem1103 \\
@@ -37,6 +38,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.request
@@ -57,10 +59,18 @@ STATIC_DIR    = Path(__file__).parent / 'static'
 
 LIVE_STALE_S  = 3.0    # live.updated_at older than this + PID alive = wedged
 SSE_PERIOD_S  = 0.5
+NAV_SSE_PERIOD_S = 2.0     # nav chip only — connection state changes slowly
+NAV_SSE_MAX_TICKS = 150    # ~5 min per response; see stream_nav()
+
+# View Raw (system test / calibration): a reserved study id whose db lives
+# in the temp dir, NOT the studies dir — it never appears in the study list
+# and holds no points (the daemon runs with --raw). str, not Path: it is
+# compared against PID-file contents.
+RAW_ID = '__raw__'
+RAW_DB = os.path.join(tempfile.gettempdir(), 'metal_mapper_raw.db')
 
 DEFAULT_CONFIG = {
     'serial_port': '/dev/ttyACM0',
-    'baud':        460800,
     'nav_host':    '127.0.0.1',
     'nav_port':    50012,
     'studies_dir': str(Path.home() / 'metal_mapper' / 'studies'),
@@ -90,13 +100,12 @@ def load_config():
     for key in ('serial_port', 'nav_host', 'studies_dir'):
         if not isinstance(cfg.get(key), str) or not cfg[key]:
             cfg[key] = DEFAULT_CONFIG[key]
-    for key, hi in (('baud', 100_000_000), ('nav_port', 65535)):
-        try:
-            cfg[key] = int(cfg[key])
-            if not (0 < cfg[key] <= hi):
-                raise ValueError
-        except (TypeError, ValueError):
-            cfg[key] = DEFAULT_CONFIG[key]
+    try:
+        cfg['nav_port'] = int(cfg['nav_port'])
+        if not (0 < cfg['nav_port'] <= 65535):
+            raise ValueError
+    except (TypeError, ValueError):
+        cfg['nav_port'] = DEFAULT_CONFIG['nav_port']
     try:
         h = float(cfg['heading_offset_deg'])
         if not math.isfinite(h):
@@ -159,14 +168,23 @@ def ensure_leaflet():
 
 ensure_leaflet()
 
-_VERSION_FILE = Path(__file__).parent / 'version.txt'
+# resolve(): on the Pi this file is a SYMLINK in /opt/metal_mapper pointing
+# into the git checkout — .parent of the link is /opt (no .git, no *.service
+# files), .parent of the resolved path is the repo.
+_REPO_DIR = Path(__file__).resolve().parent
+
+_VERSION_FILE = _REPO_DIR / 'version.txt'
+
+# Absolute path: jlw_metalmap.service sets PATH to the venv bin only, so a
+# bare 'git' never resolves under gunicorn (fallback covers exotic hosts).
+_GIT_BIN = '/usr/bin/git' if os.path.exists('/usr/bin/git') else 'git'
 
 
 def _git_hash():
     try:
         h = subprocess.check_output(
-            ['git', 'rev-parse', '--short', 'HEAD'],
-            cwd=Path(__file__).parent, stderr=subprocess.DEVNULL
+            [_GIT_BIN, 'rev-parse', '--short', 'HEAD'],
+            cwd=_REPO_DIR, stderr=subprocess.DEVNULL
         ).decode().strip()
         _VERSION_FILE.write_text(h)
         return h
@@ -181,6 +199,16 @@ def _git_hash():
 GIT_HASH = _git_hash()
 
 app = Flask(__name__)
+
+
+@app.context_processor
+def _inject_asset_version():
+    """`?v={{ asset_v }}` on static includes. Flask serves /static with no
+    Cache-Control header, so browsers apply HEURISTIC freshness (10% of the
+    file's age) and can keep serving a stale map_core.js without ever
+    revalidating — surviving a pull, a gunicorn restart AND a plain reload
+    on the kiosk. A version query flips the URL per deploy instead."""
+    return {'asset_v': GIT_HASH}
 
 
 @app.before_request
@@ -278,6 +306,8 @@ def safe_study_id(study_id):
 
 
 def get_db_path(study_id):
+    if study_id == RAW_ID:
+        return RAW_DB
     return str(studies_dir() / f'{safe_study_id(study_id)}.db')
 
 
@@ -326,6 +356,26 @@ def load_columns(db_path):
             'fix': t[4], 'adc': t[5:13]}
 
 
+def env_stats(db_path):
+    """Whole-study min/avg/max of the 1 Hz vin/temp pairs the daemon stamps
+    onto every point row. SQL aggregates skip NULLs (rows written before the
+    first pair arrived); a study with no pairs at all gets None per field."""
+    try:
+        conn = db_ro(db_path)
+        try:
+            r = conn.execute('SELECT MIN(vin), AVG(vin), MAX(vin),'
+                             '       MIN(temp), AVG(temp), MAX(temp) '
+                             'FROM points').fetchone()
+        finally:
+            conn.close()   # a failing SELECT must not strand the handle
+    except Exception:
+        return {'vin': None, 'temp': None}
+
+    def trio(mn, avg, mx):
+        return None if avg is None else {'min': mn, 'avg': avg, 'max': mx}
+    return {'vin': trio(*r[0:3]), 'temp': trio(*r[3:6])}
+
+
 def load_points(db_path, since_id=0):
     """Points as dicts; adc packed into a list, values left as raw counts —
     all channel math (zeros, ranges, coil positions) happens client-side."""
@@ -369,9 +419,36 @@ def read_live(db_path):
     return d
 
 
+def load_samples(db_path, since_id=0, cap=4096):
+    """Rows of the daemon's live_samples ring newer than since_id, oldest
+    first. Empty on any trouble (pre-ring db, table mid-rewrite): the strip
+    chart just skips a beat rather than the stream dying."""
+    try:
+        conn = db_ro(db_path)
+        rows = conn.execute(
+            'SELECT id,tick,adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7 '
+            'FROM live_samples WHERE id > ? ORDER BY id LIMIT ?',
+            (since_id, cap)).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    return [{'id': r[0], 'tick': r[1], 'adc': list(r[2:])} for r in rows]
+
+
+def samples_max_id(db_path):
+    """Newest ring id, or None (empty ring / no table / no db)."""
+    try:
+        conn = db_ro(db_path)
+        mx = conn.execute('SELECT MAX(id) FROM live_samples').fetchone()[0]
+        conn.close()
+        return mx
+    except Exception:
+        return None
+
+
 # ── Status derivation — THE single source of truth for every view ────────────
 
-TIMING_KEYS = ('blanking_us', 'rx_window_us', 'tx_pulse_us')
+TIMING_KEYS = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz')
 
 
 def derive_status(db_path, meta=None):
@@ -462,42 +539,317 @@ def coil_positions(lat, lon, heading_deg, spacing_mm, fore_mm, right_mm,
 
 # ── Study list ────────────────────────────────────────────────────────────────
 
+# Study summaries are re-read only when the files change: COUNT(*) walks
+# the whole points table, and on the Pi's SD card doing that for a season
+# of studies made every return to the landing page crawl. Keyed per path;
+# only the live study's signature moves between renders.
+_study_cache = {}
+
+
+def _study_sig(p):
+    """Change signature of a study db. WAL mode: writes land in -wal first
+    and only reach the main file on checkpoint, so both must be watched."""
+    sig = []
+    for f in (str(p), str(p) + '-wal'):
+        try:
+            st = os.stat(f)
+            sig.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            sig.append(None)
+    return tuple(sig)
+
+
 def list_studies():
     studies = []
-    for p in sorted(studies_dir().glob('*.db'),
-                    key=lambda x: x.stat().st_mtime, reverse=True):
+
+    for p in sorted(studies_dir().glob('*.db')):
+        sig = _study_sig(p)
+        cached = _study_cache.get(str(p))
+        if cached and cached[0] == sig:
+            summary = dict(cached[1])
+        else:
+            try:
+                ctime = p.stat().st_ctime
+            except OSError:
+                continue                  # deleted between glob and here
+            read_ok = True
+            try:
+                conn = db_ro(str(p))
+                meta = dict(
+                    conn.execute('SELECT key,value FROM meta').fetchall())
+                count = conn.execute(
+                    'SELECT COUNT(*) FROM points').fetchone()[0]
+                conn.close()
+            except Exception:
+                if not p.exists():
+                    continue              # purged between stat and open
+                # corrupt-but-present db: list it so the operator sees it
+                meta, count = {}, 0
+                read_ok = False
+            summary = {
+                'id':         p.stem,
+                'name':       meta.get('study_name', p.stem),
+                'created_at': meta.get('created_at', ctime),
+                'count':      count,
+                'fw':         meta.get('fw_git_hash', ''),
+            }
+            if read_ok:
+                # Never cache the failure fallback: a quiescent file's
+                # signature would pin one transient I/O hiccup (fd
+                # exhaustion, SD-card blip) as '0 points' until restart.
+                # Failed reads retry on every render instead.
+                _study_cache[str(p)] = (sig, dict(summary))
+        # liveness is daemon state, not file state — never cached
+        summary['live'] = is_live(str(p))
+        studies.append(summary)
+
+    def _created(s):
+        # created_at is the daemon's meta stamp (string) or the ctime float
+        # fallback for headerless dbs — coerce, and let anything unparseable
+        # sort to the bottom rather than 500 the landing page.
         try:
-            conn = db_ro(str(p))
-            meta = dict(conn.execute('SELECT key,value FROM meta').fetchall())
-            count = conn.execute('SELECT COUNT(*) FROM points').fetchone()[0]
-            latest = conn.execute(
-                'SELECT ts FROM points ORDER BY id DESC LIMIT 1').fetchone()
-            conn.close()
-        except Exception:
-            meta, count, latest = {}, 0, None
-        studies.append({
-            'id':         p.stem,
-            'name':       meta.get('study_name', p.stem),
-            'created_at': meta.get('created_at', p.stat().st_ctime),
-            'count':      count,
-            'latest_ts':  latest[0] if latest else None,
-            'live':       is_live(str(p)),
-            'fw':         meta.get('fw_git_hash', ''),
-        })
+            return float(s['created_at'])
+        except (TypeError, ValueError):
+            return 0.0
+
+    # Newest STUDY first — creation order, deliberately not file mtime:
+    # reopening or re-viewing an old study must not bubble it to the top.
+    studies.sort(key=_created, reverse=True)
     return studies
+
+
+# Module import ≈ web process boot. Logs written after this instant belong
+# to THIS boot's failed starts — the error page may be pointing at them.
+_BOOT_TS = time.time()
+
+
+def _older_than_boot(path):
+    try:
+        return os.path.getmtime(path) < _BOOT_TS
+    except OSError:
+        return False
+
+
+def _points_count(path):
+    """COUNT of recorded points, or None if the db can't be read (an
+    unreadable db is not provably empty)."""
+    try:
+        conn = db_ro(str(path))
+        try:
+            return conn.execute('SELECT COUNT(*) FROM points').fetchone()[0]
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def purge_empty_studies():
+    """Delete studies with ZERO recorded points — every aborted or failed
+    start leaves one behind and they clutter the list. Runs once per process
+    (first page load after boot). Never touches the db a running daemon
+    holds, and skips anything unreadable: a corrupt db is not provably
+    empty, so it stays. Removes the study's .db (+-wal/-shm), plus .log
+    files from BEFORE this boot (a fresh log is the only diagnostic of a
+    start that just failed — 'Daemon did not start, see the log' must not
+    point at a file this same page load deleted)."""
+    removed = []
+    # Pass 1, lock-free: the COUNT scan walks every study db and can take
+    # a while over a season of studies on an SD card — a Start tap must
+    # not queue behind it.
+    candidates = [p for p in sorted(studies_dir().glob('*.db'))
+                  if _points_count(p) == 0]
+    # Pass 2, under the spawn lock: /start_daemon and /start_raw hold it
+    # from before the daemon spawns until its PID file exists, so no daemon
+    # can be mid-birth while this runs. Re-verify each candidate right
+    # before deleting — the daemon writes its PID file BEFORE creating the
+    # db, so a fresh look here always sees the owner of a brand-new 0-point
+    # db, and an empty db is cheap to re-count.
+    with _spawn_lock:
+        for p in candidates:
+            ds = get_daemon_status()
+            if ds.get('running') and \
+                    os.path.abspath(ds['db_path']) == os.path.abspath(str(p)):
+                continue
+            if _points_count(p) != 0:
+                continue                  # gained rows (or vanished) since
+            victims = [str(p), str(p) + '-wal', str(p) + '-shm']
+            log = str(p.with_suffix('.log'))
+            if _older_than_boot(log):
+                victims.append(log)
+            for victim in victims:
+                try:
+                    os.unlink(victim)
+                except OSError:
+                    pass
+            removed.append(p.stem)
+    # Orphan logs (a start that died before creating its db) — same
+    # this-boot protection. No lock needed: any start, even one reusing an
+    # old study name, rewrites its log at spawn, making it this-boot.
+    for lg in sorted(studies_dir().glob('*.log')):
+        if not lg.with_suffix('.db').exists() and _older_than_boot(lg):
+            try:
+                os.unlink(str(lg))
+            except OSError:
+                pass
+    if removed:
+        print(f'[web] purged {len(removed)} empty studies: '
+              f'{", ".join(removed)}', flush=True)
+    return removed
+
+
+# Once per process: gunicorn has no reliable post-fork hook here, so the
+# first index render after boot is "system start" from the operator's seat.
+_purged = False
+
+
+# ── Pi service health ─────────────────────────────────────────────────────────
+
+# Absolute path: jlw_metalmap.service sets PATH to the venv bin only.
+SYSTEMCTL_BIN = '/usr/bin/systemctl'
+
+SVC_TTL_S = 10.0   # one fork per ~10 s no matter how many clients
+# t None = cold, never fetched. NOT 0.0: monotonic()'s epoch is boot time
+# on Linux, so a gunicorn started <TTL after Pi power-on would read a 0.0
+# cache as "fresh" and skip the first fetch.
+_svc_cache = {'t': None, 'val': None, 'refreshing': False}
+_ip_cache  = {'t': None, 'val': None, 'refreshing': False}
+_svc_lock = threading.Lock()
+
+
+def _ttl_cached(cache, fetch):
+    """TTL cache + single-flight around a subprocess-backed fetch.
+
+    The lock guards ONLY the cache dict — never the fork. systemctl is a
+    D-Bus round trip to PID 1; on a sick Pi it can take the full timeout
+    (or, in D-state, outlive even SIGKILL — subprocess.run's timeout
+    bounds communicate(), then waits UNBOUNDED for the killed child).
+    Holding the lock through that would park every nav SSE tick and every
+    landing-page render on one refresh, eating the 8-gthread pool that
+    /shutdown and /stop_daemon also live in. Instead one caller refreshes
+    (single-flight) while the rest return the last snapshot immediately;
+    worst case a wedged fork costs exactly one thread and the display
+    freezes at its last state — the rest of the UI keeps answering.
+
+    fetch() returning None means "couldn't determine": the previous
+    snapshot is kept, so callers never flicker to empty — but the attempt
+    is still TTL-stamped, so a persistently failing fetch (ip wedged to
+    its 5 s timeout on a sick Pi) retries once per TTL, not once per 2 s
+    SSE tick with a thread pinned in subprocess.run the whole while.
+    """
+    with _svc_lock:
+        if cache['refreshing'] or (
+                cache['t'] is not None
+                and time.monotonic() - cache['t'] < SVC_TTL_S):
+            # Fresh(-ly attempted), or someone else is refreshing: serve
+            # the last snapshot. None only near cold start — SSE clients
+            # get a real value on a later tick, and the index Jinja gate
+            # hides the affected markup for that one render.
+            return cache['val']
+        cache['refreshing'] = True
+    val = None
+    try:
+        val = fetch()
+        return val if val is not None else cache['val']
+    finally:
+        with _svc_lock:
+            cache['t'] = time.monotonic()   # stamp failures too
+            if val is not None:
+                cache['val'] = val
+            cache['refreshing'] = False
+
+
+def service_states():
+    """State of every repo-root *.service unit as {unit_filename: state},
+    or None off the Pi (no systemctl) so callers hide the panel entirely.
+
+    `systemctl is-active a b c` prints one state per line in argument
+    order (active/inactive/failed/activating/unknown) and exits nonzero
+    when any unit is not active — the exit code is ignored on purpose.
+    Cached: the landing page's nav SSE would otherwise fork a subprocess
+    every 2 s per open client.
+    """
+    # _REPO_DIR, not .parent: on the Pi the units live in the checkout, not
+    # in /opt/metal_mapper where this file is symlinked from.
+    units = sorted(p.name for p in _REPO_DIR.glob('*.service'))
+    if not units or not os.path.exists(SYSTEMCTL_BIN):
+        return None
+
+    def fetch():
+        try:
+            r = subprocess.run([SYSTEMCTL_BIN, 'is-active', *units],
+                               capture_output=True, text=True, timeout=5)
+            lines = r.stdout.splitlines()
+        except Exception:
+            lines = []
+        return {u: (lines[i].strip() if i < len(lines) and lines[i].strip()
+                    else 'unknown')
+                for i, u in enumerate(units)}
+
+    return _ttl_cached(_svc_cache, fetch)
+
+
+def local_ipv4s():
+    """The box's non-loopback IPv4s as ['wlan0 192.168.4.1', ...] — the
+    quickest "is the network side up" check on the landing page. [] means
+    positively no addresses (worth showing); None means undeterminable
+    (no `ip` binary — bench Mac), so callers hide the line entirely.
+
+    `ip -j -4 addr` is pure netlink (no D-Bus), JSON out; iproute2 path
+    differs across images, so candidates are probed — absolute paths, as
+    the service PATH holds only the venv bin.
+    """
+    def fetch():
+        for ip_bin in ('/usr/sbin/ip', '/sbin/ip', '/usr/bin/ip', '/bin/ip'):
+            if os.path.exists(ip_bin):
+                break
+        else:
+            return None
+        try:
+            r = subprocess.run([ip_bin, '-j', '-4', 'addr'],
+                               capture_output=True, text=True, timeout=5)
+            # busybox ip / pre-4.13 iproute2 reject -j: usage on stderr,
+            # empty stdout, rc!=0 — that's "couldn't determine", NOT
+            # "no addresses". iproute2 prints [] on genuine none.
+            if r.returncode != 0:
+                return None
+            ifaces = json.loads(r.stdout)
+        except Exception:
+            return None
+        return [f"{itf.get('ifname', '?')} {ai['local']}"
+                for itf in ifaces
+                for ai in itf.get('addr_info', [])
+                if ai.get('family') == 'inet'
+                and not ai.get('local', '').startswith('127.')]
+
+    return _ttl_cached(_ip_cache, fetch)
 
 
 # ── Views ─────────────────────────────────────────────────────────────────────
 
 @app.route('/')
 def index():
+    global _purged
+    if not _purged:
+        _purged = True
+        purge_empty_studies()
     cfg = load_config()
     default_name = datetime.datetime.now().strftime('geo_%Y%m%d_%H%M%S')
+    ds = get_daemon_status()
+    # A running daemon means the operator belongs back in that session
+    # (client reset, browser restart): hand the template the map to return
+    # to — or None if it's a raw (nothing-saved) session.
+    live_id = None
+    if ds['running'] and \
+            os.path.abspath(ds['db_path']) != os.path.abspath(RAW_DB):
+        live_id = Path(ds['db_path']).stem
     return render_template(
         'index.html',
         studies=list_studies(),
-        daemon_status=get_daemon_status(),
+        daemon_status=ds,
+        live_id=live_id,
         nav=nav().snapshot(),
+        services=service_states(),
+        ipv4s=local_ipv4s(),
         cfg=cfg,
         error=request.args.get('error'),
         default_study_name=default_name,
@@ -544,18 +896,63 @@ def get_data(study_id):
     meta.setdefault('sl_heading_offset_deg',
                     str(load_config()['heading_offset_deg']))
     return jsonify({
-        'points':  points,
-        'last_id': points['id'][-1] if points['id'] else 0,
-        'is_live': is_live(db_path),
-        'meta':    meta,
-        'status':  derive_status(db_path, meta),
-        'nav':     nav().snapshot(),
+        'points':    points,
+        'last_id':   points['id'][-1] if points['id'] else 0,
+        'is_live':   is_live(db_path),
+        'meta':      meta,
+        'status':    derive_status(db_path, meta),
+        'env_stats': env_stats(db_path),
+        'nav':       nav().snapshot(),
     })
+
+
+@app.route('/env_stats/<study_id>')
+def get_env_stats(study_id):
+    """Light re-aggregation for the map view: when a daemon detaches from an
+    open study page (live → saved flip over SSE), the run has grown since the
+    page-load /data snapshot — the client refreshes just the stats here."""
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify(env_stats(db_path))
 
 
 @app.route('/navfix')
 def navfix():
     return jsonify(nav().snapshot())
+
+
+# Reserved (double-underscore, like RAW_ID) so it can never shadow a real
+# study in /stream/<study_id> — and it must live under /stream/ because the
+# Pi's nginx scopes SSE proxying (buffering off, 24h read timeout) to that
+# path. Feeds the landing page's nav chip: the kiosk loads that page at
+# boot, often before gnssserver is up, and a one-shot server-side render
+# would show "down" forever even after the reader heals.
+NAV_STREAM_ID = '__nav__'
+
+
+@app.route(f'/stream/{NAV_STREAM_ID}')
+def stream_nav():
+    # Bounded on purpose: a phone that walks out of WiFi range never FINs,
+    # so an endless generator would hold one of gunicorn's few worker
+    # threads until the kernel gives up on the socket (~15 min) — a couple
+    # of those and the pool starves. Ending the response after ~5 min
+    # self-expires zombies; live clients auto-reconnect (stateless ticks,
+    # nothing to resume). Carries daemon_running so the landing page's
+    # shutdown-confirm warning tracks sessions started from other clients.
+    def gen():
+        for _ in range(NAV_SSE_MAX_TICKS):
+            payload = {'nav': nav().snapshot(),
+                       'daemon_running': get_daemon_status()['running'],
+                       'services': service_states(),
+                       'ipv4s': local_ipv4s()}
+            yield f'data: {json.dumps(payload)}\n\n'
+            time.sleep(NAV_SSE_PERIOD_S)
+    return Response(
+        stream_with_context(gen()),
+        mimetype='text/event-stream',
+        headers={'Cache-Control': 'no-cache', 'X-Accel-Buffering': 'no'},
+    )
 
 
 @app.route('/stream/<study_id>')
@@ -578,15 +975,37 @@ def stream_study(study_id):
 
     def gen():
         nonlocal since_id
+        # Sample cursor is per-connection, not resumed via Last-Event-ID:
+        # the ring is an ephemeral scope trace, so a reconnect just refills
+        # the chart from whatever the ring currently holds.
+        s_cur = 0
         while True:
             rows = load_points(db_path, since_id)
             if rows:
                 since_id = rows[-1]['id']
+            status = derive_status(db_path)
+            # Raw full-rate samples only while a daemon is attached — a
+            # saved study's leftover ring (daemon killed -9) is stale data.
+            samples = (load_samples(db_path, s_cur)
+                       if status['state'] != 'stopped' else [])
+            if samples:
+                s_cur = samples[-1]['id']
+            elif s_cur:
+                # Ring id regression means /start_raw recreated the db (the
+                # unlink resets the AUTOINCREMENT sequence): without a reset,
+                # a connection held across stop→start waits for ids that may
+                # take the whole new session to reappear — a live banner over
+                # a frozen chart. New-session ids are all unseen, so
+                # re-seeding from 0 cannot re-send anything.
+                mx = samples_max_id(db_path)
+                if mx is not None and mx < s_cur:
+                    s_cur = 0
             payload = {
-                'type':   'tick',
-                'rows':   rows,
-                'status': derive_status(db_path),
-                'nav':    nav().snapshot(),
+                'type':    'tick',
+                'rows':    rows,
+                'samples': samples,
+                'status':  status,
+                'nav':     nav().snapshot(),
             }
             yield f'id: {since_id}\ndata: {json.dumps(payload)}\n\n'
             time.sleep(SSE_PERIOD_S)
@@ -688,14 +1107,32 @@ def new_study_id(name):
     return f'{safe or "study"}_{int(time.time())}'
 
 
+# One spawn request at a time: the not-running check, the raw-db unlink and
+# the Popen must not interleave with a second submit — the start forms have
+# no double-click guard, and the first request can sit up to 3 s in its PID
+# poll. Without this, /start_raw's unlink can delete the db a just-claimed
+# daemon already opened, leaving it streaming into an unlinked inode the web
+# process can never read. Held lock ≤ ~3 s; the loser then sees 'running'
+# and bounces cleanly. (workers=1 gthread — one process, so a Lock covers.)
+_spawn_lock = threading.Lock()
+
+
+def _serialized_spawn(fn):
+    def wrapper(*a, **kw):
+        with _spawn_lock:
+            return fn(*a, **kw)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
 @app.route('/start_daemon', methods=['POST'])
+@_serialized_spawn
 def start_daemon():
     if get_daemon_status()['running']:
         return redirect(url_for('index', error='Daemon is already running'))
 
     cfg      = load_config()
     port     = request.form.get('port', cfg['serial_port']).strip()
-    baud     = request.form.get('baud', str(cfg['baud'])).strip()
     min_dist = request.form.get('min_dist', '20').strip()
     name     = request.form.get('study_name', '').strip()
     no_gate  = request.form.get('no_gate') == 'on'
@@ -704,12 +1141,6 @@ def start_daemon():
     # before the db exists, and the operator would get no feedback at all.
     if not port:
         return redirect(url_for('index', error='Serial port is required'))
-    try:
-        # NOT isdigit(): it accepts Unicode digits like '²' that int() rejects
-        if int(baud) <= 0:
-            raise ValueError
-    except ValueError:
-        return redirect(url_for('index', error=f'Bad baud rate: {baud!r}'))
     try:
         float(min_dist)
     except ValueError:
@@ -722,12 +1153,12 @@ def start_daemon():
     # --opt=value form so a study name (or port) starting with '-' can't be
     # eaten by argparse as an option.
     cmd = [sys.executable, str(DAEMON_SCRIPT),
-           '--port=' + port, '--baud=' + baud,
+           '--port=' + port,
            '--db=' + db_path, '--study-name=' + (name or sid),
            '--min-dist=' + min_dist]
     if no_gate:
         cmd.append('--no-gate')
-    save_config(serial_port=port, baud=int(baud))
+    save_config(serial_port=port)
     print(f'[web] launching daemon: {" ".join(cmd)}', flush=True)
     print(f'[web] daemon log: {log_path}', flush=True)
     try:
@@ -750,6 +1181,72 @@ def start_daemon():
             f'in the studies folder')))
 
     return redirect(url_for('view_study', study_id=sid))
+
+
+@app.route('/raw')
+def raw_view():
+    """View Raw: full-rate channel display for system test & calibration.
+    Attaches to whatever daemon is running — a --raw session (nothing
+    saved) or a live study (viewer only) — and offers to start a raw
+    session when none is."""
+    cfg = load_config()
+    ds  = get_daemon_status()
+    mode, sid = 'stopped', None
+    if ds['running']:
+        if ds['db_path'] == os.path.abspath(RAW_DB):
+            mode, sid = 'raw', RAW_ID
+        else:
+            sid  = os.path.splitext(os.path.basename(ds['db_path']))[0]
+            mode = 'study'
+    return render_template('raw.html', mode=mode, sid=sid, cfg=cfg,
+                           error=request.args.get('error'),
+                           git_hash=GIT_HASH)
+
+
+@app.route('/start_raw', methods=['POST'])
+@_serialized_spawn
+def start_raw():
+    """Launch the daemon in --raw mode against the throwaway temp-dir db."""
+    if get_daemon_status()['running']:
+        return redirect(url_for('raw_view', error='Daemon is already running'))
+
+    # No form fields: raw mode always attaches to the configured port at
+    # the daemon's built-in baud — set-and-forget on a custom system.
+    port = load_config()['serial_port']
+
+    # Fresh scratch db every session: db_open would happily reuse last
+    # week's meta (fw hash, timing header) and lie in the telemetry strip.
+    for ext in ('', '-wal', '-shm'):
+        try:
+            os.unlink(RAW_DB + ext)
+        except OSError:
+            pass
+
+    log_path = RAW_DB[:-3] + '.log'
+    cmd = [sys.executable, str(DAEMON_SCRIPT),
+           '--port=' + port,
+           '--db=' + RAW_DB, '--study-name=raw', '--raw']
+    print(f'[web] launching raw daemon: {" ".join(cmd)}', flush=True)
+    print(f'[web] raw daemon log: {log_path}', flush=True)
+    try:
+        log_fh = open(log_path, 'w')
+    except OSError as e:
+        return redirect(url_for('raw_view', error=f'Cannot write log: {e}'))
+    subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                     close_fds=True)
+
+    deadline = time.time() + 3.0
+    while time.time() < deadline:
+        if get_daemon_status()['running']:
+            print(f'[web] raw daemon up (pid={get_daemon_status()["pid"]})',
+                  flush=True)
+            break
+        time.sleep(0.1)
+    else:
+        return redirect(url_for('raw_view', error=(
+            f'Daemon did not start — see {os.path.basename(log_path)} '
+            f'in the temp dir')))
+    return redirect(url_for('raw_view'))
 
 
 @app.route('/stop_daemon', methods=['POST'])
@@ -775,21 +1272,78 @@ def stop_daemon():
                 os.kill(status['pid'], signal.SIGTERM)
             except ProcessLookupError:
                 pass
+            else:
+                # Wait (bounded) for it to actually die: the redirect lands
+                # on the studies page, which must not flash a running-daemon
+                # state — with a Return-to-Live button — right after the
+                # operator pressed Stop. Typical exit is well under 500 ms.
+                for _ in range(60):                        # ≤ 3 s
+                    if not get_daemon_status()['running']:
+                        break
+                    time.sleep(0.05)
         else:
             try:
                 os.unlink(PID_FILE)      # stale — clear it so the UI recovers
             except OSError:
                 pass
+    # Stop and exit are one action everywhere — every stop lands on the
+    # studies page. (The old from=raw stay-on-page redirect died with the
+    # separate Stop button.)
     return redirect(url_for('index'))
+
+
+# Absolute paths: jlw_metalmap.service sets PATH to the venv bin only, so
+# neither sudo nor shutdown would resolve through the environment.
+SUDO_BIN     = '/usr/bin/sudo'
+SHUTDOWN_BIN = '/usr/sbin/shutdown'
+
+
+@app.route('/shutdown', methods=['POST'])
+def shutdown_host():
+    """Power the mapper computer off. The confirm step is the landing
+    page's overlay — this endpoint is the point of no return. gunicorn
+    runs as the Pi user, who has passwordless sudo; `-n` makes any
+    refusal fail fast and land back on the landing page as an error
+    instead of hanging on a password prompt. systemd then stops
+    jlw_metalmap.service, which SIGTERMs the whole cgroup — a recording
+    daemon flushes and closes its db cleanly on the way down."""
+    try:
+        r = subprocess.run([SUDO_BIN, '-n', SHUTDOWN_BIN, '-h', 'now'],
+                           capture_output=True, text=True, timeout=10)
+    except Exception as e:                    # missing binary, timeout
+        return redirect(url_for('index', error=f'shutdown failed: {e}'))
+    if r.returncode != 0:
+        msg = (r.stderr or r.stdout or 'sudo refused').strip()
+        msg = msg.splitlines()[-1] if msg else 'sudo refused'
+        return redirect(url_for('index', error=f'shutdown failed: {msg}'))
+    # Post/Redirect/Get: the tab that pressed the button must end up on a
+    # plain GET, or reloading it — or a browser restoring tabs after the
+    # box is next powered on — would re-fire the POST and shut it down
+    # again. The redirect roundtrip is localhost-milliseconds; systemd
+    # unit teardown is far slower, so the GET lands before we die.
+    return redirect(url_for('shutting_down'))
+
+
+@app.route('/shutting_down')
+def shutting_down():
+    """Terminal page after a successful /shutdown (see PRG note above)."""
+    return render_template('shutdown.html', git_hash=GIT_HASH)
 
 
 @app.route('/cmd', methods=['POST'])
 def send_cmd():
     """Forward one tuning key to the firmware via the daemon's FIFO."""
     data = request.get_json(force=True)
-    # Encode FIRST: slicing the str keeps one codepoint, which can be up to
-    # 4 UTF-8 bytes — the firmware must see exactly one key byte.
-    cmd = str(data.get('cmd', '')).encode('ascii', errors='ignore')[:1]
+    raw = str(data.get('cmd', ''))
+    if raw in ('SAVE', 'CLEAR'):
+        # Flash writes are word-gated in the firmware (word + Enter) so a
+        # stray noise byte on the console line can never commit to flash.
+        # SAVE persists settings; CLEAR restores defaults and persists.
+        cmd = raw.encode('ascii') + b'\n'
+    else:
+        # Encode FIRST: slicing the str keeps one codepoint, which can be up
+        # to 4 UTF-8 bytes — the firmware must see exactly one key byte.
+        cmd = raw.encode('ascii', errors='ignore')[:1]
     if not cmd:
         return jsonify({'error': 'No command'}), 400
     try:
@@ -839,12 +1393,11 @@ if __name__ == '__main__':
     ap.add_argument('--web-port', type=int, default=5000)
     ap.add_argument('--studies-dir', help='override studies directory')
     ap.add_argument('--serial-port', help='default serial port for new studies')
-    ap.add_argument('--baud', type=int, help='default baud for new studies')
     ap.add_argument('--nav-host', help='NMEA-over-TCP host for the nav GPS')
     ap.add_argument('--nav-port', type=int, help='NMEA-over-TCP port')
     args = ap.parse_args()
 
-    for k in ('studies_dir', 'serial_port', 'baud', 'nav_host', 'nav_port'):
+    for k in ('studies_dir', 'serial_port', 'nav_host', 'nav_port'):
         v = getattr(args, k)
         if v is not None:
             _cli_overrides[k] = v

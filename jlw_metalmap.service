@@ -1,0 +1,17 @@
+[Unit]
+Description=Metal Mapper Web UI
+After=network.target
+
+[Service]
+User=pi
+Group=pi
+WorkingDirectory=/opt/metal_mapper
+Environment="PATH=/opt/metal_mapper/venv/bin"
+ExecStart=/opt/metal_mapper/venv/bin/gunicorn \
+    --config /opt/metal_mapper/gunicorn_config.py \
+    db_map:app
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

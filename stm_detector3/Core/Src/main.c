@@ -126,6 +126,19 @@ static void print_heading_field(void)
     printf(",");
   }
 }
+
+/* Append the 1 Hz status pair (,vin_V,temp_C) to the CSV line being
+ * assembled, when a second has passed since the last one. Rides whatever
+ * line prints next — sample or anchor — so no extra line shape exists. */
+static void print_status_if_due(uint32_t *last_tick)
+{
+  if (HAL_GetTick() - *last_tick < 1000U)
+    return;
+  *last_tick = HAL_GetTick();
+  float vin_v, temp_c;
+  md_status_read(&vin_v, &temp_c);
+  printf(",%.3f,%.1f", vin_v, temp_c);
+}
 /* USER CODE END 0 */
 
 /**
@@ -925,12 +938,17 @@ static void MX_USART1_UART_Init(void)
   {
     Error_Handler();
   }
-  if (HAL_UARTEx_DisableFifoMode(&huart1) != HAL_OK)
+  if (HAL_UARTEx_EnableFifoMode(&huart1) != HAL_OK)
   {
     Error_Handler();
   }
   /* USER CODE BEGIN USART1_Init 2 */
-
+  /* FIFO mode ON (8-deep RX): the console is POLLED from the task loop,
+   * whose iteration is dominated by 500 Hz sample-line printf's (~1-2 ms).
+   * Without the FIFO a multi-byte burst ("SAVE\n" from the daemon arrives
+   * back-to-back at 460800, one byte per ~22 us) loses everything after
+   * the first byte to overrun and the word-gated commands never fire.
+   * Single tuning keys never showed this - one byte parks in RDR. */
   /* USER CODE END USART1_Init 2 */
 
 }
@@ -1085,84 +1103,74 @@ void StartDefaultTask(void *argument)
   printf("# GPS synchronized at DMA position %lu\r\n", gps_buffer_read_pos);
 
   // Metal detector: shared hardware timeline, cycles paced by TIM7 in
-  // sync with the GPS (one frame just before each 20 Hz fix; 500 ms idle
-  // rate without a fix — the coils rest in between, keeping the front end
-  // cool; see md_pace_* in metal_detector.c). Defaults: TX 120us, blanking
-  // 16us, rx 3us — all three runtime-tunable (saved settings applied in
-  // MD_Hardware_Init). The fire mode gates only the coil TX; gain/integ/RX
-  // run dual-mode on both sets and all 8 ADC inputs are converted every
-  // cycle regardless.
+  // sync with the GPS (md_samples_per_period frames spread evenly across
+  // each 20 Hz fix interval — 500 Hz default; without a fix the pacer
+  // free-runs at the same rate so bench work sees the full stream and
+  // the field thermal duty cycle; see md_pace_* in metal_detector.c).
+  // Defaults: TX 120us, blanking 16us,
+  // rx 3us — all runtime-tunable (saved settings applied in
+  // MD_Hardware_Init). Both coil sets fire every cycle; all 8 ADC inputs
+  // are converted every cycle.
   MD_Hardware_Init();
-  printf("# metal detector pulsing (hw-aligned): fire_mode=%s tx_pulse=%luus blanking=%luus rx_window=%luus\r\n",
-         (md_fire_mode == MD_FIRE_A) ? "odd" :
-         (md_fire_mode == MD_FIRE_B) ? "even" : "both",
+  printf("# metal detector pulsing (hw-aligned): tx_pulse=%luus blanking=%luus rx_window=%luus\r\n",
          md_tx_pulse_us, md_blanking_us, md_rx_window_us);
   printf("# adc order: PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14\r\n");
-  printf("# csv: lat,lon,fix,adc0..7,gps_ts,heading[,vin_V,temp_C @1/s]\r\n");
-  printf("# idle line every 500ms without fix: gps fields empty, status always\r\n");
+  printf("# csv fields: lat,lon,fix,adc0..7,gps_ts,heading,tick[,vin_V,temp_C @1/s]\r\n");
+  printf("# csv sample lines (%u/fix): adc+tick, gps fields empty; anchor lines (20 Hz): gps+heading+tick, adc empty\r\n",
+         md_samples_per_period);
+  printf("# no fix: sample lines continue at full rate, no anchor lines\r\n");
   md_print_info();   /* also available on demand via the 'I' key */
   md_print_keys();   /* key map reminder for console users */
 
+  md_frame_t frame;
   uint32_t last_status_tick = 0U;
 
   /* Infinite loop */
   for(;;)
   {
-    // Tuning keys (a/z blanking, s/x rx window, S save — save suspends
-    // the pacer for the flash write).
+    // Tuning keys (a/z blanking, s/x rx window, g/b sample rate, SAVE+enter
+    // — save suspends the pacer for the flash write).
     md_console_poll();
 
     // Passthrough # lines queued by the GPS IRQ (PQTMTXT/PQTMTAR/THS) —
     // printed here so they land between CSV lines, never inside one.
     gps_echo_drain();
 
-    // Cycles start in the TIM7 pacer IRQ (md_pace_fired), not here: each
-    // valid fix re-arms TIM7 so the frame below was measured just before
-    // the fix arrived. (Single-coil mode: fire MD_FIRE_A/MD_FIRE_B on
-    // alternate pacer expiries — a md_pace_fired change now.)
-    // One CSV line per valid GGA fix (~20 Hz):
-    //   lat,lon,fix_quality,adc0..adc7,gps_timestamp,heading[,vin_V,temp_C]
-    // (adc order: PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14 — latest frame)
-    // heading is empty unless the dual-antenna THS solution is good; the
-    // status pair is appended once per second.
+    // Cycles start in the TIM7 pacer IRQ (md_pace_fired), not here; every
+    // completed frame lands in the frame ring with its sample tick.
+    //
+    // Sample lines — one per frame, oldest first. The GPS fields are
+    // empty on purpose: position is the daemon's job, interpolated
+    // between anchors in tick space (frames are evenly spaced within a
+    // fix interval). Drained BEFORE the anchor check so an anchor always
+    // follows the sample line its tick refers to — the anchored frame
+    // completed (and was queued) before the fix's GGA finished parsing.
+    while (md_frame_pop(&frame))
+    {
+      printf(",,,%u,%u,%u,%u,%u,%u,%u,%u,,,%lu",
+             frame.adc[0], frame.adc[1], frame.adc[2], frame.adc[3],
+             frame.adc[4], frame.adc[5], frame.adc[6], frame.adc[7],
+             (unsigned long)frame.tick);
+      print_status_if_due(&last_status_tick);
+      printf("\n");
+    }
+
+    // Anchor lines — one per valid GGA fix (~20 Hz), pure position: the
+    // ADC fields are empty and the tick names the frame this fix belongs
+    // with (paced to complete just before it). heading is empty unless
+    // the dual-antenna THS solution is good.
     if (new_gga_available && latest_gps_position.valid)
     {
-      printf("%.9f,%.9f,%d,%u,%u,%u,%u,%u,%u,%u,%u,%.6f",
+      printf("%.9f,%.9f,%d,,,,,,,,,%.6f",
              latest_gps_position.latitude,
              latest_gps_position.longitude,
              latest_gps_position.fix_quality,
-             md_adc[0], md_adc[1], md_adc[2], md_adc[3],
-             md_adc[4], md_adc[5], md_adc[6], md_adc[7],
              (double)latest_gps_position.timestamp);
       print_heading_field();
-      if (HAL_GetTick() - last_status_tick >= 1000U)
-      {
-        last_status_tick = HAL_GetTick();
-        float vin_v, temp_c;
-        md_status_read(&vin_v, &temp_c);
-        printf(",%.3f,%.1f", vin_v, temp_c);
-      }
+      printf(",%lu", (unsigned long)latest_gps_position.tick);
+      print_status_if_due(&last_status_tick);
       printf("\n");
       new_gga_available = 0;
-    }
-    // Idle fallback for lab/indoor use: no valid fix, so the pacer is
-    // free-running at the idle rate. It flags each idle-cadence frame;
-    // waiting for frame_ready means the line reports the frame the pacer
-    // just measured (~200 us old), not one up to an idle period stale.
-    // Line shape matches above with the GPS fields (lat,lon,fix,ts)
-    // empty; the status pair is always included.
-    else if (md_idle_line_due && md_adc_frame_ready)
-    {
-      md_idle_line_due = 0U;
-      printf(",,,%u,%u,%u,%u,%u,%u,%u,%u,",
-             md_adc[0], md_adc[1], md_adc[2], md_adc[3],
-             md_adc[4], md_adc[5], md_adc[6], md_adc[7]);
-      print_heading_field();
-      float vin_v, temp_c;
-      md_status_read(&vin_v, &temp_c);
-      printf(",%.3f,%.1f", vin_v, temp_c);
-      last_status_tick = HAL_GetTick();
-      printf("\n");
     }
     osDelay(1);
   }

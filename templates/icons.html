@@ -1,0 +1,57 @@
+{# Inline-SVG icon macros — import with {% import 'icons.html' as ic %}.
+
+   The Pi's kiosk Chromium has NO emoji font: ⏻ 📈 🗺 🌐 🎯 ⏸ 💾 ✈ all
+   render as tofu boxes (field-tested). Inline SVG can't be broken by a
+   font, and stroke:currentColor follows each button's text color.
+   BMP glyphs DejaVu covers (▶ ■ ● ○ ← ✓ ⚠ ×) are safe to keep as text.
+
+   px  — rendered size
+   cls — extra classes, e.g. 'ic-plane' so JS can target a swap state
+   hid — start hidden (for two-state buttons; JS toggles .hidden)     #}
+
+{% macro _open(px, cls, hid) -%}
+<svg class="ic {{ cls }}"{% if hid %} hidden{% endif %} width="{{ px }}"
+     height="{{ px }}" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+     stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+     aria-hidden="true">
+{%- endmacro %}
+
+{% macro power(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M12 3v8"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg>
+{%- endmacro %}
+
+{% macro chart(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M3 4v16h18"/><path d="M6.5 15l4-5.5 3.5 3 5-7"/></svg>
+{%- endmacro %}
+
+{% macro map(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2-6-2z"/><path d="M9 4v14M15 6v14"/></svg>
+{%- endmacro %}
+
+{% macro globe(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a13.5 13.5 0 0 1 0 18M12 3a13.5 13.5 0 0 0 0 18"/></svg>
+{%- endmacro %}
+
+{% macro plane(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M21 3L3 11l7 3 3 7 8-18z"/><path d="M10 14l11-11"/></svg>
+{%- endmacro %}
+
+{% macro info(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<circle cx="12" cy="12" r="9"/><path d="M12 11v5"/><path d="M12 7.5h.01"/></svg>
+{%- endmacro %}
+
+{% macro target(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
+{%- endmacro %}
+
+{% macro pause(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M9 5v14M15 5v14" stroke-width="2.6"/></svg>
+{%- endmacro %}
+
+{% macro play(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M8 5l11 7-11 7z" fill="currentColor"/></svg>
+{%- endmacro %}
+
+{% macro save(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8M7 3v5h8"/></svg>
+{%- endmacro %}

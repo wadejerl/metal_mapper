@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Shutting down — Metal Mapper</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
+  <style>
+    /* Terminal screen: the web server is going away with the OS, so no
+       links, no scripts — just tell the operator when power-off is safe. */
+    body { display: flex; align-items: center; justify-content: center;
+           height: 100vh; margin: 0; text-align: center; }
+    .off  { color: #e94560; }
+    h1    { color: #e94560; font-size: 28px; margin: 18px 0 10px 0; }
+    p     { color: #90a4ae; font-size: 16px; max-width: 420px; }
+  </style>
+</head>
+<body>
+<div>
+  {# inline SVG, not U+23FB — the Pi has no font for it (tofu box) #}
+  <div class="off"><svg width="64" height="64" viewBox="0 0 24 24"
+       fill="none" stroke="currentColor" stroke-width="2"
+       stroke-linecap="round" aria-hidden="true"><path d="M12 3v8"/>
+    <path d="M6.3 6.3a8 8 0 1 0 11.4 0"/></svg></div>
+  <h1>Shutting down…</h1>
+  <p>The mapper computer is powering off.
+     Wait for the screen to go dark before cutting power.</p>
+</div>
+</body>
+</html>

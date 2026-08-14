@@ -50,17 +50,19 @@ db_map._cli_overrides.update({
 })
 db_map.PID_FILE = os.path.join(SCRATCH, 'daemon.pid')
 db_map.CONFIG_FILE = Path(SCRATCH) / 'config.json'
+# Disarm the once-per-boot empty-study purge: several fixtures here are
+# 0-point studies on purpose. The purge gets its own tests, isolated.
+db_map._purged = True
 
 
 def make_study(name, n_points=5, heading=90.0, with_live=None, meta=None):
     """Build a study db exactly the way serial_daemon would."""
     path = os.path.join(STUDIES, f'{name}.db')
     conn = sd.db_open(path)
-    for i in range(n_points):
-        pt = {'lat': 40.1 + i * 1e-6, 'lon': -119.1, 'heading': heading,
-              'fix': 4, 'adc': [1000 + ch * 100 + i for ch in range(8)],
-              'gps_ts': '123519.10', 'vin': 12.4, 'temp': 25.0}
-        sd.insert_point(conn, pt)
+    rows = [{'lat': 40.1 + i * 1e-6, 'lon': -119.1, 'heading': heading,
+             'fix': 4, 'adc': [1000 + ch * 100 + i for ch in range(8)],
+             'gps_ts': '123519.10'} for i in range(n_points)]
+    sd.insert_rows(conn, rows, 12.4, 25.0)
     for k, v in (meta or {}).items():
         sd.meta_set(conn, k, v)
     if with_live is not None:
@@ -255,6 +257,7 @@ p_warn = make_study('warn1', meta={
     'geometry_changed': '1753500000:coil_spacing_mm 500->510',
     'blanking_us': '16', 'blanking_us_current': '18',
     'rx_window_us': '3', 'tx_pulse_us': '120', 'tx_pulse_us_current': '80',
+    'sample_rate_hz': '500', 'sample_rate_hz_current': '100',
 })
 st = db_map.derive_status(p_warn)
 check('identity warning', any('identity' in w for w in st['warnings']), repr(st['warnings']))
@@ -263,6 +266,10 @@ check('geometry drift warning', any('coil_spacing_mm' in w for w in st['warnings
 check('timing prefers _current', st['timing']['blanking_us'] == '18'
       and st['timing']['tx_pulse_us'] == '80' and st['timing']['rx_window_us'] == '3',
       repr(st['timing']))
+# The raw screen's rate slider tracks the firmware through this field —
+# a g/b echo lands in meta as sample_rate_hz_current and must win here.
+check('timing carries sample_rate_hz (prefers _current)',
+      st['timing']['sample_rate_hz'] == '100', repr(st['timing']))
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
@@ -274,11 +281,18 @@ r = client.get('/')
 check('index 200', r.status_code == 200)
 check('index lists study', b'saved1' in r.data)
 check('index shows nav chip', b'NAV GPS' in r.data)
+# Column dropped so the Created date fits one line at 800px.
+check('index has no Last Activity column', b'Last Activity' not in r.data)
 
 r = client.get('/view/saved1')
 check('view 200', r.status_code == 200)
-check('view has tx pulse control', b'TX Pulse' in r.data)
+# timing controls are raw-screen-only (clipped at 800x480 on the map view)
+check('view has no timing controls', b'TX Pulse' not in r.data
+      and b'timing-panel' not in r.data)
 check('view loads map_core.js', b'map_core.js' in r.data)
+# version-stamped: kiosk Chromium heuristic-caches /static (Flask sends no
+# Cache-Control), so deploys must flip the URL or stale JS survives reloads
+check('static assets version-stamped', b'map_core.js?v=' in r.data)
 
 r = client.get('/view/does_not_exist')
 check('view of missing study redirects', r.status_code == 302)
@@ -293,6 +307,202 @@ check('data is columnar', len(cols['lat']) == 5 and len(cols['adc']) == 8
 check('data last_id from id column', d['last_id'] == cols['id'][-1] == 5)
 check('data carries meta + status + nav',
       'meta' in d and d['status']['state'] == 'stopped' and 'connected' in d['nav'])
+
+# env_stats: whole-run min/avg/max of the vin/temp stamped on each point.
+# saved1's fixture stamps 12.4/25.0 everywhere, so all three collapse.
+es = d['env_stats']
+check('env_stats over points',
+      abs(es['vin']['min'] - 12.4) < 1e-9 and abs(es['vin']['max'] - 12.4) < 1e-9
+      and abs(es['vin']['avg'] - 12.4) < 1e-9 and abs(es['temp']['avg'] - 25.0) < 1e-9,
+      repr(es))
+
+# Mixed values aggregate across batches; NULL pairs (rows written before the
+# first 1 Hz report) are skipped, and an all-NULL study yields None fields.
+p_env = os.path.join(STUDIES, 'env1.db')
+conn = sd.db_open(p_env)
+mk = lambda i: {'lat': 40.2, 'lon': -119.2, 'heading': 90.0, 'fix': 4,
+                'adc': [1000] * 8, 'gps_ts': '123519.10'}
+sd.insert_rows(conn, [mk(0)], None, None)      # pre-first-report row
+sd.insert_rows(conn, [mk(1)], 12.0, 20.0)
+sd.insert_rows(conn, [mk(2)], 13.0, 30.0)
+conn.close()
+es = db_map.env_stats(p_env)
+check('env_stats mixed + null-skip',
+      es['vin']['min'] == 12.0 and es['vin']['max'] == 13.0
+      and abs(es['vin']['avg'] - 12.5) < 1e-9
+      and es['temp']['min'] == 20.0 and es['temp']['max'] == 30.0, repr(es))
+p_env0 = make_study('env0', n_points=0)
+check('env_stats empty study', db_map.env_stats(p_env0) ==
+      {'vin': None, 'temp': None}, repr(db_map.env_stats(p_env0)))
+check('env_stats missing db', db_map.env_stats('/nonexistent.db') ==
+      {'vin': None, 'temp': None})
+
+# /env_stats endpoint: the map view re-fetches here when a daemon detaches
+# from an open study page (live → saved flip) — the load-time stats are stale.
+r = client.get('/env_stats/env1')
+es = r.get_json()
+check('env_stats endpoint', r.status_code == 200
+      and es['vin']['min'] == 12.0 and es['vin']['max'] == 13.0, repr(es))
+check('env_stats endpoint 404', client.get('/env_stats/nope').status_code == 404)
+
+# Empty study list while a daemon runs (raw session on a fresh install): the
+# start panel is hidden, so the empty-table hint must not say 'start one above'.
+_saved_over = dict(db_map._cli_overrides)
+_empty_dir = os.path.join(SCRATCH, 'empty_studies')
+os.makedirs(_empty_dir, exist_ok=True)
+db_map._cli_overrides['studies_dir'] = _empty_dir
+Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(db_map.RAW_DB)}')
+r = client.get('/')
+check('empty list + daemon: no dangling start hint',
+      b'start one above' not in r.data and b'stop the running daemon' in r.data)
+os.unlink(db_map.PID_FILE)
+r = client.get('/')
+check('empty list, no daemon: start-above hint',
+      b'start one above' in r.data)
+db_map._cli_overrides.clear()
+db_map._cli_overrides.update(_saved_over)
+
+# ── startup purge of 0-point studies ─────────────────────────────────────────
+
+print('empty-study purge:')
+
+_purge_dir = os.path.join(SCRATCH, 'purge_studies')
+os.makedirs(_purge_dir, exist_ok=True)
+db_map._cli_overrides['studies_dir'] = _purge_dir
+
+
+def _mini_study(name, n):
+    path = os.path.join(_purge_dir, f'{name}.db')
+    conn = sd.db_open(path)
+    rows = [{'lat': 40.0, 'lon': -119.0, 'heading': 90.0, 'fix': 4,
+             'adc': [1000] * 8, 'gps_ts': '123519.10'}] * n
+    sd.insert_rows(conn, rows, 12.4, 25.0)
+    conn.close()
+    Path(path[:-3] + '.log').write_text('log')
+    return path
+
+
+# Logs written before the web process booted are fair game; logs from THIS
+# boot may belong to a start that just failed (the error page points at
+# them). The fixtures' logs are brand new, so push _BOOT_TS into the future
+# to mark them as pre-boot for the baseline tests.
+_saved_boot = db_map._BOOT_TS
+db_map._BOOT_TS = time.time() + 3600
+
+p_zero  = _mini_study('zap_me', 0)
+p_full  = _mini_study('keep_me', 3)
+p_live0 = _mini_study('live_zero', 0)
+Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(p_live0)}')
+gone = db_map.purge_empty_studies()
+check('purge removes only the empty study', gone == ['zap_me'], repr(gone))
+check('purge deletes db + log',
+      not os.path.exists(p_zero) and not os.path.exists(p_zero[:-3] + '.log'))
+check('purge keeps non-empty study', os.path.exists(p_full)
+      and os.path.exists(p_full[:-3] + '.log'))
+check('purge keeps live 0-point study', os.path.exists(p_live0))
+os.unlink(db_map.PID_FILE)
+
+# Unreadable db: not provably empty, must survive. (live_zero lost its
+# daemon guard above, so THIS pass legitimately removes it.)
+p_junk = os.path.join(_purge_dir, 'corrupt.db')
+Path(p_junk).write_bytes(b'this is not a sqlite file')
+gone = db_map.purge_empty_studies()
+check('purge skips unreadable db',
+      os.path.exists(p_junk) and gone == ['live_zero'], repr(gone))
+
+# The index route fires the purge exactly once per process.
+p_zero2 = _mini_study('zap2', 0)
+db_map._purged = False
+client.get('/')
+check('index triggers purge once', not os.path.exists(p_zero2))
+p_zero3 = _mini_study('zap3', 0)
+client.get('/')
+check('second index render does not purge', os.path.exists(p_zero3))
+
+# A log written AFTER boot survives even when its empty db is purged: it
+# may hold the traceback of the start that just failed.
+db_map._BOOT_TS = time.time() - 3600
+p_fresh = _mini_study('fresh_fail', 0)
+gone = db_map.purge_empty_studies()
+check('purge keeps this-boot log of purged study',
+      not os.path.exists(p_fresh)
+      and os.path.exists(p_fresh[:-3] + '.log'), repr(gone))
+
+# Orphan logs (a start that died before creating its db): pre-boot ones are
+# swept, this-boot ones are kept.
+db_map._BOOT_TS = time.time() + 3600
+orph_old = os.path.join(_purge_dir, 'orph_old.log')
+Path(orph_old).write_text('dead start, previous boot')
+db_map.purge_empty_studies()
+check('purge sweeps pre-boot orphan log', not os.path.exists(orph_old))
+db_map._BOOT_TS = time.time() - 3600
+orph_new = os.path.join(_purge_dir, 'orph_new.log')
+Path(orph_new).write_text('dead start, this boot')
+db_map.purge_empty_studies()
+check('purge keeps this-boot orphan log', os.path.exists(orph_new))
+
+db_map._BOOT_TS = _saved_boot
+
+# A candidate that gains rows between the lock-free scan and the locked
+# delete pass must survive (the recount under the lock catches it). The
+# hook rides get_daemon_status, which pass 2 calls right before recounting.
+p_race = _mini_study('race_gain', 0)
+_orig_gds = db_map.get_daemon_status
+
+
+def _sneaky_gds():
+    conn = sd.db_open(p_race)
+    sd.insert_rows(conn, [{'lat': 40.0, 'lon': -119.0, 'heading': 90.0,
+                           'fix': 4, 'adc': [1] * 8, 'gps_ts': '1'}],
+                   12.4, 25.0)
+    conn.close()
+    db_map.get_daemon_status = _orig_gds   # fire once
+    return _orig_gds()
+
+
+db_map.get_daemon_status = _sneaky_gds
+gone = db_map.purge_empty_studies()
+db_map.get_daemon_status = _orig_gds
+check('purge recount keeps candidate that gained rows',
+      os.path.exists(p_race) and 'race_gain' not in gone, repr(gone))
+
+# list_studies: a db purged between its stat and open (concurrent request)
+# must be skipped, not rendered as a ghost row — while a corrupt-but-
+# PRESENT db stays visible to the operator.
+p_ghost = _mini_study('ghost', 2)
+_orig_db_ro = db_map.db_ro
+
+
+def _vanishing_db_ro(path):
+    if path.endswith('ghost.db'):
+        os.unlink(path)
+    return _orig_db_ro(path)
+
+
+db_map.db_ro = _vanishing_db_ro
+names = [s['id'] for s in db_map.list_studies()]
+db_map.db_ro = _orig_db_ro
+check('list_studies skips db purged mid-listing', 'ghost' not in names,
+      repr(names))
+check('list_studies keeps corrupt-but-present db', 'corrupt' in names,
+      repr(names))
+
+db_map._purged = True
+db_map._cli_overrides['studies_dir'] = STUDIES
+
+# Ordering is CREATION time (newest study first), never file mtime —
+# reopening / re-viewing an old study must not bubble it to the top.
+p_old = make_study('order_old', meta={'created_at': '1000'})
+p_new = make_study('order_new', meta={'created_at': '2000'})
+db_map._study_cache.clear()
+os.utime(p_old)          # old db touched LAST: mtime would put it on top
+order = [s['id'] for s in db_map.list_studies()
+         if s['id'].startswith('order_')]
+check('list_studies sorts by created_at not mtime',
+      order == ['order_new', 'order_old'], repr(order))
+for p in (p_old, p_new):
+    os.unlink(p)
+db_map._study_cache.clear()
 
 # Columns must agree with the row loader (the SSE path still uses rows —
 # a divergence would render live points differently from loaded ones).
@@ -413,7 +623,468 @@ evt = json.loads(first.decode().split('data: ', 1)[1].strip())
 check('sse tick shape', evt['type'] == 'tick' and len(evt['rows']) == 5
       and evt['status']['state'] == 'stopped' and 'connected' in evt['nav'],
       repr(list(evt.keys())))
+check('sse: no samples while stopped', evt['samples'] == [],
+      repr(evt['samples'])[:120])
 r.response.close()
+
+# Landing-page nav chip is SSE-fed: the kiosk loads the page at boot,
+# usually before the nav source is accepting, and a one-shot server-side
+# render would show "down" forever. Reserved id must not hit study lookup.
+r = client.get('/stream/__nav__', headers={'Accept': 'text/event-stream'})
+first = next(r.response)
+evt = json.loads(first.decode().split('data: ', 1)[1].strip())
+check('nav stream: tick carries nav snapshot + daemon state',
+      'connected' in evt['nav'] and evt['daemon_running'] is False,
+      repr(evt)[:120])
+# services + ipv4s ride the same tick (real values on the Pi, null
+# elsewhere — assert presence only so the suite also passes ON the Pi).
+check('nav stream: tick carries services field',
+      'services' in evt, repr(evt)[:120])
+check('nav stream: tick carries ipv4s field',
+      'ipv4s' in evt, repr(evt)[:120])
+r.response.close()
+r = client.get('/')
+check('index: nav chip fed by nav stream', b'/stream/__nav__' in r.data
+      and b'new EventSource' in r.data and b'id="navChip"' in r.data)
+# nginx answers a gunicorn-restart window with a 502, which kills an
+# EventSource permanently — the page must reopen it itself (the map and
+# raw views learned this the hard way; the kiosk parks here 24/7).
+check('index: nav stream reopened on fatal SSE error',
+      b'EventSource.CLOSED' in r.data)
+
+# ⏻ power button: confirm overlay on the landing page; the route needs a
+# working `sudo -n shutdown` and must surface refusal instead of hanging.
+check('index: power button + shutdown confirm overlay',
+      b'class="powerbtn"' in r.data and b'id="shutdownOverlay"' in r.data
+      and b'action="/shutdown"' in r.data)
+# The live-session warning is toggled by the SSE tick (a session started
+# from another client must warn on this long-lived page), so the element
+# is always in the DOM — hidden while no daemon runs.
+check('index: shutdown warning present but hidden while idle',
+      b'id="shutdownWarn"' in r.data
+      and b'hidden' in r.data[r.data.index(b'id="shutdownWarn"') - 80:
+                             r.data.index(b'id="shutdownWarn"') + 80])
+
+
+class _FakeRun:
+    def __init__(self, rc, err=''):
+        self.returncode, self.stderr, self.stdout = rc, err, ''
+
+
+_real_run = db_map.subprocess.run
+db_map.subprocess.run = \
+    lambda *a, **k: _FakeRun(1, 'sudo: a password is required')
+r = client.post('/shutdown', follow_redirects=True)
+check('shutdown: sudo refusal surfaces on landing page',
+      b'shutdown failed' in r.data and b'password is required' in r.data)
+db_map.subprocess.run = lambda *a, **k: _FakeRun(0)
+# Post/Redirect/Get: reloading (or restoring, after the next power-on)
+# the terminal tab must re-issue a harmless GET, never the POST.
+r = client.post('/shutdown')
+check('shutdown: success redirects to a GET terminal page',
+      r.status_code == 302 and r.headers['Location'].endswith('/shutting_down'))
+db_map.subprocess.run = _real_run
+r = client.get('/shutting_down')
+check('shutting_down: plain GET renders terminal page',
+      r.status_code == 200 and b'Shutting down' in r.data)
+r = client.get('/shutdown')
+check('shutdown: GET refused', r.status_code == 405)
+
+# ── Pi service panel ──────────────────────────────────────────────────────────
+
+print('service panel:')
+
+# No systemctl and no `ip` -> None/None and the panel never renders
+# (Jinja-gated, not display:none). Forced, not assumed: this branch must
+# also pass when the suite runs ON the Pi, where the binaries exist —
+# and the TTL caches could be primed by earlier index renders there.
+_sys_bins = (db_map.SYSTEMCTL_BIN,
+             '/usr/sbin/ip', '/sbin/ip', '/usr/bin/ip', '/bin/ip')
+_real_exists = db_map.os.path.exists
+db_map.os.path.exists = \
+    lambda p: False if p in _sys_bins else _real_exists(p)
+db_map._svc_cache = {'t': None, 'val': None, 'refreshing': False}
+db_map._ip_cache = {'t': None, 'val': None, 'refreshing': False}
+try:
+    check('service_states: None without systemctl',
+          db_map.service_states() is None)
+    check('local_ipv4s: None without an ip binary',
+          db_map.local_ipv4s() is None)
+    r = client.get('/')
+    check('index: no service panel without systemctl',
+          b'id="svcPanel"' not in r.data)
+finally:
+    db_map.os.path.exists = _real_exists
+
+# On the Pi: ONE `systemctl is-active a b c` call — one state per stdout
+# line in argument order; the nonzero exit (any unit inactive) is noise.
+_units = sorted(p.name for p in db_map._REPO_DIR.glob('*.service'))
+_lines = ['active'] * len(_units)
+_lines[0] = 'failed'
+_real_run = db_map.subprocess.run
+db_map.os.path.exists = \
+    lambda p: True if p == db_map.SYSTEMCTL_BIN else _real_exists(p)
+_fr = _FakeRun(3)                      # nonzero: some unit isn't active
+_fr.stdout = '\n'.join(_lines) + '\n'  # states arrive on stdout
+db_map.subprocess.run = lambda *a, **k: _fr
+# Reset the TTL cache going in (a real Pi systemctl may have primed it —
+# the mock would never run) and going out (later index/SSE requests must
+# not serve our fake 'failed' for the next 10 s).
+db_map._svc_cache = {'t': None, 'val': None, 'refreshing': False}
+try:
+    _st = db_map.service_states()
+finally:
+    db_map.os.path.exists = _real_exists
+    db_map.subprocess.run = _real_run
+    db_map._svc_cache = {'t': None, 'val': None, 'refreshing': False}
+check('service_states: units mapped to states in argument order',
+      _st is not None and list(_st) == _units and _st[_units[0]] == 'failed'
+      and all(_st[u] == 'active' for u in _units[1:]), repr(_st))
+
+# local_ipv4s(): parse `ip -j -4 addr` JSON — loopback and inet6 excluded,
+# iface name rides along. Same forced-binary + cache-reset dance.
+_ip_json = json.dumps([
+    {'ifname': 'lo',    'addr_info': [{'family': 'inet',  'local': '127.0.0.1'}]},
+    {'ifname': 'wlan0', 'addr_info': [{'family': 'inet',  'local': '192.168.4.1'}]},
+    {'ifname': 'eth0',  'addr_info': [{'family': 'inet',  'local': '10.1.2.3'},
+                                      {'family': 'inet6', 'local': 'fe80::1'}]},
+])
+db_map.os.path.exists = \
+    lambda p: True if p == '/usr/sbin/ip' else _real_exists(p)
+_fr = _FakeRun(0)
+_fr.stdout = _ip_json
+db_map.subprocess.run = lambda *a, **k: _fr
+db_map._ip_cache = {'t': None, 'val': None, 'refreshing': False}
+try:
+    _ips = db_map.local_ipv4s()
+finally:
+    db_map.os.path.exists = _real_exists
+    db_map.subprocess.run = _real_run
+    db_map._ip_cache = {'t': None, 'val': None, 'refreshing': False}
+check('local_ipv4s: iface + addr, no loopback, no inet6',
+      _ips == ['wlan0 192.168.4.1', 'eth0 10.1.2.3'], repr(_ips))
+
+# A failed `ip` run (busybox/old iproute2 rejecting -j: rc!=0, usage on
+# stderr, EMPTY stdout) is "couldn't determine" (None) — it must never be
+# read or cached as a positive 'no IPv4'.
+db_map.os.path.exists = \
+    lambda p: True if p == '/usr/sbin/ip' else _real_exists(p)
+_fr = _FakeRun(1, 'ip: unrecognized option: j')
+db_map.subprocess.run = lambda *a, **k: _fr
+db_map._ip_cache = {'t': None, 'val': None, 'refreshing': False}
+try:
+    _ips = db_map.local_ipv4s()
+    _cached = db_map._ip_cache['val']
+finally:
+    db_map.os.path.exists = _real_exists
+    db_map.subprocess.run = _real_run
+    db_map._ip_cache = {'t': None, 'val': None, 'refreshing': False}
+check('local_ipv4s: failed ip run is None, not cached as []',
+      _ips is None and _cached is None, repr((_ips, _cached)))
+
+# ── View Raw (--raw daemon + /raw routes + samples over SSE) ─────────────────
+
+print('view raw:')
+
+# The raw scratch db is redirected into SCRATCH so the real temp dir is
+# never touched. Routes read the module global at request time.
+db_map.RAW_DB = os.path.join(SCRATCH, 'raw_view.db')
+
+check('RAW_ID resolves outside studies dir',
+      db_map.get_db_path(db_map.RAW_ID) == db_map.RAW_DB
+      and not db_map.get_db_path(db_map.RAW_ID).startswith(STUDIES))
+
+# No daemon: View Raw is a one-touch start (POST /start_raw, no intermediate
+# screen). With a daemon up it becomes a plain link to /raw (viewer attach).
+r = client.get('/')
+check('index has View Raw button',
+      b'View Raw' in r.data and b'action="/start_raw"' in r.data)
+Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(p_saved)}')
+r = client.get('/')
+check('index View Raw is a link while daemon runs',
+      b'href="/raw"' in r.data and b'action="/start_raw"' not in r.data)
+# A daemon running while the operator sits on the landing page means a
+# client reset mid-run: the primary button is the way back in, and the
+# start form stays hidden. Assert the COMPOSED anchor — the studies table
+# always contains href="/view/saved1" on its own, which would mask a
+# broken live_id derivation (e.g. basename instead of stem).
+check('index offers Return to Live Study while recording',
+      'href="/view/saved1">▶ Return to Live Study'.encode() in r.data
+      and b'Start Recording' not in r.data)
+
+# Live map view: exit collapses into Stop & Exit (2-line label: the view
+# toolbar is width-squeezed at 800px); a saved study is just a viewer and
+# keeps plain navigation.
+# NB: assert on rendered markup — both templates' JS contains a literal
+# '← Studies' string (the stale-label swap when the daemon dies), so the
+# plain-exit BUTTON is identified by its composed onclick form.
+_studies_btn = 'onclick="location.href=\'/\'">← Studies'.encode()
+r = client.get('/view/saved1')
+check('live view exit is Stop & Exit',
+      b'Stop<br>&amp; Exit' in r.data and _studies_btn not in r.data)
+# The map strip has no scale selector, so it must pin the zero-referenced
+# overlay explicitly — StripChart's default 'auto' became raw shared-axis.
+check('view strip chart pins zero-overlay mode',
+      b"chart.setScaleMode('zero')" in r.data)
+# 800px layout: fix type rides above Stop & Exit, Vin/T sit under the strip
+# chart — the info-col copies of these are clipped off-screen while driving.
+check('live view: fix badge + vin/temp row in the visible zone',
+      b'id="fixBadge"' in r.data and b'id="vinLiveRow"' in r.data
+      and b'id="vinVal"' in r.data and b'id="tempVal"' in r.data)
+os.unlink(db_map.PID_FILE)
+r = client.get('/view/saved1')
+check('saved view keeps plain Studies exit',
+      _studies_btn in r.data and b'Stop<br>&amp; Exit' not in r.data)
+check('saved view: no fix badge (live-only element)',
+      b'id="fixBadge"' not in r.data)
+
+# Stopped: the start form, no stream.
+r = client.get('/raw')
+check('raw stopped: 200 + start form', r.status_code == 200
+      and b'/start_raw' in r.data and b'Start Streaming' in r.data)
+r = client.get('/raw?error=boom')
+# No URL strip here: this message points at the failure log, and a reload
+# must keep pointing at it (unlike the streaming branch's one-shot note).
+check('raw stopped: error surfaced', b'boom' in r.data)
+check('raw stopped: error survives reload (no URL strip)',
+      b'replaceState' not in r.data)
+
+# Raw mode: daemon (faked as us) attached to the raw db.
+conn = sd.db_open(db_map.RAW_DB)
+pt_raw = {'lat': None, 'lon': None, 'fix': None, 'heading': None,
+          'adc': [7] * 8, 'gps_ts': None}
+sd.live_write(conn, pt_raw, 0, '', time.time(), 12.4, 25.0)
+sd.samples_flush(conn, [(t, [t] * 8) for t in range(1, 9)])
+conn.close()
+Path(db_map.PID_FILE).write_text(
+    f'{os.getpid()}:{os.path.abspath(db_map.RAW_DB)}')
+
+r = client.get('/raw')
+check('raw mode: streaming banner, no start form',
+      b'STREAMING' in r.data and b'action="/start_raw"' not in r.data,
+      r.status_code)
+# raw is the ONLY home of the detector timing controls (removed from view)
+check('raw has timing controls', b'TX Pulse' in r.data
+      and b'timing-panel' in r.data)
+# Channel legend: per-channel show/hide checkboxes + σ readout. The rows
+# are client-built (buildVals), so assert the wiring ships, not the DOM.
+check('raw ships channel-visibility + σ wiring',
+      b'onChanVis' in r.data and b'updateStats' in r.data)
+_js = client.get('/static/map_core.js').data
+check('StripChart ships vis + stats API',
+      b'setChanVis' in _js and b'stats()' in _js)
+# Rate slider: 5 stops browsing the firmware's 20/40/100/200/500 Hz list.
+# Save Settings moved OUT of the timing panel (its old slot IS the slider
+# row) — it must render after the panel's closing tag.
+check('raw has rate slider', b'id="rateSl"' in r.data
+      and b'max="4"' in r.data)
+# Outside-ness proven structurally: between the panel's opening <div> and
+# the Save button, opens must equal closes — the panel (and every row in
+# it) closed before the button. Nested back inside, opens would lead by 1.
+# find() not index(): a missing marker must FAIL the check, not abort the
+# whole harness with a ValueError.
+_i0 = r.data.find(b'<div id="timing-panel"')
+_i1 = r.data.find(b'Save<br>Settings')
+_seg = r.data[_i0:_i1]
+check('save button sits outside the timing panel',
+      0 <= _i0 < _i1 and _seg.count(b'<div') == _seg.count(b'</div>'),
+      (_i0, _i1))
+# Stop and exit are ONE action — a daemon must never keep running after
+# the operator lands back on the studies page. (Match the plain-exit
+# BUTTON by its composed markup: the JS stale-label swap contains a bare
+# '← Studies' string.)
+check('raw mode: single Stop & Exit, no separate Studies exit',
+      b'/stop_daemon' in r.data and b'value="raw"' not in r.data
+      and b'Stop &amp; Exit' in r.data
+      and 'onclick="location.href=\'/\'">← Studies'.encode() not in r.data)
+check('raw mode: loads map_core.js', b'map_core.js' in r.data)
+# Autoscale must be ONE shared axis over raw counts so channels compare;
+# the per-channel-zero overlay is its own labelled mode, not "autoscale".
+_scale_opts = (b'<option value="auto">autoscale</option>',
+               '<option value="zero">Δ from zero</option>'.encode(),
+               b'<option value="abs">0 \xe2\x80\x93 65535</option>')
+check('raw mode: scale select = autoscale / Δ from zero / 0-65535',
+      all(o in r.data for o in _scale_opts)
+      and r.data.index(_scale_opts[0]) < r.data.index(_scale_opts[1])
+      < r.data.index(_scale_opts[2]))
+# e.g. a second /start_raw refused while streaming redirects here with
+# ?error=... — the streaming branch must show it, not swallow it. It's a
+# dismissible one-shot note (errNote) and the URL param is stripped
+# client-side so a reload doesn't repeat it.
+r = client.get('/raw?error=boom')
+check('raw mode: error surfaced while streaming', b'boom' in r.data
+      and b'errNote' in r.data and b'replaceState' in r.data)
+# The dismiss handler must be parsed before the note paints — a tap during
+# page streaming on slow Wi-Fi must not hit an undefined function.
+check('raw mode: dismissErr defined before errNote',
+      r.data.index(b'function dismissErr') < r.data.index(b'id="errNote"'))
+
+# Raw study is addressable for /data (raw.html seeds meta from it) but must
+# never appear in the studies list.
+r = client.get('/data/' + db_map.RAW_ID)
+check('data on raw db 200', r.status_code == 200
+      and r.get_json()['status']['state'] in ('recording', 'not_recording'),
+      r.status_code)
+# The daemon box may honestly say "running — raw_view.db", but the raw db
+# must never get a study row (it lives outside studies_dir).
+r = client.get('/')
+check('raw db not listed as a study', b'/view/raw_view' not in r.data
+      and b'/view/__raw__' not in r.data)
+# A raw session has no map to return to — the way back in is /raw itself.
+check('index offers Return to Raw View while raw daemon runs',
+      b'Return to Raw View' in r.data
+      and b'Return to Live Study' not in r.data)
+
+# SSE on the raw stream: first tick ships the whole ring, next tick only
+# new rows past the cursor.
+r = client.get('/stream/' + db_map.RAW_ID)
+first = json.loads(next(r.response).decode().split('data: ', 1)[1].strip())
+check('sse raw: first tick seeds whole ring',
+      len(first['samples']) == 8 and first['samples'][0]['tick'] == 1
+      and first['samples'][0]['adc'] == [1] * 8 and first['rows'] == [],
+      repr(first['samples'][:2]))
+conn = sqlite3.connect(db_map.RAW_DB)
+conn.execute('INSERT INTO live_samples '
+             '(tick,adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7) '
+             'VALUES (100,1,2,3,4,5,6,7,8)')
+conn.commit(); conn.close()
+second = json.loads(next(r.response).decode().split('data: ', 1)[1].strip())
+check('sse raw: cursor advances, only new samples',
+      len(second['samples']) == 1 and second['samples'][0]['tick'] == 100,
+      repr(second['samples']))
+
+# A held connection must survive /start_raw recreating the db: the unlink
+# resets the AUTOINCREMENT sequence, so without a cursor reset this stream
+# would wait ~a whole session for the old ids to come back around.
+for ext in ('', '-wal', '-shm'):
+    try:
+        os.unlink(db_map.RAW_DB + ext)
+    except OSError:
+        pass
+conn = sd.db_open(db_map.RAW_DB)
+sd.live_write(conn, pt_raw, 0, '', time.time(), 12.4, 25.0)
+sd.samples_flush(conn, [(t, [t] * 8) for t in (501, 502, 503)])
+conn.close()
+third = json.loads(next(r.response).decode().split('data: ', 1)[1].strip())
+if not third['samples']:      # one tick may straddle the recreate: allow it
+    third = json.loads(next(r.response).decode().split('data: ', 1)[1].strip())
+check('sse raw: cursor resets after db recreate',
+      [s['tick'] for s in third['samples']] == [501, 502, 503],
+      repr(third['samples']))
+r.response.close()
+
+# Study mode: daemon on a normal study → /raw is a viewer for it. The
+# exit rule holds here too: Stop & Exit ends the RECORDING (deliberate —
+# any exit to the studies page stops the daemon); the non-destructive way
+# out is the study-map link.
+Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(p_rec)}')
+r = client.get('/raw')
+check('raw study mode: viewer with study link',
+      b'/view/rec1' in r.data and b'action="/start_raw"' not in r.data)
+check('raw study mode: exit is Stop & Exit (stops the recording)',
+      b'Stop &amp; Exit' in r.data and b'/stop_daemon' in r.data
+      and 'onclick="location.href=\'/\'">← Studies'.encode() not in r.data)
+
+# A live study's SSE now carries samples too (the map-view strip chart).
+conn = sqlite3.connect(p_rec)
+conn.execute('INSERT INTO live_samples '
+             '(tick,adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7) '
+             'VALUES (55,9,9,9,9,9,9,9,9)')
+conn.commit(); conn.close()
+r = client.get('/stream/rec1?since_id=0')
+first = json.loads(next(r.response).decode().split('data: ', 1)[1].strip())
+check('sse live study: samples present',
+      len(first['samples']) == 1 and first['samples'][0]['tick'] == 55,
+      repr(first['samples']))
+r.response.close()
+os.unlink(db_map.PID_FILE)
+
+# The stale-ring fence for real: rec1's ring still holds that row, but with
+# the daemon gone (state 'stopped') it must NOT be served — a kill -9
+# leftover would otherwise replay as live data. (This is the test that
+# fails if the state gate is deleted from stream_study.)
+r = client.get('/stream/rec1?since_id=0')
+first = json.loads(next(r.response).decode().split('data: ', 1)[1].strip())
+check('sse: leftover ring not served while stopped',
+      first['status']['state'] == 'stopped' and first['samples'] == [],
+      repr((first['status']['state'], first['samples'])))
+r.response.close()
+
+# start_raw takes no form fields (port comes from config, baud is the
+# daemon's own default); its only pre-spawn rejection is a daemon already
+# running, and the bounce must land back on /raw, not the index.
+Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(p_saved)}')
+r = client.post('/start_raw')
+check('start_raw refuses while daemon running',
+      r.status_code == 302 and 'error=' in r.headers['Location'],
+      r.headers.get('Location'))
+check('start_raw redirects back to /raw',
+      '/raw' in r.headers['Location'], r.headers.get('Location'))
+os.unlink(db_map.PID_FILE)
+
+# Stop and exit are one action: every stop lands on the studies page, and
+# stray form fields (including the retired from=raw) can't redirect it.
+r = client.post('/stop_daemon', data={'from': 'raw'})
+check('stop always lands on the studies page',
+      r.status_code == 302 and not r.headers['Location'].endswith('/raw'),
+      r.headers.get('Location'))
+r = client.post('/stop_daemon', data={'from': 'http://evil.example'})
+check('stop with junk from → index',
+      r.status_code == 302 and not r.headers['Location'].endswith('/raw'),
+      r.headers.get('Location'))
+
+# ── study-list cache ──────────────────────────────────────────────────────────
+
+# Summaries are cached per db and re-read only when the file signature
+# (db + -wal mtime/size) changes — the landing page must not COUNT-scan a
+# season of studies on every render.
+db_map._study_cache.clear()
+before = {s['id']: s['count'] for s in db_map.list_studies()}
+_openings = []
+_orig_ro2 = db_map.db_ro
+
+
+def _counting_ro(path):
+    _openings.append(path)
+    return _orig_ro2(path)
+
+
+db_map.db_ro = _counting_ro
+again = {s['id']: s['count'] for s in db_map.list_studies()}
+db_map.db_ro = _orig_ro2
+check('study cache: unchanged dbs not re-opened',
+      again == before and not _openings, repr(_openings))
+
+conn = sd.db_open(p_rec)
+sd.insert_rows(conn, [{'lat': 40.2, 'lon': -119.2, 'heading': 90.0,
+                       'fix': 4, 'adc': [1] * 8, 'gps_ts': '123520.10'}],
+               12.4, 25.0)
+conn.close()
+after = {s['id']: s['count'] for s in db_map.list_studies()}
+check('study cache: write invalidates via file signature',
+      after['rec1'] == before['rec1'] + 1
+      and all(after[k] == v for k, v in before.items() if k != 'rec1'),
+      repr((before.get('rec1'), after.get('rec1'))))
+
+# A transient read failure (fd exhaustion, SD-card hiccup) must NOT be
+# cached: a quiescent file's signature never changes, so caching the
+# 0-point fallback would pin it until process restart.
+db_map._study_cache.clear()
+
+
+def _failing_ro(path):
+    if path.endswith('rec1.db'):
+        raise sqlite3.OperationalError('disk I/O error')
+    return _orig_ro2(path)
+
+
+db_map.db_ro = _failing_ro
+hiccup = {s['id']: s['count'] for s in db_map.list_studies()}
+db_map.db_ro = _orig_ro2
+healed = {s['id']: s['count'] for s in db_map.list_studies()}
+check('study cache: transient read failure not cached',
+      hiccup['rec1'] == 0 and healed['rec1'] == after['rec1'],
+      repr((hiccup.get('rec1'), healed.get('rec1'))))
 
 # ── review-driven hardening ───────────────────────────────────────────────────
 
@@ -456,6 +1127,28 @@ r = client.post('/cmd', json={'cmd': 'f'})
 data = os.read(rfd, 16)
 check('cmd writes exactly one byte',
       r.get_json().get('ok') is True and data == b'f', repr(data))
+# Rate slider steps arrive as individual g/b keys — plain single bytes.
+r = client.post('/cmd', json={'cmd': 'g'})
+data = os.read(rfd, 16)
+check('cmd rate key g forwards one byte', data == b'g', repr(data))
+r = client.post('/cmd', json={'cmd': 'b'})
+data = os.read(rfd, 16)
+check('cmd rate key b forwards one byte', data == b'b', repr(data))
+# SAVE and CLEAR are the only multi-byte commands: firmware word-gates both
+# flash writes ("WORD"+Enter), so the wire bytes must be word plus newline.
+r = client.post('/cmd', json={'cmd': 'SAVE'})
+data = os.read(rfd, 16)
+check('cmd SAVE sends word + newline',
+      r.get_json().get('ok') is True and data == b'SAVE\n', repr(data))
+r = client.post('/cmd', json={'cmd': 'CLEAR'})
+data = os.read(rfd, 16)
+check('cmd CLEAR sends word + newline',
+      r.get_json().get('ok') is True and data == b'CLEAR\n', repr(data))
+# Anything else multi-char still truncates to its first byte ('Sx' must
+# never reach the wire as anything that could accumulate toward a save).
+r = client.post('/cmd', json={'cmd': 'SAVE '})
+data = os.read(rfd, 16)
+check('cmd non-exact SAVE truncates to one byte', data == b'S', repr(data))
 os.close(rfd)
 
 # Cross-origin browser POSTs are refused; same-origin sails through, and
@@ -474,13 +1167,15 @@ check('same-host other-port POST allowed', r.status_code == 200, r.status_code)
 orig_cfg_text = (db_map.CONFIG_FILE.read_text()
                  if db_map.CONFIG_FILE.exists() else None)
 saved_overrides = dict(db_map._cli_overrides)
+# ('baud' is a legacy key — configs written before it moved into the
+# daemon still carry it; it must be ignored, not crash anything.)
 db_map.CONFIG_FILE.write_text(json.dumps(
     {'nav_port': None, 'baud': 'fast', 'studies_dir': 123, 'nav_host': '',
      'heading_offset_deg': 'north'}))
 db_map._cli_overrides.clear()
 cfg = db_map.load_config()
 check('config type fallback',
-      cfg['nav_port'] == 50012 and cfg['baud'] == 460800
+      cfg['nav_port'] == 50012
       and isinstance(cfg['studies_dir'], str) and cfg['nav_host'] == '127.0.0.1'
       and cfg['heading_offset_deg'] == 270,
       repr(cfg))
@@ -498,22 +1193,10 @@ try:
     os.unlink(db_map.PID_FILE)
 except FileNotFoundError:
     pass
-r = client.post('/start_daemon', data={'port': '/dev/x', 'baud': '46080o',
-                                       'min_dist': '20'})
-check('start_daemon rejects bad baud',
-      r.status_code == 302 and 'error=' in r.headers['Location'],
-      r.headers.get('Location'))
-r = client.post('/start_daemon', data={'port': '/dev/x', 'baud': '²',
-                                       'min_dist': '20'})
-check('start_daemon rejects unicode digit baud',
-      r.status_code == 302 and 'error=' in r.headers['Location'],
-      r.status_code)
-r = client.post('/start_daemon', data={'port': '/dev/x', 'baud': '115200',
-                                       'min_dist': 'abc'})
+r = client.post('/start_daemon', data={'port': '/dev/x', 'min_dist': 'abc'})
 check('start_daemon rejects bad min_dist',
       r.status_code == 302 and 'error=' in r.headers['Location'])
-r = client.post('/start_daemon', data={'port': '', 'baud': '115200',
-                                       'min_dist': '20'})
+r = client.post('/start_daemon', data={'port': '', 'min_dist': '20'})
 check('start_daemon rejects empty port',
       r.status_code == 302 and 'error=' in r.headers['Location'])
 

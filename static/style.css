@@ -10,6 +10,9 @@ body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee;
 
 .btn { border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer;
        font-size: 12px; font-weight: bold; color: #fff; }
+
+/* inline-SVG button icons (templates/icons.html) ride the text baseline */
+svg.ic { vertical-align: -3px; }
 .btn-green  { background: #2e7d32; }
 .btn-blue   { background: #1565c0; }
 .btn-red    { background: #b71c1c; }

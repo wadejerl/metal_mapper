@@ -3,8 +3,8 @@
 
 Study 'serpentine_demo': a lawnmower pattern over a ~40x25 m field with two
 buried targets (one hot, one negative response), RTK fixed, heading present,
-vin/temp at 1 Hz — written with serial_daemon's own db_open/insert_point so
-the schema is exactly what the real daemon produces.
+vin/temp at 1 Hz — written with serial_daemon's own db_open so the schema
+is exactly what the real daemon produces.
 
 Study 'warn_demo': small study carrying drift flags + identity failure, to
 exercise the warning pills and banner states.
@@ -37,6 +37,7 @@ HEADER = {
     'gps_id': 'UID-DEMO-1', 'blanking_us': '16', 'rx_window_us': '3',
     'tx_pulse_us': '120', 'coil_spacing_mm': '500',
     'coil_offset_fore_mm': '0', 'coil_offset_right_mm': '0',
+    'fire_mode': 'both', 'sample_rate_hz': '500', 'adc_oversample': '16',
     'adc_order': 'PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14',
     'info_ok': '1', 'schema_version': '3', 'gate': 'rtk+heading',
     'min_dist_mm': '20',

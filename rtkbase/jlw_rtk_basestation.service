@@ -1,0 +1,11 @@
+[Unit]
+Description=RTK base station (Quectel survey-in + NTRIP caster)
+
+[Service]
+ExecStart=/home/rtk/run_rtk.sh
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+

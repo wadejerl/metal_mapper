@@ -1,0 +1,655 @@
+{% import 'icons.html' as ic %}<!DOCTYPE html>
+<html>
+<head>
+  <title>View Raw — Metal Mapper</title>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
+  <style>
+    body { background: #111; color: #eee; }
+    #banner   { position:absolute; top:0; left:0; right:0; z-index:1100; }
+    .st-raw   { background:#4a148c; color:#e1bee7; }
+    /* telemetry strip: every live value across the top — compact enough to
+       stay a SINGLE row at 800px wide (the 800x480 operator display); every
+       extra row comes straight out of the chart's height */
+    #telemetry {
+      position:absolute; left:0; right:0; z-index:1000;
+      background:rgba(0,0,0,0.88); padding:3px 10px;
+      display:flex; gap:10px; flex-wrap:wrap; align-items:baseline;
+    }
+    .tv       { display:flex; flex-direction:column; min-width:44px; }
+    .tv-lbl   { font-size:8px; color:#888; text-transform:uppercase;
+                letter-spacing:.04em; }
+    .tv-val   { font-size:12px; font-family:monospace; color:#fff;
+                white-space:nowrap; }
+    /* toolbar: same controls family as the map view */
+    #toolbar {
+      position:absolute; left:0; right:0;
+      background:rgba(0,0,0,0.88); color:#fff; padding:4px 10px;
+      /* gap 6px: raw-mode content must stay ONE row at 800px measured
+         with the Pi's DejaVu fonts (~5-8% wider than bench fonts — an
+         earlier 8px/95px/unstyled-select combo fit the bench at 787px
+         but measured ~815px under DejaVu and wrapped Save under the
+         Stop button) */
+      z-index:1000; display:flex; align-items:center; gap:6px;
+      /* wrap, never clip: narrower still, the Stop button must stay
+         reachable (relayout() measures offsetHeight, chart just shrinks) */
+      flex-wrap:wrap; overflow:hidden;
+    }
+    .toolbar-sep { width:1px; background:rgba(255,255,255,0.15);
+                   align-self:stretch; margin:4px 0; }
+    .slider-row { display:flex; align-items:center; gap:6px; font-size:12px; }
+    .slider-row label { min-width:52px; }
+    /* 88px (was 110): buys the Save button its slot right of the timing
+       panel at 800px. Coarse calib sliders — the lost travel is noise. */
+    .slider-row input[type=range] { width:88px; height:4px; }
+    /* Fixed width + 11px: intrinsic select sizing follows the widest
+       option in the PLATFORM font — DejaVu grew these ~10px and blew the
+       800px row. 100px: "Δ array mean" measures 74.6px at 11px DejaVu
+       plus ~22px of menulist chrome — 96px shaved the final glyph. */
+    .slider-row select { width:100px; font-size:11px; }
+    .slider-row .sv { min-width:40px; font-family:monospace; }
+    .sliders-col { display:flex; flex-direction:column; gap:4px; }
+    /* timing panel (same look as the map view) */
+    #timing-panel {
+      background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.18);
+      border-radius:6px; padding:4px 10px; font-size:11px; min-width:160px;
+    }
+    #timing-panel h4 { margin:0 0 3px 0; color:#a5d6a7; font-size:9px;
+                       text-transform:uppercase; letter-spacing:.05em; }
+    .tm-row { display:flex; align-items:center; gap:5px; margin-bottom:2px; }
+    .tm-lbl  { min-width:60px; color:#aaa; }
+    .tm-val  { min-width:32px; font-family:monospace; color:#fff; }
+    .tm-btn  { background:#0d47a1; color:#fff; border:none; padding:1px 7px;
+               border-radius:3px; cursor:pointer; font-size:11px; }
+    .tm-btn:hover { background:#1565c0; }
+    /* Sits OUTSIDE the timing panel, to its right — its old in-panel slot
+       became the Rate slider row. Standalone in the toolbar it also can't
+       be fat-fingered from the +/- taps any more. Two-line label: the
+       slack right of the panel fits "Settings" stacked (~63px under
+       DejaVu) but not "Save Settings" in one run. */
+    .save-btn { background:#4a148c; color:#fff; border:none; padding:6px 8px;
+                border-radius:4px; cursor:pointer; font-size:10px;
+                font-weight:bold; align-self:center; line-height:1.3;
+                text-align:center; }
+    .save-btn:hover { background:#6a1b9a; }
+    /* Rate slider: browses the discrete 20/40/100/200/500 Hz list — the
+       thumb snaps to 5 stops, each stop = one g/b step at the firmware */
+    #rateSl { width:68px; height:4px; }
+    /* the big chart */
+    #chartWrap { position:absolute; left:0; right:0; bottom:0;
+                 display:flex; gap:8px; padding:6px; box-sizing:border-box; }
+    #rawChart  { background:rgba(255,255,255,0.05);
+                 border:1px solid rgba(255,255,255,0.15); border-radius:4px;
+                 flex:none; }
+    /* min-width must cover the row's intrinsic width (checkbox + chN +
+       val + σ + gaps ≈ 171px DejaVu) — anything less lets flex squeeze
+       the column and the flex-end rows overflow LEFT onto the canvas
+       until relayout() converges */
+    #chart-vals { display:flex; flex-direction:column;
+                  justify-content:space-around; font-size:13px;
+                  font-family:monospace; min-width:175px; }
+    /* each row is a <label> wrapping its checkbox: the whole ~175x27px
+       row is the touch target — a gloved finger, not a 15px checkbox
+       (true 44px rows won't fit: 8x44 overflows the column at 480px) */
+    .ch-row  { display:flex; gap:8px; justify-content:flex-end;
+               align-items:baseline; padding:6px 0; cursor:pointer;
+               user-select:none; }
+    .ch-row input[type=checkbox] { width:15px; height:15px; margin:0;
+                                   align-self:center; cursor:pointer; }
+    .ch-val  { min-width:52px; text-align:right; font-weight:bold; }
+    /* per-channel noise: σ over the displayed window, same filter as the
+       traces — the asymmetry between channels is the point of showing it */
+    .ch-std  { min-width:56px; text-align:right; color:#9ab; font-size:11px; }
+    /* unticked channel: row stays live (values keep updating) but dims —
+       the checkbox itself keeps full contrast as the way back */
+    .ch-off span { opacity:0.35; }
+    /* stopped: the start panel */
+    #startPanel { max-width:420px; margin:120px auto; background:#16213e;
+                  border:1px solid #0f3460; border-radius:8px; padding:24px; }
+    #startPanel h2 { color:#e94560; margin-top:0; }
+    #startPanel button { margin-top:16px; background:#e94560; color:#fff;
+                         border:none; padding:9px 24px; border-radius:4px;
+                         cursor:pointer; font-size:14px; font-weight:bold; }
+    .err { color:#ef9a9a; font-size:13px; margin-top:8px; }
+    .note { color:#889; font-size:12px; margin-top:8px; }
+  </style>
+  <script src="/static/map_core.js?v={{ asset_v }}"></script>
+</head>
+<body>
+<script>
+{% if mode != 'stopped' %}
+// STREAMING page only: ?error= describes the request that just landed, not
+// future state — strip it so a reload doesn't repeat a stale complaint.
+// The stopped branch keeps its param: that message points at the failure
+// log, and a reload must not eat the only pointer.
+if (location.search.includes('error=')) {
+  history.replaceState(null, '', location.pathname);
+}
+{% endif %}
+// Defined up top so the errNote's onclick works the instant it paints,
+// even while the rest of the page is still streaming in.
+function dismissErr() {
+  const e = document.getElementById('errNote');
+  if (e) {
+    e.remove();
+    if (typeof relayout === 'function') relayout();
+  }
+}
+</script>
+
+{% if mode == 'stopped' %}
+<div style="padding:14px;">
+  <button class="btn btn-grey" onclick="location.href='/'">← Studies</button>
+</div>
+<div id="startPanel">
+  <h2>View Raw</h2>
+  <div class="note">Streams the detector at the full sample rate for system
+    testing and calibration. No GPS needed — and <b>nothing is saved</b>.</div>
+  {% if error %}<div class="err">⚠ {{ error }}</div>{% endif %}
+  <div class="note">Uses the configured port ({{ cfg.serial_port }}).</div>
+  <form method="post" action="/start_raw">
+    <button type="submit">▶ Start Streaming</button>
+  </form>
+</div>
+<div style="color:#555; font-size:11px; font-family:monospace;
+            text-align:center;">{{ git_hash }}</div>
+
+{% else %}
+<div id="banner">
+  <div class="status-banner st-raw" id="statusBanner">● STREAMING</div>
+  {# e.g. a second /start_raw racing an already-running daemon — must not
+     vanish just because the page rendered in viewer mode. Info-blue, not
+     .err red: the amber banner above owns live-fault severity, this is a
+     one-shot notice about a refused action. Tap to dismiss. #}
+  {# padded to a ~44px touch target — field gloves, not mouse pointers #}
+  {% if error %}
+  <div id="errNote" onclick="dismissErr()" style="background:rgba(0,0,0,0.88);
+       color:#90caf9; font-size:14px; margin:0; padding:13px 14px;
+       cursor:pointer;">{{ ic.info(14) }} {{ error }} — tap to dismiss</div>
+  {% endif %}
+</div>
+
+<div id="telemetry">
+  <div class="tv"><span class="tv-lbl">Fix</span>
+    <span class="tv-val" id="fixVal">—</span></div>
+  <div class="tv"><span class="tv-lbl">Heading</span>
+    <span class="tv-val" id="hdgVal">—</span></div>
+  <div class="tv" style="min-width:150px;"><span class="tv-lbl">Position</span>
+    <span class="tv-val" id="posVal" style="font-size:12px;">—</span></div>
+  <div class="tv"><span class="tv-lbl">GPS time</span>
+    <span class="tv-val" id="gpstsVal">—</span></div>
+  <div class="tv"><span class="tv-lbl">Vin</span>
+    <span class="tv-val" id="vinVal">—</span></div>
+  <div class="tv"><span class="tv-lbl">Temp</span>
+    <span class="tv-val" id="tempVal">—</span></div>
+  <div class="tv"><span class="tv-lbl">Rate</span>
+    <span class="tv-val" id="rateVal">—</span></div>
+  <div class="tv"><span class="tv-lbl">FW build</span>
+    <span class="tv-val" id="fwVal">—</span></div>
+  <div class="tv"><span class="tv-lbl">Port</span>
+    <span class="tv-val" id="portVal" style="font-size:12px;">—</span></div>
+</div>
+
+<div id="toolbar">
+  {# Exiting to the studies page IS ending the session — one button, so
+     the daemon can never be left running behind the operator's back. #}
+  <form method="post" action="/stop_daemon">
+    <button class="btn btn-red" id="stopExitBtn">■ Stop &amp; Exit</button>
+  </form>
+
+  <div class="sliders-col">
+    <div class="slider-row">
+      <label>− Range</label>
+      <input type="range" id="minusSl" min="5" max="2000" step="5" value="450"
+             oninput="onSliders()">
+      <span class="sv" id="minusV">450</span>
+    </div>
+    <div class="slider-row">
+      <label>+ Range</label>
+      <input type="range" id="plusSl" min="5" max="2000" step="5" value="450"
+             oninput="onSliders()">
+      <span class="sv" id="plusV">450</span>
+    </div>
+    <div class="slider-row">
+      <label>Offset</label>
+      <input type="range" id="offSl" min="-2000" max="2000" step="10" value="-140"
+             oninput="onSliders()">
+      <span class="sv" id="offV">-140</span>
+    </div>
+  </div>
+
+  <div class="sliders-col">
+    <div class="slider-row">
+      <label title="Δ array: subtract the mean of all coils at each instant — hides rises/falls common to the whole array, keeps differential (target) response">Filter</label>
+      <select id="filterSel" onchange="onFilter()">
+        <option value="abs">absolute</option>
+        <option value="cm">Δ array mean</option>
+      </select>
+    </div>
+    <div class="slider-row">
+      <label title="Autoscale: raw counts, one shared axis fit to the data — levels and amplitudes comparable across channels. Δ from zero: each channel offset to its own zero baseline so the traces overlay — shapes comparable, levels not. 0–65535: raw counts on the full ADC range">Scale</label>
+      <select id="scaleSel" onchange="onScale()">
+        <option value="auto">autoscale</option>
+        <option value="zero">Δ from zero</option>
+        <option value="abs">0 – 65535</option>
+      </select>
+    </div>
+  </div>
+
+  <div class="toolbar-sep"></div>
+
+  <div id="timing-panel">
+    <h4>Detector Timing</h4>
+    <div class="tm-row">
+      <span class="tm-lbl">Blanking</span>
+      <span class="tm-val" id="blankVal">—</span>µs
+      <button class="tm-btn" onclick="sendCmd('a')">+1</button>
+      <button class="tm-btn" onclick="sendCmd('z')">−1</button>
+    </div>
+    <div class="tm-row">
+      <span class="tm-lbl">RX Window</span>
+      <span class="tm-val" id="winVal">—</span>µs
+      <button class="tm-btn" onclick="sendCmd('s')">+1</button>
+      <button class="tm-btn" onclick="sendCmd('x')">−1</button>
+    </div>
+    <div class="tm-row">
+      <span class="tm-lbl">TX Pulse</span>
+      <span class="tm-val" id="txVal">—</span>µs
+      <button class="tm-btn" onclick="sendCmd('f')">+1</button>
+      <button class="tm-btn" onclick="sendCmd('v')">−1</button>
+    </div>
+    <div class="tm-row" style="margin-bottom:0;">
+      <span class="tm-lbl" title="Sample rate: 20/40/100/200/500 Hz — steps the firmware's g/b keys">Rate</span>
+      <input type="range" id="rateSl" min="0" max="4" step="1" value="4"
+             oninput="rateDrag()" onchange="onRate()">
+      <span class="tm-val" id="rateSlV" style="min-width:44px;">—</span>
+    </div>
+  </div>
+
+  <button class="save-btn" onclick="sendCmd('SAVE')">{{ ic.save(11) }} Save<br>Settings</button>
+
+  {% if mode != 'raw' %}
+  <div class="toolbar-sep"></div>
+  <a class="btn btn-blue" style="margin-left:auto; text-decoration:none;"
+     href="/view/{{ sid }}">{{ ic.map(16) }} Open study map</a>
+  {% endif %}
+</div>
+
+<div id="chartWrap">
+  <canvas id="rawChart"></canvas>
+  <div id="chart-vals"></div>
+</div>
+
+<script>
+// ── Constants injected from Flask ─────────────────────────────────────────────
+const MODE = {{ mode | tojson }};   // 'raw' (nothing saved) | 'study' (viewer)
+const SID  = {{ sid  | tojson }};
+
+const CH_COLORS = MM.CH_COLORS;
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const RAW_N   = 2048;               // ~4 s at 500 Hz — the daemon's whole ring
+let calib     = {zero8: null, offset: -140, plusRange: 450, minusRange: 450};
+let adcLabels = [];
+let lastTick  = null, lastWall = null, rateHz = null;
+
+const chart = MM.StripChart(document.getElementById('rawChart'), {n: RAW_N});
+
+// ── Layout: chart fills everything below the control rows ────────────────────
+function relayout() {
+  const bannerH = document.getElementById('banner').offsetHeight;
+  const tele    = document.getElementById('telemetry');
+  const bar     = document.getElementById('toolbar');
+  tele.style.top = bannerH + 'px';
+  bar.style.top  = (bannerH + tele.offsetHeight) + 'px';
+  const wrap = document.getElementById('chartWrap');
+  wrap.style.top = (bannerH + tele.offsetHeight + bar.offsetHeight) + 'px';
+  const valsW = document.getElementById('chart-vals').offsetWidth || 175;
+  const w = Math.max(200, wrap.clientWidth - valsW - 30);
+  const h = Math.max(120, wrap.clientHeight - 20);
+  chart.resize(w, h);
+  chart.draw();
+}
+
+function buildVals() {
+  const col = document.getElementById('chart-vals');
+  col.innerHTML = '';
+  for (let ch = 0; ch < 8; ch++) {
+    const row = document.createElement('label');
+    // Rebuilt on every meta retry poll — checkbox state must come back
+    // from the chart (the source of truth), never reset to checked.
+    const on = chart.chanVis(ch);
+    row.className = 'ch-row' + (on ? '' : ' ch-off');
+    row.id = 'chrow' + ch;
+    row.title = adcLabels[ch] || ('ch' + ch);
+    row.innerHTML =
+      `<input type="checkbox"${on ? ' checked' : ''}` +
+      ` style="accent-color:${CH_COLORS[ch]};"` +
+      ` onchange="onChanVis(${ch}, this.checked)">` +
+      `<span style="color:${CH_COLORS[ch]};">ch${ch}</span>` +
+      `<span class="ch-val" id="chv${ch}">—</span>` +
+      `<span class="ch-std" id="chs${ch}">—</span>`;
+    col.appendChild(row);
+  }
+}
+
+function onChanVis(ch, on) {
+  chart.setChanVis(ch, on);
+  document.getElementById('chrow' + ch).classList.toggle('ch-off', !on);
+  chart.draw();
+}
+
+function updateStats() {
+  const st = chart.stats();
+  if (!st) return;
+  for (let ch = 0; ch < 8; ch++) {
+    const el = document.getElementById('chs' + ch);
+    if (el) el.textContent = 'σ' + st[ch].std.toFixed(1);
+  }
+}
+
+function updateChanReadout(adc) {
+  if (!adc) return;
+  for (let ch = 0; ch < 8; ch++) {
+    const el = document.getElementById('chv' + ch);
+    if (!el || adc[ch] == null) continue;
+    el.textContent = adc[ch];
+    const zero = calib.zero8 ? calib.zero8[ch] : null;
+    el.style.color = MM.colorFor(adc[ch], zero, calib.offset,
+                                 calib.plusRange, calib.minusRange);
+  }
+}
+
+// ── Controls ──────────────────────────────────────────────────────────────────
+function onSliders() {
+  calib.minusRange = parseFloat(document.getElementById('minusSl').value);
+  calib.plusRange  = parseFloat(document.getElementById('plusSl').value);
+  calib.offset     = parseFloat(document.getElementById('offSl').value);
+  document.getElementById('minusV').textContent = calib.minusRange;
+  document.getElementById('plusV').textContent  = calib.plusRange;
+  document.getElementById('offV').textContent   = calib.offset;
+}
+
+function onFilter() {
+  chart.setFilter(document.getElementById('filterSel').value);
+  chart.draw();
+  updateStats();  // σ rides the display pipeline: new filter, new numbers
+}
+
+function onScale() {
+  chart.setScaleMode(document.getElementById('scaleSel').value);
+  chart.draw();
+  updateStats();  // abs scale bypasses the cm filter — σ follows suit
+}
+
+function rezero() {
+  // Display-side zero from the stream itself: mean of the newest ~0.5 s.
+  // No button any more — runs once automatically when the first data lands.
+  const t = chart.tail(256);
+  if (t.length < 10) return;
+  calib.zero8 = Array.from({length: 8}, (_, ch) =>
+    Math.round(t.reduce((a, r) => a + r[ch], 0) / t.length * 10) / 10);
+  chart.setZero(calib.zero8);
+  chart.draw();
+}
+
+// EVERY command rides one promise chain: the g/b rate steps are relative,
+// so ordering isn't cosmetic — a SAVE overtaking queued steps would persist
+// an intermediate rate to flash, and parallel fetches guarantee nothing.
+let cmdChain = Promise.resolve();
+
+function sendCmd(byte) {
+  // Panel values refresh via the SSE status ticks.
+  cmdChain = cmdChain.then(() => fetch('/cmd', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({cmd: byte})
+  }).catch(() => {}));
+  return cmdChain;
+}
+
+// ── Sample-rate slider ────────────────────────────────────────────────────────
+// The firmware browses a fixed divisor list with g (up) / b (down); the
+// slider's 5 stops map onto it. A drag can mean several steps sent as
+// individual keys through the chain above.
+const RATES = [20, 40, 100, 200, 500];
+let fwRateIdx  = null;   // last rate CONFIRMED by the firmware (echo/meta)
+let ratePending = null;  // {idx, t}: steps in flight, don't snap the slider
+let walkQueued = 0;      // g/b fetches queued but not yet resolved
+let rateMatches = 0;     // consecutive ticks agreeing with the pending target
+let rateHeld   = false;  // finger/pointer currently on the thumb
+
+function setRateUI(idx) {
+  document.getElementById('rateSl').value = idx;
+  document.getElementById('rateSlV').textContent = RATES[idx] + ' Hz';
+}
+
+function rateDrag() {  // live label while the thumb moves; nothing sent yet
+  const i = parseInt(document.getElementById('rateSl').value, 10);
+  document.getElementById('rateSlV').textContent = RATES[i] + ' Hz';
+}
+
+function onRate() {    // thumb released: walk the firmware to the target
+  const target = parseInt(document.getElementById('rateSl').value, 10);
+  // Steps are relative — with no confirmed starting point there is nothing
+  // safe to send. Park the thumb back on '—' state and wait for the echo.
+  const from = ratePending ? ratePending.idx : fwRateIdx;
+  if (from == null) {
+    document.getElementById('rateSlV').textContent = '—';
+    return;
+  }
+  if (target === from) { setRateUI(target); return; }
+  ratePending = {idx: target, t: performance.now()};
+  rateMatches = 0;
+  const key = target > from ? 'g' : 'b';
+  for (let i = 0; i < Math.abs(target - from); i++) {
+    walkQueued++;
+    sendCmd(key).then(() => { walkQueued--; });
+  }
+}
+
+function updateRateFromFw(hz) {
+  const idx = RATES.indexOf(hz);
+  if (idx < 0) return;               // not a list value: leave the UI alone
+  fwRateIdx = idx;
+  if (ratePending) {
+    // Mid-walk echoes must not yank the thumb around. One matching tick
+    // is NOT confirmation: /cmd resolves on the FIFO write, long before
+    // the byte is paced onto the wire and its echo lands in meta — so on
+    // a retarget back to the walk's origin (500->20->500) a stale tick
+    // can carry the origin value with the queue already drained. That
+    // stale window (FIFO select wake + 2 ms/byte pacing + echo parse +
+    // meta commit, ~200-400 ms) is shorter than one SSE tick period, so
+    // TWO consecutive matching ticks guarantee at least one is post-walk
+    // firmware truth. The timeout covers a lost echo / daemon swap.
+    rateMatches = (idx === ratePending.idx && walkQueued === 0)
+                  ? rateMatches + 1 : 0;
+    if (rateMatches >= 2 || performance.now() - ratePending.t > 5000) {
+      ratePending = null;
+      rateMatches = 0;
+      if (!rateHeld) setRateUI(idx);
+    }
+    return;
+  }
+  if (!rateHeld) setRateUI(idx);
+}
+
+// While a finger is on the thumb the SSE ticks must not rewrite the
+// slider: a tick mid-drag warps the value back under the pointer, and a
+// press-hold-release (the normal gloved gesture) then ends at its start
+// value — no change event, the selection silently dropped. Release can
+// happen off-element, so the clear rides window-level events — matched
+// by pointerId so a second concurrent touch (multi-touch phone; the
+// kiosk itself is single-touch) can't release the drag guard early.
+let ratePtrId = null;
+document.getElementById('rateSl').addEventListener(
+  'pointerdown', (e) => { rateHeld = true; ratePtrId = e.pointerId; });
+for (const ev of ['pointerup', 'pointercancel']) {
+  window.addEventListener(ev, (e) => {
+    if (e.pointerId === ratePtrId) { rateHeld = false; ratePtrId = null; }
+  });
+}
+
+// ── Status / telemetry render ─────────────────────────────────────────────────
+function setVal(id, text, color) {
+  const el = document.getElementById(id);
+  el.textContent = text;
+  if (color) el.style.color = color;
+}
+
+// Exit control tracks daemon state BOTH ways: with the daemon gone the red
+// Stop & Exit must become plain navigation (a neutered form — a stale tab's
+// POST could SIGTERM a daemon somebody else started since); when a new raw
+// session reattaches to this same db, it must turn back into a real stop.
+function setExitBtn(stopped) {
+  const xb = document.getElementById('stopExitBtn');
+  if (!xb) return;
+  if (stopped) {
+    xb.type = 'button';                    // never submits /stop_daemon
+    xb.onclick = () => location.href = '/';
+    xb.textContent = '← Studies';
+    xb.className = 'btn btn-grey';
+  } else {
+    xb.type = 'submit';
+    xb.onclick = null;
+    xb.textContent = '■ Stop & Exit';
+    xb.className = 'btn btn-red';
+  }
+}
+
+function updateStatus(st) {
+  setExitBtn(st.state === 'stopped');
+  const sb = document.getElementById('statusBanner');
+  if (st.state === 'wedged') {
+    sb.className = 'status-banner st-wedged';
+    sb.textContent = '✖ DAEMON WEDGED — no heartbeat for ' +
+                     (st.live_age_s != null ? st.live_age_s + ' s' : '?');
+  } else if (st.state === 'stopped') {
+    sb.className = 'status-banner st-stopped';
+    sb.textContent = '■ Daemon stopped — reload to start a new session';
+    dismissErr();  // the load-time notice referred to the session that ended
+  } else if (MODE === 'raw') {
+    // Data-flow faults must not hide behind a green STREAMING banner — with
+    // the port set-and-forget, this is the only place a wrong port shows up.
+    // Gate reasons (no fix / no heading) are NORMAL here: raw needs no GPS.
+    if (st.reason === 'no port' || st.reason === 'no data'
+        || st.reason === 'garbage') {
+      sb.className = 'status-banner st-not_recording';
+      sb.textContent = '▲ STREAMING FAULT: ' + MM.reasonText(st.reason);
+    } else {
+      sb.className = 'status-banner st-raw';
+      sb.textContent = '● STREAMING — NOT SAVING (raw view for test & calibration)';
+    }
+  } else if (st.state === 'recording') {
+    sb.className = 'status-banner st-recording';
+    sb.textContent = '● RECORDING study "' + SID + '" — raw viewer';
+  } else {
+    sb.className = 'status-banner st-not_recording';
+    sb.textContent = '▲ LIVE study "' + SID + '" — NOT RECORDING: ' +
+                     MM.reasonText(st.reason);
+  }
+
+  for (const [key, id] of [['blanking_us', 'blankVal'],
+                           ['rx_window_us', 'winVal'],
+                           ['tx_pulse_us', 'txVal']]) {
+    if (st.timing && st.timing[key] != null) {
+      document.getElementById(id).textContent = st.timing[key];
+    }
+  }
+  // meta values arrive as strings; the RATES lookup needs the number
+  if (st.timing && st.timing.sample_rate_hz != null) {
+    updateRateFromFw(parseInt(st.timing.sample_rate_hz, 10));
+  }
+
+  const lv = st.live;
+  if (lv) {
+    setVal('fixVal', MM.fixLabel(lv.fix), MM.fixColor(lv.fix));
+    setVal('hdgVal', lv.heading != null ? lv.heading.toFixed(1) + '°' : '—');
+    setVal('posVal', (lv.lat != null && lv.lon != null)
+                     ? lv.lat.toFixed(7) + ', ' + lv.lon.toFixed(7) : '—');
+    // gps_ts is TEXT (hhmmss.ssssss GPS time-of-day) — never call number
+    // methods on it: one throw here would kill the whole render chain.
+    const ts = parseFloat(lv.gps_ts);
+    setVal('gpstsVal', Number.isFinite(ts) ? ts.toFixed(1) : '—');
+    if (lv.vin  != null) setVal('vinVal',  lv.vin.toFixed(2) + ' V');
+    if (lv.temp != null) setVal('tempVal', lv.temp.toFixed(1) + ' °C');
+  }
+  relayout();
+}
+
+// ── Initial load, then SSE ────────────────────────────────────────────────────
+let sseOpened = false;
+
+function loadMeta(retriesLeft) {
+  fetch('/data/' + SID)
+    .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.json(); })
+    .then(d => {
+      if (!d || !d.status) throw new Error('no status');
+      const meta = d.meta || {};
+      adcLabels = (meta.adc_order || '').split(',');
+      buildVals();
+      setVal('fwVal', meta.fw_git_hash || '—');
+      setVal('portVal', meta.serial_port || '—');
+      if (meta.sample_rate_hz && rateHz == null)
+        setVal('rateVal', meta.sample_rate_hz + ' Hz');
+      updateStatus(d.status);
+      if (!sseOpened) { sseOpened = true; openSSE(); }
+      relayout();
+      // Right after /start_raw the header may not be stamped yet (the 'I'
+      // handshake is still in flight) — poll a few times rather than
+      // showing '—' until a manual reload.
+      if (!meta.fw_git_hash && retriesLeft > 0)
+        setTimeout(() => loadMeta(retriesLeft - 1), 2000);
+    })
+    .catch(() => {
+      // /data can 404 for a moment right after /start_raw (the daemon
+      // claims the PID file before creating the db) and non-JSON 5xx across
+      // a web-server restart. One failed fetch must not leave a dead page —
+      // keep polling; openSSE only ever runs from a success above.
+      if (retriesLeft > 0) setTimeout(() => loadMeta(retriesLeft - 1), 2000);
+    });
+}
+loadMeta(5);
+
+function openSSE() {
+  // Huge since_id: this screen only reads samples/status, so opt out of the
+  // points payload — in study mode the cursor would otherwise start at 0 and
+  // the first tick would serialize the study's ENTIRE points table into one
+  // JSON event that gets thrown away (again on every reconnect).
+  const es = new EventSource('/stream/' + SID + '?since_id=9007199254740991');
+  es.onmessage = function(e) {
+    const d = JSON.parse(e.data);
+    const samples = d.samples || [];
+    if (samples.length) {
+      samples.forEach(s => chart.append(s.adc));
+      if (!calib.zero8 && chart.length >= 10) rezero();  // first data: auto-zero
+      chart.draw();
+      updateChanReadout(samples[samples.length - 1].adc);
+      updateStats();
+
+      // Measured rate from the firmware's own tick counter: Δtick over wall
+      // time between SSE batches — robust to ring wraps and dropped batches.
+      const tick = samples[samples.length - 1].tick;
+      const now  = performance.now();
+      if (lastTick != null && tick > lastTick && now > lastWall) {
+        const hz = (tick - lastTick) / ((now - lastWall) / 1000);
+        rateHz = rateHz == null ? hz : 0.7 * rateHz + 0.3 * hz;
+        setVal('rateVal', rateHz.toFixed(0) + ' Hz');
+      }
+      lastTick = tick; lastWall = now;
+    }
+    if (d.status) updateStatus(d.status);
+  };
+  es.onerror = () => {
+    console.warn('[SSE] connection error');
+    if (es.readyState === EventSource.CLOSED) setTimeout(openSSE, 2000);
+  };
+}
+
+window.addEventListener('resize', relayout);
+relayout();
+</script>
+{% endif %}
+</body>
+</html>

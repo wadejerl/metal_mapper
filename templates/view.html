@@ -1,11 +1,11 @@
-<!DOCTYPE html>
+{% import 'icons.html' as ic %}<!DOCTYPE html>
 <html>
 <head>
   <title>{{ study_name }} — Metal Mapper</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <link rel="stylesheet" href="/static/leaflet.css"/>
-  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="/static/leaflet.css?v={{ asset_v }}"/>
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
   <style>
     body { background: #111; }
     #banner   { position:absolute; top:0; left:0; right:0; z-index:1100; }
@@ -36,32 +36,26 @@
     #strip-wrap { display:flex; gap:6px; align-items:stretch; }
     #stripChart { background:rgba(255,255,255,0.05);
                   border:1px solid rgba(255,255,255,0.15); border-radius:3px; }
+    /* line-height pins the 8-row readout at 88px on ANY monospace font —
+       this column is what actually sets #strip-wrap's height (flex
+       stretch), so without the pin the Pi's DejaVu metrics (~11.6px/row)
+       silently push the Vin/T row below it toward the toolbar clip edge */
     #strip-vals { display:flex; flex-direction:column;
                   justify-content:space-between; font-size:10px;
-                  font-family:monospace; }
+                  line-height:11px; font-family:monospace; }
     .ch-row  { display:flex; gap:4px; justify-content:flex-end; }
     .ch-val  { min-width:38px; text-align:right; font-weight:bold; }
     /* info column */
     .info-col { display:flex; flex-direction:column; gap:3px; font-size:12px;
                 min-width:110px; }
+    /* the fixed-height toolbar clips silently — a wrapped stat line would
+       push the Points row and NAV chip out of view */
+    #envStats div { white-space:nowrap; }
     #fq-text  { font-weight:bold; }
-    /* timing panel */
-    #timing-panel {
-      background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.18);
-      border-radius:6px; padding:6px 12px; font-size:12px; min-width:170px;
-    }
-    #timing-panel h4 { margin:0 0 5px 0; color:#a5d6a7; font-size:10px;
-                       text-transform:uppercase; letter-spacing:.05em; }
-    .tm-row { display:flex; align-items:center; gap:5px; margin-bottom:3px; }
-    .tm-lbl  { min-width:60px; color:#aaa; }
-    .tm-val  { min-width:32px; font-family:monospace; color:#fff; }
-    .tm-btn  { background:#0d47a1; color:#fff; border:none; padding:1px 7px;
-               border-radius:3px; cursor:pointer; font-size:11px; }
-    .tm-btn:hover { background:#1565c0; }
-    .save-btn { background:#4a148c; color:#fff; border:none; padding:3px 10px;
-                border-radius:3px; cursor:pointer; font-size:11px;
-                font-weight:bold; margin-top:4px; width:100%; }
-    .save-btn:hover { background:#6a1b9a; }
+    /* fix type above the exit button — colored by MM.fixColor */
+    #fixBadge { font-size:11px; font-weight:bold; text-align:center;
+                background:rgba(255,255,255,0.08); border-radius:4px;
+                padding:2px 4px; white-space:nowrap; color:#888; }
     #mapToggle { background:#37474f; color:#90a4ae; border:1px solid #546e7a;
                  padding:3px 10px; border-radius:4px; cursor:pointer; font-size:11px; }
     #mapToggle.offline { background:#1a237e; color:#7986cb; border-color:#3949ab; }
@@ -81,8 +75,8 @@
     .meta-val  { color:#eee; word-break:break-all; }
     .meta-warn { color:#ffab91; }
   </style>
-  <script src="/static/leaflet.js"></script>
-  <script src="/static/map_core.js"></script>
+  <script src="/static/leaflet.js?v={{ asset_v }}"></script>
+  <script src="/static/map_core.js?v={{ asset_v }}"></script>
 </head>
 <body>
 <div id="banner">
@@ -91,7 +85,26 @@
 </div>
 
 <div id="toolbar">
+  {% if is_live %}
+  {# Exiting the live map IS ending the study — one button, so the daemon
+     can never be left recording behind the operator's back. A saved study
+     is just a viewer: plain navigation. #}
+  {# explicit 2-line label: this toolbar is width-squeezed at 800px and a
+     free-wrapping "■ Stop & Exit" shatters into a 4-line word stack #}
+  <div style="display:flex; flex-direction:column; gap:4px;">
+    {# fix type rides above the exit button — the leftmost column is the
+       only part of this toolbar guaranteed visible at 800px #}
+    <div id="fixBadge">—</div>
+    <form method="post" action="/stop_daemon">
+      {# nowrap: the <br> is the ONLY break — min-content squeeze must not
+         shatter the words further #}
+      <button class="btn btn-red" id="stopExitBtn"
+              style="white-space:nowrap;">■ Stop<br>&amp; Exit</button>
+    </form>
+  </div>
+  {% else %}
   <button class="btn btn-grey" onclick="location.href='/'">← Studies</button>
+  {% endif %}
 
   <div id="title-block">
     <span class="study-name" id="studyName" onclick="editName()"
@@ -102,15 +115,17 @@
     {% else %}
       <span class="badge badge-saved">◉ Saved</span>
     {% endif %}
-    <button id="mapToggle" onclick="toggleMapLayer()">🌐 Map</button>
-    <button id="metaBtn" onclick="toggleMetaPanel()">ⓘ Meta</button>
+    {# two-state buttons hold BOTH icons; JS toggles .hidden + the label
+       span — never textContent, which would wipe the inline SVG #}
+    <button id="mapToggle" onclick="toggleMapLayer()">{{ ic.globe(14, 'ic-globe') }}{{ ic.plane(14, 'ic-plane', true) }} <span id="mapLbl">Map</span></button>
+    <button id="metaBtn" onclick="toggleMetaPanel()">{{ ic.info(14) }} Meta</button>
   </div>
 
   <div class="toolbar-sep"></div>
 
   <div style="display:flex; flex-direction:column; gap:5px;">
-    <button class="btn btn-blue" onclick="recalibrate()">🎯 Re-zero</button>
-    <button id="pauseBtn" class="btn btn-green" onclick="togglePause()">⏸ Pause</button>
+    <button class="btn btn-blue" onclick="recalibrate()">{{ ic.target(14) }} Re-zero</button>
+    <button id="pauseBtn" class="btn btn-green" onclick="togglePause()">{{ ic.pause(14, 'ic-pause') }}{{ ic.play(14, 'ic-play', true) }} <span id="pauseLbl">Pause</span></button>
   </div>
 
   <div class="sliders-col">
@@ -144,18 +159,28 @@
       <input type="checkbox" id="combineChk" checked onchange="onCombine()">
       <button class="btn btn-blue"
               style="font-size:11px;padding:2px 8px;margin-left:8px;"
-              onclick="saveSliders(this)">💾 Save View</button>
+              onclick="saveSliders(this)">{{ ic.save(12) }} Save View</button>
     </div>
   </div>
 
   <div class="toolbar-sep"></div>
 
+  {# every vertical metric in this column is PINNED (line-heights, not
+     font defaults): the Pi's DejaVu fonts run ~1px/line taller than the
+     bench and the toolbar clips at a fixed height — pinned, the column
+     is 12+3+90+3+12 = 120px on any font, 10px inside the clip edge #}
   <div>
-    <div style="font-size:10px;color:#888;margin-bottom:3px;">
+    <div style="font-size:10px;line-height:12px;color:#888;margin-bottom:3px;">
       Channels (adc counts)</div>
     <div id="strip-wrap">
       <canvas id="stripChart"></canvas>
       <div id="strip-vals"></div>
+    </div>
+    {# right under the graph: the info-col copy of these was clipped off
+       the 800px toolbar. Inline spans — side by side. #}
+    <div id="vinLiveRow" style="font-size:11px; line-height:12px; color:#bbb; margin-top:3px;">
+      Vin <span id="vinVal" style="color:#fff; font-weight:bold;">—</span>
+      &nbsp;&nbsp;T <span id="tempVal" style="color:#fff; font-weight:bold;">—</span>
     </div>
   </div>
 
@@ -164,35 +189,15 @@
   <div class="info-col">
     <div>Points: <span id="ptCount">0</span></div>
     <div id="fq-text">—</div>
-    <div>Vin: <span id="vinVal">—</span>&nbsp; T: <span id="tempVal">—</span></div>
+    <div id="envStats" style="display:none;"></div>
     <div id="motion-row" style="display:none;">
       Motion: <span id="motionVal" style="font-family:monospace;">—</span>
     </div>
     <div id="navLine" class="nav-chip nav-down">NAV ○</div>
   </div>
 
-  <div id="timing-panel" style="display:none;">
-    <h4>Detector Timing</h4>
-    <div class="tm-row">
-      <span class="tm-lbl">Blanking</span>
-      <span class="tm-val" id="blankVal">—</span>µs
-      <button class="tm-btn" onclick="sendCmd('a')">+2</button>
-      <button class="tm-btn" onclick="sendCmd('z')">−2</button>
-    </div>
-    <div class="tm-row">
-      <span class="tm-lbl">RX Window</span>
-      <span class="tm-val" id="winVal">—</span>µs
-      <button class="tm-btn" onclick="sendCmd('s')">+1</button>
-      <button class="tm-btn" onclick="sendCmd('x')">−1</button>
-    </div>
-    <div class="tm-row">
-      <span class="tm-lbl">TX Pulse</span>
-      <span class="tm-val" id="txVal">—</span>µs
-      <button class="tm-btn" onclick="sendCmd('f')">+1</button>
-      <button class="tm-btn" onclick="sendCmd('v')">−1</button>
-    </div>
-    <button class="save-btn" onclick="sendCmd('S')">💾 Save Settings</button>
-  </div>
+  <!-- Detector timing controls live on the raw data screen only; the map
+       toolbar clips them at 800x480 anyway. -->
 </div>
 
 <div id="metaPanel"></div>
@@ -206,8 +211,7 @@ const IS_LIVE       = {{ is_live       | tojson }};
 const MAP_CENTER    = {{ map_center    | tojson }};
 const GEOJSON_FILES = {{ geojson_files | tojson }};
 
-const CH_COLORS = ['#e6194b','#f58231','#ffe119','#3cb44b',
-                   '#42d4f4','#4363d8','#911eb4','#f032e6'];
+const CH_COLORS = MM.CH_COLORS;     // one palette, shared with the raw view
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const store    = MM.PointStore();   // columnar; no per-point JS objects
@@ -250,13 +254,14 @@ const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png
 
 function applyMapMode(mode) {
   const btn = document.getElementById('mapToggle');
-  if (mode === 'offline') {
-    osmLayer.remove(); blankLayer.addTo(mapObj);
-    btn.textContent = '✈ Offline'; btn.classList.add('offline');
-  } else {
-    blankLayer.remove(); osmLayer.addTo(mapObj);
-    btn.textContent = '🌐 Map'; btn.classList.remove('offline');
-  }
+  const off = mode === 'offline';
+  if (off) { osmLayer.remove(); blankLayer.addTo(mapObj); }
+  else     { blankLayer.remove(); osmLayer.addTo(mapObj); }
+  // swap icon visibility + label only — textContent would wipe the SVGs
+  btn.querySelector('.ic-globe').hidden = off;
+  btn.querySelector('.ic-plane').hidden = !off;
+  document.getElementById('mapLbl').textContent = off ? 'Offline' : 'Map';
+  btn.classList.toggle('offline', off);
   localStorage.setItem('mapMode', mode);
 }
 function toggleMapLayer() {
@@ -296,20 +301,20 @@ mapObj.on('click', e => {
   L.popup().setLatLng(hit.latlng).setContent(html).openOn(mapObj);
 });
 
-// ── Channel strip chart (one shared scale, newest sample at the right) ───────
-const STRIP_W = 220, STRIP_H = 88;
-const STRIP_N = 240;                 // samples kept (~12 s at 20 Hz)
-const stripBuf = [];                 // rows of adc[8], newest last
-const stripCv  = document.getElementById('stripChart');
-const stripCtx = stripCv.getContext('2d');
-{
-  const dpr = window.devicePixelRatio || 1;
-  stripCv.width  = STRIP_W * dpr;
-  stripCv.height = STRIP_H * dpr;
-  stripCv.style.width  = STRIP_W + 'px';
-  stripCv.style.height = STRIP_H + 'px';
-  stripCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
+// ── Channel strip chart (shared MM.StripChart, one scale for all channels) ───
+// Fed by the daemon's live sample stream, so it scrolls at the full ADC rate
+// whether or not there is a GPS fix or recording. Saved studies have no
+// sample stream — those seed from recorded rows instead.
+const STRIP_N = 1024;                // ~2 s at 500 Hz
+// 88px: #strip-wrap's height comes from the 8-row readout column (flex
+// stretch), not the canvas — trimming the canvas buys no room for the
+// Vin/T row, it just throws away chart resolution. The row fits because
+// #strip-vals pins line-height (see CSS).
+const chart = MM.StripChart(document.getElementById('stripChart'),
+                            {width: 220, height: 88, n: STRIP_N});
+// map strip has no scale selector: pin the zero-referenced overlay (traces
+// share one gain but sit on the study's calibrated zeros — target spotting)
+chart.setScaleMode('zero');
 
 function buildStripVals() {
   const col = document.getElementById('strip-vals');
@@ -323,64 +328,6 @@ function buildStripVals() {
       `<span class="ch-val" id="chv${ch}">—</span>`;
     col.appendChild(row);
   }
-}
-
-function stripAppend(adc) {
-  if (!adc) return;
-  stripBuf.push(Array.from(adc));
-  if (stripBuf.length > STRIP_N) stripBuf.shift();
-}
-
-function drawStrip() {
-  const ctx = stripCtx;
-  ctx.clearRect(0, 0, STRIP_W, STRIP_H);
-  const n = stripBuf.length;
-  if (n < 2) return;
-  // Plot each channel's deviation from its zero baseline, not raw counts:
-  // the per-channel DC offsets would otherwise fan the lines out into what
-  // looks like 8 stacked traces. Zeroed, the lines overlay and only
-  // real signal (or drift) separates them.
-  const z = calib.zero8;
-  const devOf = (row, ch) => z ? row[ch] - z[ch] : row[ch];
-  let lo = Infinity, hi = -Infinity;
-  for (let i = 0; i < n; i++) {
-    const row = stripBuf[i];
-    for (let ch = 0; ch < 8; ch++) {
-      const v = devOf(row, ch);
-      if (v < lo) lo = v;
-      if (v > hi) hi = v;
-    }
-  }
-  if (hi - lo < 1) { hi += 1; lo -= 1; }
-  const pad = (hi - lo) * 0.06;
-  const top = hi + pad, bot = lo - pad;
-  const step = STRIP_W / (STRIP_N - 1);
-  const x0   = STRIP_W - (n - 1) * step;   // newest anchored at the right edge
-  const yOf  = v => (top - v) / (top - bot) * STRIP_H;
-  if (z && top > 0 && bot < 0) {           // zero-baseline reference line
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-    ctx.lineWidth = 1;
-    ctx.setLineDash([3, 3]);
-    ctx.beginPath();
-    ctx.moveTo(0, yOf(0)); ctx.lineTo(STRIP_W, yOf(0));
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-  ctx.lineWidth = 1;
-  for (let ch = 0; ch < 8; ch++) {
-    ctx.beginPath();
-    for (let i = 0; i < n; i++) {
-      const x = x0 + i * step, y = yOf(devOf(stripBuf[i], ch));
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    }
-    ctx.strokeStyle = CH_COLORS[ch];
-    ctx.stroke();
-  }
-  // the shared scale's bounds (Δ counts once zeroed), so spread reads as counts
-  ctx.fillStyle = '#999';
-  ctx.font = '9px monospace';
-  ctx.fillText(Math.round(hi), 2, 9);
-  ctx.fillText(Math.round(lo), 2, STRIP_H - 2);
 }
 
 function updateChanReadout(adc) {
@@ -411,6 +358,7 @@ const META_GROUPS = [
   ['Detector firmware', [
     ['fw_git_hash',    'fw build'],
     ['fire_mode',      'fire mode'],
+    ['sample_rate_hz', 'sample rate',    v => v + ' Hz'],
     ['adc_oversample', 'adc oversample', v => v + '×'],
     ['adc_order',      'adc order'],
     ['info_at',        'header stamped', v => fmtEpoch(v)],
@@ -449,7 +397,7 @@ function renderMetaPanel() {
              'align-items:center;gap:16px;">' +
              '<b style="color:#fff;">Study metadata</b>' +
              '<button onclick="toggleMetaPanel()" style="background:none;' +
-             'border:none;color:#aaa;cursor:pointer;font-size:13px;">✕</button>' +
+             'border:none;color:#aaa;cursor:pointer;font-size:13px;">×</button>' +
              '</div>';
 
   // Header health first: these mean the provenance below needs a second look.
@@ -479,6 +427,16 @@ function renderMetaPanel() {
       html += `<div class="meta-row"><span class="meta-key">${label}</span>` +
               `<span class="meta-val">${val}</span></div>`;
     }
+  }
+
+  // Whole-run environment stats (also in the toolbar, but the toolbar clips
+  // on narrow screens — this panel is the home that survives 800px).
+  if (envStatsCache && (envStatsCache.vin || envStatsCache.temp)) {
+    html += '<h4>Environment (whole run, min – max · avg)</h4>' +
+            '<div class="meta-row"><span class="meta-key">Supply Vin</span>' +
+            `<span class="meta-val">${fmtTrio(envStatsCache.vin, 'V', 2)}</span></div>` +
+            '<div class="meta-row"><span class="meta-key">Board temp</span>' +
+            `<span class="meta-val">${fmtTrio(envStatsCache.temp, '°C', 1)}</span></div>`;
   }
 
   // Anything stamped that this panel doesn't know about yet — never hide it.
@@ -519,6 +477,17 @@ function updateStatus(st) {
                      (st.live_age_s != null ? st.live_age_s + ' s' : '?');
   } else {
     sb.textContent = '◉ Saved study';
+    // The daemon is gone — the exit must become plain navigation, and a
+    // NEUTERED form: a stale tab's POST could SIGTERM a daemon somebody
+    // else started since. (Unlike /raw, a study id is never reattached —
+    // new recordings get fresh ids — so this swap is one-way.)
+    const xb = document.getElementById('stopExitBtn');
+    if (xb) {
+      xb.type = 'button';
+      xb.onclick = () => location.href = '/';
+      xb.textContent = '← Studies';
+      xb.className = 'btn btn-grey';
+    }
   }
 
   const wr = document.getElementById('warnrow');
@@ -529,14 +498,6 @@ function updateStatus(st) {
     s.textContent = '⚠ ' + w;
     wr.appendChild(s);
   });
-
-  for (const [key, id] of [['blanking_us', 'blankVal'],
-                           ['rx_window_us', 'winVal'],
-                           ['tx_pulse_us', 'txVal']]) {
-    if (st.timing && st.timing[key] != null) {
-      document.getElementById(id).textContent = st.timing[key];
-    }
-  }
 
   if (st.motion_mm != null) {
     document.getElementById('motion-row').style.display = 'block';
@@ -554,12 +515,60 @@ function updateStatus(st) {
     const fq = document.getElementById('fq-text');
     fq.textContent = MM.fixLabel(st.live.fix);
     fq.style.color = MM.fixColor(st.live.fix);
+    const fb = document.getElementById('fixBadge');
+    if (fb) {
+      fb.textContent = MM.fixLabel(st.live.fix);
+      fb.style.color = MM.fixColor(st.live.fix);
+    }
     if (st.live.vin != null)
       document.getElementById('vinVal').textContent = st.live.vin.toFixed(2) + ' V';
     if (st.live.temp != null)
       document.getElementById('tempVal').textContent = st.live.temp.toFixed(1) + ' °C';
   }
+
+  // Env stats vs live Vin/T is a function of the CURRENT state, not of page
+  // load: a daemon attaching mid-page must bring the live readout back, and
+  // a daemon stopping must swap in the (refreshed) whole-run stats.
+  const stopped = st.state === 'stopped';
+  document.getElementById('vinLiveRow').style.display = stopped ? 'none' : '';
+  // Two-way, like vinLiveRow: a daemon reattaching (stop raw → start raw on
+  // the same open page) must bring the badge back. NOT keyed on st.live —
+  // saved dbs keep a leftover heartbeat row, so st.live is truthy even
+  // when stopped and would resurrect a frozen stale badge.
+  const fbv = document.getElementById('fixBadge');
+  if (fbv) fbv.style.display = stopped ? 'none' : '';
+  document.getElementById('envStats').style.display   = stopped ? 'block' : 'none';
+  if (stopped && lastEnvState && lastEnvState !== 'stopped') {
+    // live → saved flip: the run grew since page load — re-aggregate.
+    fetch('/env_stats/' + STUDY_ID).then(r => r.json())
+      .then(renderEnvStats).catch(() => {});
+  }
+  lastEnvState = st.state;
   relayout();
+}
+
+// Saved study: the live Vin/T readout is dead (no daemon) — show the run's
+// min/avg/max instead, aggregated server-side over every recorded point.
+// This fills CONTENT only; visibility strictly follows daemon state in
+// updateStatus, because a daemon can attach to (or leave) this study while
+// the page is open and SSE delivers that flip.
+let envStatsCache = null;
+let lastEnvState  = null;
+
+function fmtTrio(t, unit, dp) {
+  if (!t) return '—';
+  const mn = t.min.toFixed(dp), mx = t.max.toFixed(dp);
+  if (mn === mx) return mn + ' ' + unit;   // flat run: one value, not x–x
+  // Spaced separator: '-6.4–-2.0' with a bare dash is unreadable.
+  return mn + ' – ' + mx + ' ' + unit + ' · avg ' + t.avg.toFixed(dp);
+}
+
+function renderEnvStats(es) {
+  envStatsCache = es || null;
+  const el = document.getElementById('envStats');
+  el.title = 'Whole-run stats over all recorded points: min – max · average';
+  el.innerHTML = '<div>Vin: ' + fmtTrio(es && es.vin, 'V', 2) + '</div>' +
+                 '<div>T: '   + fmtTrio(es && es.temp, '°C', 1) + '</div>';
 }
 
 function updateNav(nv) {
@@ -625,14 +634,18 @@ function recalibrate() {
       if (!d.success) return;
       calib.zero8 = d.zero8;
       renderer.setCalib(calib);
-      drawStrip();               // strip plots deviations from these zeros
+      chart.setZero(calib.zero8);  // strip plots deviations from these zeros
+      chart.draw();
     });
 }
 
 function togglePause() {
   isPaused = !isPaused;
   const btn = document.getElementById('pauseBtn');
-  btn.textContent = isPaused ? '▶ Resume' : '⏸ Pause';
+  btn.querySelector('.ic-pause').hidden = isPaused;
+  btn.querySelector('.ic-play').hidden = !isPaused;
+  document.getElementById('pauseLbl').textContent =
+      isPaused ? 'Resume' : 'Pause';
   btn.style.background = isPaused ? '#c62828' : '';
 }
 
@@ -694,20 +707,13 @@ function saveSliders(btn) {
     })
   }).then(r => r.json()).then(d => {
     if (d.ok && btn) {
-      const orig = btn.textContent;
+      // innerHTML round-trip: the button contains an inline SVG icon that
+      // a textContent restore would erase
+      const orig = btn.innerHTML;
       btn.textContent = '✓ Saved';
-      setTimeout(() => { btn.textContent = orig; }, 1200);
+      setTimeout(() => { btn.innerHTML = orig; }, 1200);
     }
   }).catch(() => {});
-}
-
-function sendCmd(byte) {
-  fetch('/cmd', {
-    method: 'POST',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({cmd: byte})
-  }).catch(() => {});
-  // Panel values refresh via the SSE status ticks.
 }
 
 // ── Initial load, then SSE ────────────────────────────────────────────────────
@@ -719,6 +725,7 @@ fetch('/data/' + STUDY_ID)
     meta      = d.meta || {};
     adcLabels = (meta.adc_order || '').split(',');
     buildStripVals();
+    renderEnvStats(d.env_stats);   // content only; updateStatus gates visibility
 
     // Rotation comes with meta: config.json's heading_offset_deg, unless
     // this study saved its own before the move to config.
@@ -744,15 +751,20 @@ fetch('/data/' + STUDY_ID)
     catch (e) { calib.zero8 = null; }
     if (!calib.zero8) calib.zero8 = autoZero();
     renderer.setCalib(calib);
+    chart.setZero(calib.zero8);
 
     renderer.markDirty();
     document.getElementById('ptCount').textContent = store.length;
 
     if (store.length) {
       const last = store.view();
-      for (let i = Math.max(0, store.length - STRIP_N); i < store.length; i++)
-        stripAppend(store.adcRow(i));
-      drawStrip();
+      if (d.status.state === 'stopped') {
+        // Saved study: no live sample stream, seed the strip from recorded
+        // rows. (Live: the SSE tick delivers the daemon's whole sample ring.)
+        for (let i = Math.max(0, store.length - STRIP_N); i < store.length; i++)
+          chart.append(store.adcRow(i));
+        chart.draw();
+      }
       updateChanReadout(store.adcRow(store.length - 1));
       mapObj.setView([last.lat[store.length - 1], last.lon[store.length - 1]],
                      mapObj.getZoom());
@@ -760,8 +772,6 @@ fetch('/data/' + STUDY_ID)
 
     updateStatus(d.status);
     updateNav(d.nav);
-    document.getElementById('timing-panel').style.display =
-      (d.status.state !== 'stopped') ? 'block' : 'none';
 
     openSSE();
     relayout();
@@ -782,23 +792,35 @@ function openSSE() {
       rows.forEach(p => store.push(p));
       if (!calib.zero8 && (calib.zero8 = autoZero())) {
         // First rows of a fresh study: seed zeros. Colors are computed at
-        // draw time, so a repaint is all it takes. (The strip redraws with
-        // these zeros on this same tick, below.)
+        // draw time, so a repaint is all it takes.
         renderer.setCalib(calib);
+        chart.setZero(calib.zero8);
       }
       renderer.markDirty();
       document.getElementById('ptCount').textContent = store.length;
       const latest = rows[rows.length - 1];
-      rows.forEach(p => stripAppend(p.adc));
-      drawStrip();
-      updateChanReadout(latest.adc);
       if (!isPaused) mapObj.panTo([latest.lat, latest.lon],
                                   {animate: true, duration: 0.25});
     }
+    // Sample stream feeds the strip chart at the full ADC rate — flowing
+    // whenever the daemon runs, with or without GPS fix or recording.
+    const samples = d.samples || [];
+    if (samples.length) {
+      samples.forEach(s => chart.append(s.adc));
+      if (!calib.zero8 && chart.length >= 10) {
+        // Nothing recorded yet (bench, no gate): zero off the live stream so
+        // the traces overlay instead of fanning out by DC offset.
+        const t = chart.tail(10);
+        calib.zero8 = Array.from({length: 8}, (_, ch) =>
+          Math.round(t.reduce((a, r) => a + r[ch], 0) / t.length * 10) / 10);
+        chart.setZero(calib.zero8);
+        renderer.setCalib(calib);
+      }
+      chart.draw();
+      updateChanReadout(samples[samples.length - 1].adc);
+    }
     if (d.status) {
       updateStatus(d.status);
-      document.getElementById('timing-panel').style.display =
-        (d.status.state !== 'stopped') ? 'block' : 'none';
     }
     if (d.nav) updateNav(d.nav);
   };

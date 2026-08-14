@@ -1,0 +1,12 @@
+[Unit]
+Description=Rover RTK service
+After=multi-user.target
+
+[Service]
+ExecStart=/home/pi/pygpsclient/bin/gnssntripclient --server northpole --port 2101 --mountpoint pygnssutils --clioutput 2 --output '/dev/ttyUSB3@460800' --verbosity 1  --retryinterval 1 --retries 3
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+

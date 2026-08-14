@@ -10,8 +10,15 @@ import sys
 import os
 import subprocess
 import time
+import datetime
+import shutil
 from serial import Serial
 from pynmeagps import NMEAReader, NMEAMessage, GET, SET, POLL
+
+# One-shot GPS->system-clock sync only makes sense as root on Linux;
+# bench runs on macOS must never touch the host clock.
+CAN_SET_CLOCK = (sys.platform == 'linux' and os.geteuid() == 0
+                 and hasattr(time, 'clock_settime'))
 
 
 class BaseStation:
@@ -30,6 +37,9 @@ class BaseStation:
 
     POST_RESET_MSGS = [
         NMEAMessage('P', 'QTMCFGMSGRATE', SET, payload=['W', 'PQTMSVINSTATUS', '1', '1']),
+        # Base mode disables all standard NMEA; RMC is the clock-sync time
+        # source (rovers never see it: gnssserver forwards RTCM only).
+        NMEAMessage('P', 'QTMCFGMSGRATE', SET, payload=['W', 'RMC', '1']),
         NMEAMessage('P', 'QTMSAVEPAR', SET),
     ]
 
@@ -51,6 +61,7 @@ class BaseStation:
         self.svin_duration = str(svin_duration)
         self.stream = None
         self.nmr = None
+        self.clock_synced = False
 
     def connect(self):
         """
@@ -132,6 +143,51 @@ class BaseStation:
 
         print("Configuration complete!")
 
+    def _maybe_set_clock(self, msg):
+        """
+        One-shot: step the system clock from the first valid GNSS RMC.
+
+        Any failure disarms the hook for the rest of the run — a crash here
+        under Restart=always would loop factory-reset forever and the NTRIP
+        caster would never come up.
+        """
+        if self.clock_synced or not CAN_SET_CLOCK:
+            return
+        try:
+            if getattr(msg, 'msgID', None) != 'RMC' or msg.status != 'A':
+                return
+            if not isinstance(msg.date, datetime.date) or not isinstance(msg.time, datetime.time):
+                return  # no-fix RMC carries empty strings for date/time
+            gps = datetime.datetime.combine(msg.date, msg.time,
+                                            tzinfo=datetime.timezone.utc)
+            delta = gps.timestamp() - time.time()
+            if abs(delta) > 2.0:
+                time.clock_settime(time.CLOCK_REALTIME, gps.timestamp())
+                print(f"System clock stepped {delta:+.1f} s to GPS time {gps.isoformat()}")
+            else:
+                print(f"System clock already within {delta:+.1f} s of GPS time")
+            self.clock_synced = True
+        except Exception as e:
+            print(f"Clock set failed ({e}); giving up on clock sync")
+            self.clock_synced = True
+
+    def _drain_for_clock(self, max_wait=15):
+        """
+        Give the clock sync a last bounded chance before monitor() returns
+        (run() closes the port right after). Deadline on monotonic: the hook
+        steps CLOCK_REALTIME out from under a wall-clock deadline.
+        """
+        if self.clock_synced or not CAN_SET_CLOCK:
+            return
+        print(f"Waiting up to {max_wait} s for a valid RMC to set the clock...")
+        deadline = time.monotonic() + max_wait
+        while not self.clock_synced and time.monotonic() < deadline:
+            raw_data, parsed_data = self.nmr.read()
+            if parsed_data is not None:
+                self._maybe_set_clock(parsed_data)
+        if not self.clock_synced:
+            print("No valid RMC seen; continuing without clock sync")
+
     def monitor(self):
         """
         Monitor and display incoming NMEA messages from the receiver.
@@ -149,12 +205,14 @@ class BaseStation:
                 raw_data, parsed_data = self.nmr.read()
                 if parsed_data is not None:
                     print(parsed_data)
+                    self._maybe_set_clock(parsed_data)
 
                     # Check if this is a PQTMSVINSTATUS message and if survey-in is complete
                     if self.wait_for_svin and hasattr(parsed_data, 'msgID'):
                         if parsed_data.msgID == 'QTMSVINSTATUS' and hasattr(parsed_data, 'valid'):
                             if parsed_data.valid == 2:
                                 print("\nSurvey-in complete! (valid=2)")
+                                self._drain_for_clock()
                                 return
         except KeyboardInterrupt:
             print("\nMonitoring stopped by user")
@@ -173,6 +231,26 @@ class BaseStation:
             self.disconnect()
 
         return True
+
+
+def persist_clock():
+    """
+    Best-effort follow-ups once the clock is GPS-correct: write it to the
+    battery RTC (if any) and to fake-hwclock's file so it survives an
+    unclean power cut, then let chrony serve the LAN even while offline.
+    'local' is deliberately NOT in chrony.conf — a static entry would start
+    serving the stale pre-step time the moment chronyd boots. hwclock exits
+    nonzero when no RTC exists — that is fine.
+    """
+    fake_hwclock = shutil.which('fake-hwclock') or 'fake-hwclock'
+    chronyc = shutil.which('chronyc') or '/usr/bin/chronyc'
+    for cmd in (['/usr/sbin/hwclock', '--systohc'],
+                [fake_hwclock, 'save'],
+                [chronyc, 'local', 'stratum', '10']):
+        try:
+            subprocess.run(cmd, timeout=10)
+        except Exception as e:
+            print(f"{cmd[0]}: {e} (ignored)")
 
 
 if __name__ == "__main__":
@@ -219,12 +297,24 @@ if __name__ == "__main__":
 
     (options, args) = parser.parse_args()
 
+    if not CAN_SET_CLOCK:
+        print("GPS clock sync disabled (requires Linux + root)")
+
     # Create and run base station
     base_station = BaseStation(options.port, timeout=options.timeout, wait_for_svin=options.wait_for_svin, svin_duration=options.svin_duration)
 
     try:
-        base_station.run()
+        if not base_station.run():
+            # Port not openable (USB still enumerating, transient EBUSY).
+            # Exit so systemd's 2 s restart loop retries — falling through
+            # would let gnssserver capture the port with the receiver
+            # unconfigured and the clock never stepped.
+            sys.exit(1)
         base_station.disconnect()
+
+        # Persist the GPS-stepped time before the caster takes over
+        if CAN_SET_CLOCK and base_station.clock_synced:
+            persist_clock()
 
         # Launch gnssserver from venv
         print("\nStarting GNSS server...")
@@ -237,9 +327,10 @@ if __name__ == "__main__":
             '--ntripmode', '1',
             '--protfilter', '4',
             '--format', '2',
+            '--maxclients', '10',
             '--ntripuser', 'anon',
             '--ntrippassword', 'password',
-            '--verbosity', '2'
+            '--verbosity', '1'
         ])
     except Exception as e:
         print(f"Error: {e}")

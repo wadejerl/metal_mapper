@@ -3,7 +3,8 @@
 <head>
   <title>Metal Mapper — Studies</title>
   <meta charset="utf-8">
-  <link rel="stylesheet" href="/static/style.css">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
   <style>
     body { padding: 24px; }
     h1   { color: #e94560; margin-top: 0; }
@@ -12,16 +13,22 @@
                   font-weight: bold; font-size: 13px; }
     .daemon-on  { background: #1b5e20; color: #a5d6a7; }
     .daemon-off { background: #37474f; color: #90a4ae; }
-    table { width: 100%; border-collapse: collapse; margin-bottom: 28px; }
-    th { background: #16213e; color: #a0a0c0; text-align: left; padding: 10px; }
-    td { padding: 9px 10px; border-bottom: 1px solid #252545; }
+    /* fits without scrolling at the Pi's 800px; pannable on a phone.
+       Headers, FW hash and the View Map button never wrap — the study
+       name and the two timestamp columns are the flexible ones. */
+    .tblwrap { overflow-x: auto; margin-bottom: 28px; }
+    table { width: 100%; border-collapse: collapse; }
+    th { background: #16213e; color: #a0a0c0; text-align: left;
+         padding: 8px; white-space: nowrap; }
+    td { padding: 8px; border-bottom: 1px solid #252545; }
     tr:hover td { background: #1f2b50; }
     a.view-btn { background: #0f3460; color: #e94560; padding: 4px 14px;
-                 border-radius: 4px; text-decoration: none; font-size: 13px; }
+                 border-radius: 4px; text-decoration: none; font-size: 13px;
+                 white-space: nowrap; }
     a.view-btn:hover { background: #e94560; color: #fff; }
     .panel { background: #16213e; border: 1px solid #0f3460; border-radius: 8px;
              padding: 20px; max-width: 480px; display: inline-block;
-             vertical-align: top; margin-right: 20px; }
+             vertical-align: top; margin: 0 20px 24px 0; }
     .panel h2 { color: #e94560; margin-top: 0; font-size: 16px; }
     .panel label { display: block; margin-top: 12px; color: #aaa; font-size: 12px; }
     .panel input[type=text], .panel input[type=number] {
@@ -35,10 +42,107 @@
     .panel button:hover { background: #c73652; }
     .err { color: #ef9a9a; font-size: 13px; margin-top: 8px; }
     .empty { color: #555; text-align: center; padding: 20px; }
-    .fwcol { color: #667; font-family: monospace; font-size: 11px; }
+    .fwcol { color: #667; font-family: monospace; font-size: 11px;
+             white-space: nowrap; }
+    /* the two things an operator actually does, as big touch targets */
+    .action-row { display: flex; gap: 18px; flex-wrap: wrap;
+                  margin: 4px 0 26px 0; }
+    .bigbtn { font-size: 20px; font-weight: bold; padding: 18px 38px;
+              border: none; border-radius: 12px; cursor: pointer;
+              text-decoration: none; display: inline-block; }
+    .bigbtn.rec { background: #e94560; color: #fff; }
+    .bigbtn.rec:hover { background: #c73652; }
+    .bigbtn.raw { background: #4a148c; color: #e1bee7; }
+    .bigbtn.raw:hover { background: #6a1b9a; }
+    /* power-off: always in the same corner, big enough for a glove */
+    .powerbtn { position: absolute; top: 18px; right: 20px; width: 54px;
+                height: 48px; font-size: 22px; background: #37474f;
+                color: #eceff1; border: none; border-radius: 8px;
+                cursor: pointer; }
+    .powerbtn:hover { background: #e94560; }
+    /* per-unit health, tucked left of the power button. Rendered only on
+       the Pi (service_states() is None without systemctl). */
+    #svcPanel { position: absolute; top: 12px; right: 86px;
+                display: grid; grid-template-columns: auto auto;
+                gap: 2px 12px; font-size: 10px; font-family: monospace;
+                color: #90a4ae; text-align: left; }
+    #svcPanel .svc { white-space: nowrap; }
+    #svcPanel .dot { display: inline-block; width: 7px; height: 7px;
+                     border-radius: 50%; margin-right: 4px;
+                     background: #666; }
+    #svcPanel .dot.on  { background: #4caf50; }
+    #svcPanel .dot.err { background: #e94560; }
+    /* the box's own IPv4s, under the dots — "is the network side up".
+       Green = has address(es); flashing red = positively none (DHCP
+       lease lost / WiFi down) — loud on purpose, it's the field signal */
+    #ipLine { grid-column: 1 / -1; color: #b0bec5; white-space: nowrap;
+              margin-top: 2px; }
+    #ipLine.ip-ok   { color: #4caf50; }
+    #ipLine.ip-none { color: #e94560; font-weight: bold;
+                      animation: ipBlink 1s step-end infinite; }
+    @keyframes ipBlink { 50% { opacity: 0.15; } }
+    #shutdownOverlay { position: fixed; inset: 0; z-index: 1000;
+                       background: rgba(10, 10, 26, 0.88); display: flex;
+                       align-items: center; justify-content: center; }
+    #shutdownOverlay[hidden] { display: none; }
+    .confirm-box { background: #16213e; border: 1px solid #e94560;
+                   border-radius: 12px; padding: 24px 30px;
+                   text-align: center; max-width: 440px; }
+    .confirm-box h2 { color: #fff; margin: 0 0 10px 0; font-size: 22px; }
+    .confirm-box p  { color: #90a4ae; font-size: 14px; margin: 8px 0; }
+    .confirm-box .warn { color: #ffcc80; }
+    .confirm-row { display: flex; gap: 18px; justify-content: center;
+                   margin-top: 20px; }
+    .confirm-row button { font-size: 18px; font-weight: bold;
+                          padding: 14px 30px; border: none;
+                          border-radius: 10px; cursor: pointer; }
+    .cbtn-cancel { background: #37474f; color: #eceff1; }
+    .cbtn-off    { background: #e94560; color: #fff; }
   </style>
 </head>
 <body>
+{% import 'icons.html' as ic %}
+<button class="powerbtn" title="Shut down" aria-label="Shut down"
+        onclick="document.getElementById('shutdownOverlay').hidden = false">{{ ic.power(24) }}</button>
+
+{% if services or ipv4s is not none %}
+<div id="svcPanel">
+  {% for unit, state in (services or {}).items() %}
+  <span class="svc" id="svc-{{ unit | replace('.service', '') }}"
+        title="{{ unit }}: {{ state }}"><i class="dot
+    {{- ' on' if state == 'active' else (' err' if state == 'failed' else '') }}"></i>{{
+    unit | replace('jlw_', '') | replace('.service', '') }}</span>
+  {% endfor %}
+  {# always in the DOM when the panel renders (hidden while ipv4s is
+     undeterminable): SSE can only update the span, not create it, and
+     this page never reloads on the kiosk — a cold-cache first render
+     must not hide the line forever #}
+  <span id="ipLine" class="{{ 'ip-ok' if ipv4s else 'ip-none' }}"
+        {% if ipv4s is none %}hidden{% endif %}>{{
+    ipv4s | join(' · ') if ipv4s else 'no IPv4' }}</span>
+</div>
+{% endif %}
+
+<div id="shutdownOverlay" hidden>
+  <div class="confirm-box">
+    <h2>{{ ic.power(20) }} Shut down the mapper computer?</h2>
+    {# always in the DOM — the SSE tick toggles it, so a session started
+       from another client still warns on this long-lived kiosk page #}
+    <p class="warn" id="shutdownWarn"
+       {% if not daemon_status.running %}hidden{% endif %}>
+      ⚠ A session is in progress — it will be stopped.</p>
+    <p>Wait for the screen to go dark before cutting power.</p>
+    <div class="confirm-row">
+      <button class="cbtn-cancel"
+              onclick="document.getElementById('shutdownOverlay').hidden = true">
+        Cancel</button>
+      <form method="post" action="/shutdown" style="display:inline;">
+        <button class="cbtn-off">{{ ic.power(18) }} Shut Down</button>
+      </form>
+    </div>
+  </div>
+</div>
+
 <h1>Metal Mapper</h1>
 <div style="color:#555; font-size:11px; font-family:monospace; margin-top:-14px; margin-bottom:18px;">{{ git_hash }}</div>
 
@@ -64,12 +168,43 @@
   {% endif %}
 </span>
 
+{# Big buttons up top, settings out of the way at the bottom: this gets
+   operated in the field by people in no state to read a form. The start
+   button submits the Recording Settings inputs below via form="startForm". #}
+<div class="action-row">
+  {% if not ds.running %}
+    <form id="startForm" method="post" action="/start_daemon">
+      <button type="submit" class="bigbtn rec">▶ Start Recording</button>
+    </form>
+    {# straight into the raw stream — no intermediate screen #}
+    <form method="post" action="/start_raw">
+      <button type="submit" class="bigbtn raw">{{ ic.chart(20) }} View Raw</button>
+    </form>
+  {% else %}
+    {# a daemon is running but the operator is here — client reset or
+       browser restart mid-run. The primary action is getting back in. #}
+    {% if live_id %}
+      <a class="bigbtn rec" href="/view/{{ live_id }}">▶ Return to Live Study</a>
+      <a class="bigbtn raw" href="/raw">{{ ic.chart(20) }} View Raw</a>
+    {% else %}
+      <a class="bigbtn raw" href="/raw">{{ ic.chart(20) }} Return to Raw View</a>
+    {% endif %}
+  {% endif %}
+</div>
+{% if not ds.running %}
+<div style="margin:-16px 0 22px 0; font-size:12px;">
+  {# #889 matches the panel hint tone — secondary but touchable #}
+  <a href="#settings" style="color:#889; display:inline-block;
+     padding:6px 0;">⚙ recording settings — below the studies</a>
+</div>
+{% endif %}
+
+<div class="tblwrap">
 <table>
   <tr>
     <th>Study</th>
     <th>Created</th>
     <th>Points</th>
-    <th>Last Activity</th>
     <th>FW</th>
     <th></th>
   </tr>
@@ -79,37 +214,43 @@
       {{ s.name }}
       {% if s.live %}<span class="badge badge-live">● LIVE</span>{% endif %}
     </td>
-    <td>{{ s.created_at | ts_fmt }}</td>
+    {# nowrap: the whole point of dropping the Last Activity column was
+       giving this date room to render on one line at 800px #}
+    <td style="white-space:nowrap;">{{ s.created_at | ts_fmt }}</td>
     <td>{{ s.count }}</td>
-    <td>{{ s.latest_ts | ts_fmt if s.latest_ts else '—' }}</td>
     <td class="fwcol">{{ s.fw }}</td>
     <td><a class="view-btn" href="/view/{{ s.id }}">View Map</a></td>
   </tr>
   {% else %}
-  <tr><td colspan="6" class="empty">No studies yet — start one below.</td></tr>
+  {# the start panel is hidden while a daemon runs (e.g. a raw session on an
+     otherwise-empty install) — don't point at a form that isn't there #}
+  <tr><td colspan="5" class="empty">No studies yet —
+    {% if ds.running %}stop the running daemon to start one.{% else %}start one above.{% endif %}
+  </td></tr>
   {% endfor %}
 </table>
+</div>
 
 {% if not ds.running %}
-<div class="panel">
-  <h2>Start New Study</h2>
-  <form method="post" action="/start_daemon">
-    <label>Study Name</label>
-    <input type="text" name="study_name" value="{{ default_study_name }}">
-    <label>Serial Port</label>
-    <input type="text" name="port" value="{{ cfg.serial_port }}" placeholder="/dev/ttyACM0">
-    <label>Baud</label>
-    <input type="number" name="baud" value="{{ cfg.baud }}">
-    <label>Min Distance (mm)</label>
-    <input type="number" name="min_dist" value="20" min="1" max="10000">
-    <div class="chk">
-      <label style="display:inline; color:#ccc;">
-        <input type="checkbox" name="no_gate">
-        Record without RTK+heading gate (bench mode)
-      </label>
-    </div>
-    <button type="submit">▶ Start Recording</button>
-  </form>
+<div class="panel" id="settings">
+  <h2>Recording Settings</h2>
+  <div style="color:#889; font-size:12px;">Set-and-forget — used by
+    ▶ Start Recording at the top.</div>
+  <label>Study Name</label>
+  <input type="text" name="study_name" form="startForm"
+         value="{{ default_study_name }}">
+  <label>Serial Port</label>
+  <input type="text" name="port" form="startForm"
+         value="{{ cfg.serial_port }}" placeholder="/dev/ttyACM0">
+  <label>Min Distance (mm)</label>
+  <input type="number" name="min_dist" form="startForm"
+         value="20" min="1" max="10000">
+  <div class="chk">
+    <label style="display:inline; color:#ccc;">
+      <input type="checkbox" name="no_gate" form="startForm">
+      Record without RTK+heading gate (bench mode)
+    </label>
+  </div>
 </div>
 {% endif %}
 
@@ -126,6 +267,56 @@
 </div>
 
 <script>
+// Live status over SSE: the kiosk loads this page at boot, usually before
+// gnssserver is accepting — a one-shot server-side render would say
+// "down" forever. Feeds the nav chip and the shutdown-confirm warning
+// (a session started from another client must still warn here).
+function openNavSSE() {
+  const es = new EventSource('/stream/__nav__');
+  es.onmessage = (e) => {
+    const d = JSON.parse(e.data);
+    const chip = document.getElementById('navChip');
+    chip.className = 'nav-chip ' + (d.nav.connected ? 'nav-ok' : 'nav-down');
+    chip.textContent = d.nav.connected
+      ? `NAV GPS ● ${d.nav.host}:${d.nav.port}`
+      : `NAV GPS ○ ${d.nav.host}:${d.nav.port} — ${d.nav.error || 'down'}`;
+    document.getElementById('shutdownWarn').hidden = !d.daemon_running;
+    if (d.services) {
+      // both directions on this never-reloaded page: a unit deleted or
+      // renamed in a deploy must not keep a frozen (green!) dot forever
+      for (const el of document.querySelectorAll('#svcPanel .svc')) {
+        const unit = el.id.slice(4) + '.service';   // 'svc-' prefix
+        el.style.display = (unit in d.services) ? '' : 'none';
+      }
+      for (const [unit, state] of Object.entries(d.services)) {
+        const el = document.getElementById('svc-' + unit.replace('.service', ''));
+        if (!el) continue;   // unit added since page load — reload picks it up
+        el.querySelector('.dot').className = 'dot' +
+          (state === 'active' ? ' on' : state === 'failed' ? ' err' : '');
+        el.title = unit + ': ' + state;
+      }
+    }
+    // ipv4s null = undeterminable this tick — keep the last value shown.
+    // Empty array is real news: DHCP lost the lease / WiFi went down.
+    const ipEl = document.getElementById('ipLine');
+    if (ipEl && Array.isArray(d.ipv4s)) {
+      ipEl.hidden = false;   // may have rendered hidden on a cold cache
+      const ipOk = d.ipv4s.length > 0;
+      ipEl.textContent = ipOk ? d.ipv4s.join(' · ') : 'no IPv4';
+      ipEl.className = ipOk ? 'ip-ok' : 'ip-none';
+    }
+  };
+  es.onerror = () => {
+    // Transport drops auto-reconnect on their own (and the server ends
+    // the response every ~5 min by design). A non-200 response — nginx
+    // 502 while gunicorn restarts — closes the stream for GOOD, and this
+    // page lives on the kiosk 24/7: reopen ourselves or the chip freezes
+    // at its last value. Same pattern as the map/raw views.
+    if (es.readyState === EventSource.CLOSED) setTimeout(openNavSSE, 2000);
+  };
+}
+openNavSSE();
+
 function saveNav(btn) {
   fetch('/nav_config', {
     method: 'POST',

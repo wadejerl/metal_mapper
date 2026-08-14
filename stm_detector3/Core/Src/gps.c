@@ -489,6 +489,11 @@ void gps_parse_gga_sentence(const char *sentence)
     latest_gps_position.fix_quality = frame.fix_quality;
     latest_gps_position.satellites = frame.satellites_tracked;
     latest_gps_position.timestamp = frame.time.seconds + frame.time.microseconds / 1000000.0;
+    /* Anchor tick: the newest COMPLETED frame — by pacing it fired
+     * MD_SAMPLE_LEAD_MS before this fix and its ADC data is already in
+     * the frame ring, so the anchor line always follows its sample line
+     * on the wire. One atomic uint32 read; ADC IRQs outrank this one. */
+    latest_gps_position.tick = md_tick_completed;
 
     // Check if position is valid (not NaN and has fix)
     if (!isnan(latest_gps_position.latitude) &&

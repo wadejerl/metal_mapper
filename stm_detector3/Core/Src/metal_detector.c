@@ -24,15 +24,15 @@
  *   t = tx + bl + rx      RX pins disconnect (aux OPM update clears the PWM2
  *                         ref in hardware); TIM1's UIE starts the ADC reads.
  *   + ~3 µs               all four ADCs finish their 2-channel injected
- *                         sequences (all 8 inputs, every cycle, regardless of
- *                         fire mode); the last JEOS releases gain + integ —
- *                         deliberately non-critical (integrators hold until
- *                         they have been sampled).
+ *                         sequences (all 8 inputs, every cycle); the last
+ *                         JEOS releases gain + integ — deliberately
+ *                         non-critical (integrators hold until they have
+ *                         been sampled).
  *
  * ADC plan: each ADC converts its own pin pair as a software-started
- * injected sequence (results in JDR1/JDR2 — no DMA). TIM1 always runs the
- * timeline (its outputs are just idled in B-only mode), so its UIE kicks
- * all four ADCs every cycle and adjacent-coil cross-reads come for free.
+ * injected sequence (results in JDR1/JDR2 — no DMA). TIM1 runs the
+ * timeline; its UIE kicks all four ADCs every cycle and adjacent-coil
+ * cross-reads come for free.
  *   ADC1: PA0/PA1 (IN1/IN2)    ADC2: PA6/PA7  (IN3/IN4)
  *   ADC3: PB1/PB13 (IN1/IN5)   ADC4: PB12/PB14 (IN3/IN4)
  *
@@ -45,10 +45,9 @@
  * Gain/integ channels use Active-on-compare, which latches the ref HIGH
  * through the OPM stop — exactly what the integrator-hold requires.
  *
- * Fire modes gate ONLY the coil TX channels: gain/integ/RX on both sets
- * run the identical dual-mode timeline every cycle regardless (the quiet
- * set's receive chain listens to the other coil's pulse). Single-coil
- * operation alternates the TX between sets on successive cycles.
+ * Both coil sets fire every cycle. (Single-set firing — the old 1/2/3
+ * "fire mode" keys — was a bring-up diagnostic, removed once all 8
+ * coils were validated.)
  *
  * Set A: TX=TIM2 CH1 (PA5), TIM1: CH2=PA9 gain, CH3=PA10 integ,
  *        CH4=PA11 RX connect (CC4P=1 inverts).
@@ -88,24 +87,13 @@ volatile uint32_t md_blanking_us  = MD_BLANKING_US;
 volatile uint32_t md_rx_window_us = MD_RX_WINDOW_US;
 volatile uint32_t md_cycle_count  = 0;
 
-/* Coil-array geometry — set at provisioning time (d/c keys + 'S' save),
+/* Coil-array geometry — set at provisioning time (d/c keys + SAVE),
  * reported by the 'I' info line so studies get tagged with the producing
  * unit's physical layout. The web visualizer combines these with the GPS
  * heading to place each coil's samples. */
 volatile uint32_t md_coil_spacing_mm      = MD_COIL_SPACING_MM_DEFAULT;
 volatile int32_t  md_coil_offset_fore_mm  = 0;   /* array center vs antenna */
 volatile int32_t  md_coil_offset_right_mm = MD_COIL_OFFSET_RIGHT_MM_DEFAULT;
-
-/* Fire mode (keys 1/2/3, persisted): which TX strobes run each cycle.
- * "odd" = set A only (PA5), "even" = set B only (PB4), "both" = normal.
- * Everything else — gain/integ/RX lines and all 8 ADC reads — is identical
- * in every mode (md_arm_set gates only the coil trigger). */
-volatile uint8_t md_fire_mode = MD_FIRE_BOTH;
-
-static const char *md_fire_name(uint8_t m)
-{
-    return (m == MD_FIRE_A) ? "odd" : (m == MD_FIRE_B) ? "even" : "both";
-}
 
 /* DWT cycle timestamps (debug aid) */
 volatile uint32_t md_ts_cen;
@@ -188,7 +176,56 @@ static inline void md_slave_to_tim2(TIM_TypeDef *tim)
  * md_adc[] order is the CSV order.
  * ------------------------------------------------------------------------- */
 volatile uint16_t md_adc[MD_ADC_COUNT];
-volatile uint8_t  md_adc_frame_ready = 0;
+
+/* Sample ticks (see metal_detector.h): md_sample_tick numbers every pacer
+ * fire; md_tick_inflight is the started cycle's number (exactly one cycle
+ * runs at a time — md_start_cycle refuses overlap); md_tick_completed is
+ * published for the GGA anchor stamp when the frame lands. */
+static volatile uint32_t md_sample_tick   = 0U;
+static volatile uint32_t md_tick_inflight = 0U;
+volatile uint32_t md_tick_completed       = 0U;
+
+/* Completed-frame ring: last-JEOS ISR writes (the ADC IRQs share priority
+ * 3, so writes never nest), app task reads. Free-running indices, same
+ * discipline as gps.c's echo ring. A full ring drops the frame — the
+ * tick gap tells the host — and counts the overrun (debugger-visible). */
+#define MD_FRAME_RING 32U               /* power of two */
+static md_frame_t md_frame_ring[MD_FRAME_RING];
+static volatile uint32_t md_frame_head = 0U;  /* ISR writes  */
+static volatile uint32_t md_frame_tail = 0U;  /* task writes */
+volatile uint32_t md_frame_overruns = 0U;
+
+uint8_t md_frame_pop(md_frame_t *out)
+{
+    uint32_t tail = md_frame_tail;
+    if (tail == md_frame_head)
+        return 0U;
+    *out = md_frame_ring[tail & (MD_FRAME_RING - 1U)];
+    md_frame_tail = tail + 1U;
+    return 1U;
+}
+
+/* Cycles per GPS period — the g/b console keys step through the divisor
+ * list below; persisted with the settings (packed into the rx_window
+ * record word). The pacer reads this per arm, so a change takes effect
+ * within one fix interval. */
+volatile uint8_t md_samples_per_period = MD_SAMPLES_PER_GPS_PERIOD;
+
+static const uint8_t md_rate_steps[] = { 1U, 2U, 5U, 10U, 25U };
+#define MD_RATE_STEPS (sizeof(md_rate_steps) / sizeof(md_rate_steps[0]))
+
+static uint8_t md_rate_valid(uint32_t sp)
+{
+    for (uint32_t i = 0U; i < MD_RATE_STEPS; i++)
+        if (md_rate_steps[i] == sp)
+            return 1U;
+    return 0U;
+}
+
+static uint32_t md_sample_rate_hz(void)
+{
+    return 1000U * md_samples_per_period / MD_GPS_PERIOD_MS;
+}
 
 typedef struct {
     ADC_TypeDef *adc;
@@ -351,10 +388,13 @@ void md_status_read(float *vin_volts, float *temp_c)
 
 typedef struct __attribute__((aligned(8))) {
     uint32_t magic;
-    uint32_t blanking_us;          /* bits 23:0 blanking; bits 31:24 fire
-                                      mode (0 = pre-fire-mode record ->
-                                      MD_FIRE_BOTH applies)               */
-    uint32_t rx_window_us;
+    uint32_t blanking_us;          /* bits 23:0 blanking; bits 31:24 held
+                                      the retired fire mode — ignored on
+                                      load, written 0 (both sets always
+                                      fire now)                           */
+    uint32_t rx_window_us;         /* bits 7:0 rx window (<= 50); bits
+                                      15:8 samples per GPS period (0 =
+                                      pre-rate record -> default applies) */
     uint32_t coil_spacing_mm;      /* 0xFFFFFFFF = pre-geometry record     */
     int32_t  coil_offset_fore_mm;  /* array center vs antenna, + forward   */
     int32_t  coil_offset_right_mm; /* + starboard                          */
@@ -446,16 +486,16 @@ void MD_Load_Settings(void)
         /* Clamp to the same limits the console enforces (16-bit ARR at
          * 170 MHz ticks) in case the record came from other firmware. */
         uint32_t bl = last->blanking_us & 0x00FFFFFFU;
-        uint32_t fm = last->blanking_us >> 24;
         md_blanking_us  = (bl <= MD_BLANKING_MAX_US)
                           ? bl : MD_BLANKING_MAX_US;
-        /* 0 = record predates fire mode; anything else out of range means
-         * foreign firmware — the default (both) applies either way. */
-        md_fire_mode    = (fm >= MD_FIRE_A && fm <= MD_FIRE_BOTH)
-                          ? (uint8_t)fm : (uint8_t)MD_FIRE_BOTH;
-        md_rx_window_us = (last->rx_window_us >= 1U &&
-                           last->rx_window_us <= MD_RX_WINDOW_MAX_US)
-                          ? last->rx_window_us : MD_RX_WINDOW_US;
+        uint32_t rxw = last->rx_window_us & 0xFFU;
+        uint32_t sp  = (last->rx_window_us >> 8) & 0xFFU;
+        md_rx_window_us = (rxw >= 1U && rxw <= MD_RX_WINDOW_MAX_US)
+                          ? rxw : MD_RX_WINDOW_US;
+        /* 0 = record predates the sample rate; anything not in the step
+         * list means foreign firmware — the default applies either way. */
+        md_samples_per_period = md_rate_valid(sp)
+                          ? (uint8_t)sp : (uint8_t)MD_SAMPLES_PER_GPS_PERIOD;
         /* Older records carry erased 0xFFFFFFFF in this (ex-spare) word —
          * out of range, so the compile-time default applies. */
         md_tx_pulse_us  = (last->tx_pulse_us >= MD_TX_PULSE_MIN_US &&
@@ -478,16 +518,16 @@ void MD_Load_Settings(void)
                  last->coil_offset_right_mm <=  MD_COIL_OFFSET_MM_LIMIT)
                 ? last->coil_offset_right_mm : 0;
         }
-        printf("# settings loaded: blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  fire_mode=%s\r\n",
+        printf("# settings loaded: blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  sample_rate=%luHz\r\n",
                md_blanking_us, md_rx_window_us, md_tx_pulse_us, md_coil_spacing_mm,
-               md_fire_name(md_fire_mode));
+               md_sample_rate_hz());
     } else {
         /* Nothing valid in flash (new board, or the page was just purged
          * after an ECC fault): persist the compile-time defaults so the
          * unit always carries a valid record. 'D' re-writes them on demand. */
-        printf("# no saved settings -- writing defaults: blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  fire_mode=%s\r\n",
+        printf("# no saved settings -- writing defaults: blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  sample_rate=%luHz\r\n",
                md_blanking_us, md_rx_window_us, md_tx_pulse_us, md_coil_spacing_mm,
-               md_fire_name(md_fire_mode));
+               md_sample_rate_hz());
         MD_Save_Settings();
     }
 }
@@ -526,9 +566,9 @@ void MD_Save_Settings(void)
     md_settings_rec_t rec;
     memset(&rec, 0xFF, sizeof(rec));
     rec.magic                = MD_SETTINGS_MAGIC;
-    rec.blanking_us          = md_blanking_us
-                             | ((uint32_t)md_fire_mode << 24);
-    rec.rx_window_us         = md_rx_window_us;
+    rec.blanking_us          = md_blanking_us;
+    rec.rx_window_us         = md_rx_window_us
+                             | ((uint32_t)md_samples_per_period << 8);
     rec.tx_pulse_us          = md_tx_pulse_us;
     rec.coil_spacing_mm      = md_coil_spacing_mm;
     rec.coil_offset_fore_mm  = md_coil_offset_fore_mm;
@@ -580,10 +620,10 @@ void MD_Save_Settings(void)
     const md_settings_rec_t *r = md_settings_slot(slot);
     if (st == HAL_OK && r->magic == MD_SETTINGS_MAGIC
         && r->check == md_settings_check(r))
-        printf("# saved (slot %lu/%u): blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  fire_mode=%s\r\n",
+        printf("# saved (slot %lu/%u): blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  sample_rate=%luHz\r\n",
                slot, (unsigned)MD_SETTINGS_SLOTS,
                md_blanking_us, md_rx_window_us, md_tx_pulse_us, md_coil_spacing_mm,
-               md_fire_name(md_fire_mode));
+               md_sample_rate_hz());
     else
         printf("# save FAILED: program/verify at slot %lu\r\n", slot);
 }
@@ -598,14 +638,14 @@ void md_print_info(void)
     printf("# info fw=%s gps_ver=%s gps_id=%s"
            " blanking_us=%lu rx_window_us=%lu tx_pulse_us=%lu"
            " coil_spacing_mm=%lu coil_offset_fore_mm=%ld coil_offset_right_mm=%ld"
-           " fire_mode=%s adc_oversample=16 adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14\r\n",
+           " sample_rate_hz=%lu adc_oversample=16 adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14\r\n",
            FW_GIT_HASH,
            gps_version_str[0] ? gps_version_str : "?",
            gps_uniqid_str[0]  ? gps_uniqid_str  : "?",
            md_blanking_us, md_rx_window_us, md_tx_pulse_us,
            md_coil_spacing_mm,
            (long)md_coil_offset_fore_mm, (long)md_coil_offset_right_mm,
-           md_fire_name(md_fire_mode));
+           md_sample_rate_hz());
 }
 
 /* Console key map — printed at boot so the bindings are on screen for
@@ -613,10 +653,40 @@ void md_print_info(void)
  * daemon's info/echo parsers can never match these lines. */
 void md_print_keys(void)
 {
-    printf("# keys: a/z blanking +-2us (0..200)    s/x rx window +-1us (1..50)\r\n"
+    printf("# keys: a/z blanking +-1us (0..200)    s/x rx window +-1us (1..50)\r\n"
            "# keys: f/v tx pulse +-1us (10..120)   d/c coil spacing +-10mm (50..5000)\r\n"
-           "# keys: 1/2/3 fire coils: odd only (PA5) / even only (PB4) / both\r\n"
-           "# keys: S save settings   D restore defaults+save   I info   G gps passthrough\r\n");
+           "# keys: g/b sample rate up/down (20/40/100/200/500 Hz)\r\n"
+           "# keys: SAVE+enter save settings   CLEAR+enter restore defaults+save\r\n"
+           "# keys: I info   G gps passthrough\r\n");
+}
+
+/* Force-restore compile-time defaults and persist them (the word-gated
+ * CLEAR command — was the single-key 'D'). */
+static void md_restore_defaults(void)
+{
+    md_blanking_us          = MD_BLANKING_US;
+    md_rx_window_us         = MD_RX_WINDOW_US;
+    md_tx_pulse_us          = MD_TX_PULSE_US;
+    md_coil_spacing_mm      = MD_COIL_SPACING_MM_DEFAULT;
+    md_coil_offset_fore_mm  = 0;
+    md_coil_offset_right_mm = MD_COIL_OFFSET_RIGHT_MM_DEFAULT;
+    md_samples_per_period   = MD_SAMPLES_PER_GPS_PERIOD;
+    printf("# defaults restored\r\n");
+    MD_Save_Settings();
+}
+
+/* One keyword-matcher step. Returns 1 if the byte advanced (or restarted)
+ * the word — consumed, don't treat it as a key. *pos == len means the full
+ * word has been seen; the caller checks the NEXT byte for Enter. */
+static int md_word_step(const char *word, uint32_t len, uint32_t *pos,
+                        uint8_t ch)
+{
+    if (*pos < len && ch == (uint8_t)word[*pos]) { (*pos)++; return 1; }
+    if (*pos > 0U) {
+        *pos = (ch == (uint8_t)word[0]) ? 1U : 0U;
+        return (*pos != 0U) ? 1 : 0;
+    }
+    return 0;
 }
 
 /* ---------------------------------------------------------------------------
@@ -634,32 +704,58 @@ void md_console_poll(void)
     int changed = 0;
     int geom_changed = 0;
     int tx_changed = 0;
-    int fire_changed = 0;
+    int rate_changed = 0;
+    /* Flash writes are word-gated: SAVE+Enter saves, CLEAR+Enter restores
+     * defaults and saves. A single stray byte (RX crosstalk from the host's
+     * other data line lands as valid-looking key bytes) can never commit to
+     * flash. Matcher state is static — words may arrive split across polls.
+     * Both matchers step on every byte; a byte neither uses falls through
+     * to normal key handling, so tuning keys stay live mid-word. */
+    static const char SAVE_WORD[]  = "SAVE";
+    static const char CLEAR_WORD[] = "CLEAR";
+    static uint32_t save_pos = 0U, clear_pos = 0U;
     while (USART1->ISR & USART_ISR_RXNE) {
         uint8_t ch = (uint8_t)(USART1->RDR & 0xFFU);
-        if      (ch == 'a') { if (md_blanking_us < MD_BLANKING_MAX_US) md_blanking_us += 2U;            changed = 1; }
-        else if (ch == 'z') { md_blanking_us  = (md_blanking_us  > 2U) ? md_blanking_us - 2U : 0U;      changed = 1; }
+        if (save_pos == 4U) {           /* full SAVE seen: want Enter */
+            save_pos = 0U;
+            if (ch == '\r' || ch == '\n') {
+                MD_Save_Settings();
+                clear_pos = 0U;
+                continue;
+            }                           /* not Enter: byte re-enters below */
+        }
+        if (clear_pos == 5U) {          /* full CLEAR seen: want Enter */
+            clear_pos = 0U;
+            if (ch == '\r' || ch == '\n') {
+                md_restore_defaults();
+                save_pos = 0U;
+                continue;
+            }
+        }
+        {
+            int used = md_word_step(SAVE_WORD,  4U, &save_pos,  ch);
+            used    |= md_word_step(CLEAR_WORD, 5U, &clear_pos, ch);
+            if (used)
+                continue;
+        }
+        if      (ch == 'a') { if (md_blanking_us < MD_BLANKING_MAX_US) md_blanking_us += 1U;            changed = 1; }
+        else if (ch == 'z') { md_blanking_us  = (md_blanking_us  > 1U) ? md_blanking_us - 1U : 0U;      changed = 1; }
         else if (ch == 's') { if (md_rx_window_us < MD_RX_WINDOW_MAX_US) md_rx_window_us += 1U;         changed = 1; }
         else if (ch == 'x') { md_rx_window_us = (md_rx_window_us > 1U) ? md_rx_window_us - 1U : 1U;     changed = 1; }
         else if (ch == 'd') { if (md_coil_spacing_mm < MD_COIL_SPACING_MM_MAX) md_coil_spacing_mm += 10U; geom_changed = 1; }
         else if (ch == 'c') { if (md_coil_spacing_mm > MD_COIL_SPACING_MM_MIN) md_coil_spacing_mm -= 10U; geom_changed = 1; }
         else if (ch == 'f') { if (md_tx_pulse_us < MD_TX_PULSE_MAX_US) md_tx_pulse_us += 1U;            tx_changed = 1; }
         else if (ch == 'v') { if (md_tx_pulse_us > MD_TX_PULSE_MIN_US) md_tx_pulse_us -= 1U;            tx_changed = 1; }
-        else if (ch == '1') { md_fire_mode = MD_FIRE_A;    fire_changed = 1; }
-        else if (ch == '2') { md_fire_mode = MD_FIRE_B;    fire_changed = 1; }
-        else if (ch == '3') { md_fire_mode = MD_FIRE_BOTH; fire_changed = 1; }
-        else if (ch == 'S') { MD_Save_Settings(); }
-        else if (ch == 'D') {
-            /* Force-restore compile-time defaults and persist them. */
-            md_blanking_us          = MD_BLANKING_US;
-            md_rx_window_us         = MD_RX_WINDOW_US;
-            md_tx_pulse_us          = MD_TX_PULSE_US;
-            md_coil_spacing_mm      = MD_COIL_SPACING_MM_DEFAULT;
-            md_coil_offset_fore_mm  = 0;
-            md_coil_offset_right_mm = MD_COIL_OFFSET_RIGHT_MM_DEFAULT;
-            md_fire_mode            = MD_FIRE_BOTH;
-            printf("# defaults restored\r\n");
-            MD_Save_Settings();
+        else if (ch == 'g' || ch == 'b') {
+            /* Step through the divisor list — the pacer picks the new
+             * interval up at its next arm; the next fix re-syncs fully. */
+            uint32_t i = 0U;
+            while (i < MD_RATE_STEPS - 1U && md_rate_steps[i] != md_samples_per_period)
+                i++;
+            if (ch == 'g' && i < MD_RATE_STEPS - 1U) i++;
+            else if (ch == 'b' && i > 0U) i--;
+            md_samples_per_period = md_rate_steps[i];
+            rate_changed = 1;
         }
         else if (ch == 'I') { md_print_info(); }
         else if (ch == 'G') {
@@ -675,8 +771,9 @@ void md_console_poll(void)
         printf("# tx_pulse=%luus\r\n", md_tx_pulse_us);
     if (geom_changed)
         printf("# coil_spacing=%lumm\r\n", md_coil_spacing_mm);
-    if (fire_changed)
-        printf("# fire_mode=%s\r\n", md_fire_name(md_fire_mode));
+    if (rate_changed)
+        printf("# sample_rate=%luHz (%u per fix)\r\n",
+               md_sample_rate_hz(), md_samples_per_period);
 }
 
 /* Common one-pulse timebase setup: 170 MHz ticks, given end-of-timeline. */
@@ -759,9 +856,8 @@ void MD_Hardware_Init(void)
 }
 
 /* Arm one set for the coming cycle (timers are stopped here, so mode and
- * compare writes are glitch-free). The aux channels are armed identically
- * every cycle in every mode; fire_tx gates only the coil trigger. */
-static void md_arm_set(md_set_t *s, uint8_t fire_tx,
+ * compare writes are glitch-free). */
+static void md_arm_set(md_set_t *s,
                        uint32_t tx_arr, uint32_t aux_ccr, uint32_t aux_arr)
 {
     s->tx->ARR  = tx_arr;
@@ -777,19 +873,16 @@ static void md_arm_set(md_set_t *s, uint8_t fire_tx,
     md_oc_mode(s->opm, s->integ_ch, MD_OCM_ACT_ON_CMP);  /* latches HIGH      */
     md_oc_mode(s->opm, s->rx_ch,    MD_OCM_PWM2);        /* hardware window   */
 
-    /* The only per-mode difference: does this coil fire? */
-    md_oc_mode(s->tx, 1, fire_tx ? MD_OCM_PWM2           /* rise @1 tick,
-                                                            fall @update      */
-                                 : MD_OCM_FORCE_INACT);  /* coil quiet        */
+    md_oc_mode(s->tx, 1, MD_OCM_PWM2);   /* coil: rise @1 tick, fall @update */
 }
 
 /* ============================================================================
  * md_start_cycle  (called from the TIM7 pacer IRQ — see md_pace_fired)
- * Arms the selected set(s), then starts the master. Every armed timer
- * starts on the same hardware trigger — the only software-timed event is
- * this single CEN write, and nothing downstream depends on when it lands.
+ * Arms both sets, then starts the master. Every armed timer starts on
+ * the same hardware trigger — the only software-timed event is this
+ * single CEN write, and nothing downstream depends on when it lands.
  * ========================================================================== */
-uint8_t md_start_cycle(md_fire_t which)
+uint8_t md_start_cycle(void)
 {
     if (((TIM2->CR1 | TIM3->CR1 | TIM1->CR1 | TIM8->CR1) & TIM_CR1_CEN)
         || md_adc_done_mask != 0x0FU)
@@ -802,8 +895,8 @@ uint8_t md_start_cycle(md_fire_t which)
     uint32_t aux_ccr = (tx + bl) * MD_TICKS_PER_US + 1U;
     uint32_t aux_arr = (tx + bl + rx) * MD_TICKS_PER_US;
 
-    md_arm_set(&md_set_a, (which & MD_FIRE_A) != 0U, tx_arr, aux_ccr, aux_arr);
-    md_arm_set(&md_set_b, (which & MD_FIRE_B) != 0U, tx_arr, aux_ccr, aux_arr);
+    md_arm_set(&md_set_a, tx_arr, aux_ccr, aux_arr);
+    md_arm_set(&md_set_b, tx_arr, aux_ccr, aux_arr);
 
     md_ts_cen = dwt_cyccnt();
     TIM2->CR1 |= TIM_CR1_CEN;      /* master + all armed slaves start here   */
@@ -838,11 +931,6 @@ void md_tim8_uie_fired(void)
  * ========================================================================== */
 #define MD_PACE_TICKS_PER_MS 10U
 
-volatile uint8_t md_idle_line_due = 0U;
-
-static volatile uint8_t md_pace_remaining = 0U; /* extra fires this interval */
-static volatile uint8_t md_pace_idle = 1U;      /* current arm is idle-rate  */
-
 /* An expiry that lands while the other arm site runs (equal priority, so
  * it can only pend, never preempt) is superseded by this re-arm: clearing
  * SR alone is not enough — the NVIC latches pending on the UIF edge and
@@ -876,10 +964,7 @@ static void md_pace_init(void)
 
 void md_pace_on_fix(void)
 {
-    md_pace_idle = 0U;
-    md_idle_line_due = 0U;   /* stale idle flag: this frame reports via GGA */
-    md_pace_remaining = MD_SAMPLES_PER_GPS_PERIOD - 1U;
-    md_pace_arm(MD_GPS_PERIOD_MS / MD_SAMPLES_PER_GPS_PERIOD
+    md_pace_arm(MD_GPS_PERIOD_MS / md_samples_per_period
                 - MD_SAMPLE_LEAD_MS);
 }
 
@@ -888,26 +973,27 @@ void md_pace_fired(void)
     if ((TIM7->SR & TIM_SR_UIF) == 0U)
         return;                             /* superseded expiry (see arm) */
     TIM7->SR = 0U;                          /* clear UIF */
-    md_adc_frame_ready = 0U;                /* frame in flight */
-    md_start_cycle((md_fire_t)md_fire_mode);
-    if (md_pace_idle)
-        md_idle_line_due = 1U;              /* no fix armed this one */
-    if (md_pace_remaining != 0U) {
-        md_pace_remaining--;
-        md_pace_arm(MD_GPS_PERIOD_MS / MD_SAMPLES_PER_GPS_PERIOD);
-    } else {
-        /* Fallback arm: a valid fix normally re-arms before this fires;
-         * without one it keeps frames (and idle lines) coming at the
-         * idle rate with the coils resting in between. */
-        md_pace_idle = 1U;
-        md_pace_arm(MD_IDLE_PERIOD_MS);
-    }
+    /* Every fire consumes a tick, started or not: a skipped slot (previous
+     * cycle still in flight — never happens at a 2 ms interval vs ~185 us
+     * cycles, but the guard stands) leaves a tick gap instead of quietly
+     * relabeling time. The in-flight number is set only on a real start
+     * so a frame still converting keeps its own tick. */
+    uint32_t tick = md_sample_tick + 1U;
+    md_sample_tick = tick;
+    if (md_start_cycle())
+        md_tick_inflight = tick;
+    /* Re-arm at the sample interval unconditionally. A valid fix re-syncs
+     * the phase (md_pace_on_fix, arming interval-minus-lead); without one
+     * the stream free-runs at the same interval — full rate for bench
+     * work with no GPS attached, and the front end keeps its field
+     * thermal duty cycle (see the cadence contract in metal_detector.h). */
+    md_pace_arm(MD_GPS_PERIOD_MS / md_samples_per_period);
 }
 
 /* ============================================================================
  * Injected-sequence completion (JEOS), one per ADC. The last one to land
  * releases gain + integ on both sets: every integrator has been sampled by
- * then. For a disabled set the releases are no-ops (refs already inactive).
+ * then.
  * ========================================================================== */
 static void md_adc_collect(uint32_t i)
 {
@@ -925,7 +1011,21 @@ static void md_adc_collect(uint32_t i)
         md_oc_mode(md_set_b.opm, md_set_b.gain_ch,  MD_OCM_FORCE_INACT);
         md_oc_mode(md_set_b.opm, md_set_b.integ_ch, MD_OCM_FORCE_INACT);
         md_cycle_count++;
-        md_adc_frame_ready = 1U;
+
+        /* Frame complete: queue it for the app task's sample line. The
+         * head bump publishes after the payload; a full ring drops the
+         * frame whole (its tick gap is the host's signal). */
+        uint32_t head = md_frame_head;
+        if (head - md_frame_tail < MD_FRAME_RING) {
+            md_frame_t *f = &md_frame_ring[head & (MD_FRAME_RING - 1U)];
+            f->tick = md_tick_inflight;
+            for (uint32_t k = 0U; k < MD_ADC_COUNT; k++)
+                f->adc[k] = md_adc[k];
+            md_frame_head = head + 1U;
+        } else {
+            md_frame_overruns++;
+        }
+        md_tick_completed = md_tick_inflight;
     }
 }
 

@@ -38,6 +38,8 @@ typedef struct {
   uint8_t satellites;
   uint8_t valid;
   float timestamp;
+  uint32_t tick;     // md_tick_completed at GGA parse: the sample tick this
+                     // fix anchors (the frame paced to land just before it)
 } gps_position_t;
 
 extern volatile gps_position_t latest_gps_position;

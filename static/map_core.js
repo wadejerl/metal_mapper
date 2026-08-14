@@ -620,7 +620,169 @@ const MM = (() => {
     };
   }
 
+  /* ── Channel strip chart (shared by the map view and the raw view) ────────
+   * Scrolling multi-channel trace: newest sample at the right edge, one line
+   * per channel in CH_COLORS, ONE shared Y scale so the traces overlay.
+   * Fed from the daemon's live_samples stream (full sample rate), so it
+   * works with no GPS fix and no recording — it is a scope, not a log.
+   *
+   * Scale modes:
+   *   'auto' — RAW counts, Y bounds fit the visible data. ONE mapping
+   *            (gain AND offset) for all channels, so both levels and
+   *            amplitudes are directly comparable — channels sitting at
+   *            different DC points fan into separate traces, as they must.
+   *   'zero' — each channel plotted as DEVIATION from its zero baseline
+   *            (per-channel offset removal overlays the traces), shared
+   *            gain fit to the visible deviations. Dashed zero line.
+   *            Levels are NOT comparable here — only response shapes.
+   *   'abs'  — RAW counts on a fixed 0..65535 axis: where each analog
+   *            stage actually sits, rails included. Zeros/filter ignored.
+   * filter 'cm' (auto/zero modes) subtracts the array-mean deviation per
+   * sample — same Δ-array-mean as the map coloring. */
+  const CH_COLORS = ['#e6194b', '#f58231', '#ffe119', '#3cb44b',
+                     '#42d4f4', '#4363d8', '#911eb4', '#f032e6'];
+
+  function StripChart(canvas, opts) {
+    opts = opts || {};
+    let W = opts.width  || 220;
+    let H = opts.height || 88;
+    let N = opts.n      || 240;         // samples kept
+    const buf = [];                     // rows of adc[8], newest last
+    let zero8 = null;
+    let scaleMode = 'auto';             // 'auto' | 'zero' | 'abs'
+    let filter = 'abs';                 // 'abs' | 'cm' (Δ array mean)
+    const vis = [true, true, true, true, true, true, true, true];
+    const ctx = canvas.getContext('2d');
+
+    function size() {
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width  = W * dpr;
+      canvas.height = H * dpr;
+      canvas.style.width  = W + 'px';
+      canvas.style.height = H + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    size();
+
+    function seriesOf(row) {
+      if (scaleMode === 'abs') return row;
+      // deviations drive the cm filter in both modes; only 'zero' plots them
+      const dev = zero8 ? row.map((v, ch) => v - zero8[ch]) : row.slice();
+      const base = scaleMode === 'zero' ? dev : row;
+      if (filter === 'cm') {
+        const m = dev.reduce((a, b) => a + b, 0) / dev.length;
+        return base.map(v => v - m);
+      }
+      return base;
+    }
+
+    function draw() {
+      ctx.clearRect(0, 0, W, H);
+      const n = buf.length;
+      if (n < 2) return;
+      const rows = buf.map(seriesOf);
+      let top, bot;
+      if (scaleMode === 'abs') {
+        top = 65535; bot = 0;
+      } else {
+        // Fit VISIBLE channels only: unticking a railed channel is how the
+        // operator zooms the shared axis into the quiet ones.
+        let lo = Infinity, hi = -Infinity;
+        for (const row of rows)
+          for (let ch = 0; ch < 8; ch++) {
+            if (!vis[ch]) continue;
+            const v = row[ch];
+            if (v < lo) lo = v; if (v > hi) hi = v;
+          }
+        if (lo > hi) { lo = 0; hi = 1; }  // everything hidden: keep a frame
+        if (hi - lo < 1) { hi += 1; lo -= 1; }
+        const pad = (hi - lo) * 0.06;
+        top = hi + pad; bot = lo - pad;
+      }
+      const step = W / (N - 1);
+      const x0   = W - (n - 1) * step;  // newest anchored at the right edge
+      // Inset the trace band: a value AT a scale bound (rails in 'abs' mode)
+      // otherwise strokes centered on the canvas edge and shows only as a
+      // half-clipped smear. auto/zero pad their fitted range, but the fixed
+      // 0..65535 axis has values exactly at its bounds. The half-pixel puts
+      // a bound-value stroke on a pixel center: crisp, not two dim rows.
+      const EDGE = 1.5;
+      const yOf  = v => EDGE + (top - v) / (top - bot) * (H - 2 * EDGE);
+      if (scaleMode === 'zero' && zero8 && top > 0 && bot < 0) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.25)';
+        ctx.lineWidth = 1;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.moveTo(0, yOf(0)); ctx.lineTo(W, yOf(0));
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+      ctx.lineWidth = 1;
+      for (let ch = 0; ch < 8; ch++) {
+        if (!vis[ch]) continue;
+        ctx.beginPath();
+        for (let i = 0; i < n; i++) {
+          const x = x0 + i * step, y = yOf(rows[i][ch]);
+          if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+        }
+        ctx.strokeStyle = CH_COLORS[ch];
+        ctx.stroke();
+      }
+      // shared-scale bounds: raw counts in auto/abs, Δ counts in zero mode
+      ctx.fillStyle = '#999';
+      ctx.font = '9px monospace';
+      ctx.fillText(Math.round(top), 2, 9);
+      ctx.fillText(Math.round(bot), 2, H - 2);
+    }
+
+    return {
+      append(adc) {
+        if (!adc) return;
+        buf.push(Array.from(adc));
+        if (buf.length > N) buf.splice(0, buf.length - N);
+      },
+      draw,
+      clear() { buf.length = 0; draw(); },
+      tail(k) { return buf.slice(-k); },
+      get length() { return buf.length; },
+      setZero(z) { zero8 = z; },
+      setScaleMode(m) {
+        scaleMode = (m === 'abs' || m === 'zero') ? m : 'auto';
+      },
+      setFilter(f) { filter = f === 'cm' ? 'cm' : 'abs'; },
+      setChanVis(ch, on) { if (ch >= 0 && ch < 8) vis[ch] = !!on; },
+      chanVis(ch) { return vis[ch]; },
+      // Per-channel mean/σ over the buffer, run through the SAME seriesOf
+      // pipeline the traces are drawn with — so with the Δ-array-mean
+      // filter active the σ is differential noise, matching what the eye
+      // sees: a fat trace and a big number always agree. Hidden channels
+      // are still computed (their legend row keeps reading).
+      stats() {
+        const n = buf.length;
+        if (n < 2) return null;
+        const sum = new Array(8).fill(0), sq = new Array(8).fill(0);
+        for (const row of buf) {
+          const s = seriesOf(row);
+          for (let ch = 0; ch < 8; ch++) {
+            sum[ch] += s[ch];
+            sq[ch]  += s[ch] * s[ch];
+          }
+        }
+        return sum.map((s, ch) => {
+          const mean = s / n;
+          const varc = Math.max(0, sq[ch] / n - mean * mean);
+          return {mean, std: Math.sqrt(varc)};
+        });
+      },
+      resize(w, h, n) {
+        W = w; H = h;
+        if (n) { N = n; if (buf.length > N) buf.splice(0, buf.length - N); }
+        size();
+      },
+    };
+  }
+
   return {coilPositions, geomFromMeta, colorFor, fixLabel, fixColor,
-          reasonText, NavLayer, PointStore, ChannelRenderer,
-          NAV_MIN_SPEED_MPS};
+          reasonText, NavLayer, PointStore, ChannelRenderer, StripChart,
+          CH_COLORS, NAV_MIN_SPEED_MPS};
 })();

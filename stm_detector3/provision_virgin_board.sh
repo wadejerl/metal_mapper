@@ -22,7 +22,7 @@
 #      (skip with --no-flash).
 #
 # AFTER FIRST BOOT: the settings page is empty, so the firmware runs
-# compile-time defaults — re-tune (a/z s/x d/c f/v) and press S to save.
+# compile-time defaults — re-tune (a/z s/x d/c f/v), type SAVE + enter to save.
 # Tuned values are recoverable from any recent study header (tx_pulse_us etc.).
 #
 # NEVER use CubeProgrammer's "factory default" option-bytes button on a
@@ -127,5 +127,5 @@ fi
 echo ""
 echo "Done. Board is provisioned (single-bank, DBANK=0)."
 echo "Reminder: settings page is empty on a fresh chip — re-tune over serial"
-echo "(a/z s/x d/c f/v) and press S to save. Never apply factory-default"
+echo "(a/z s/x d/c f/v), type SAVE + enter to save. Never apply factory-default"
 echo "option bytes to this board (it would set DBANK=1 again)."

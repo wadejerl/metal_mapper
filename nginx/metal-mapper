@@ -1,0 +1,26 @@
+upstream metal_mapper_app {
+    server 127.0.0.1:8000;
+}
+
+server {
+    listen 80;
+    server_name _;
+
+    # SSE — longer prefix wins over the catch-all below
+    location /stream/ {
+        proxy_pass         http://metal_mapper_app;
+        proxy_set_header   Host $host;
+        proxy_set_header   Connection '';
+        proxy_http_version 1.1;
+        chunked_transfer_encoding off;
+        proxy_buffering    off;
+        proxy_cache        off;
+        proxy_read_timeout 24h;
+    }
+
+    location / {
+        proxy_pass       http://metal_mapper_app;
+        proxy_set_header Host $host;
+        proxy_buffering  off;
+    }
+}
