@@ -1,0 +1,14 @@
+[Unit]
+Description=Metal Mapper studies hub (rsync daemon)
+After=network.target
+
+[Service]
+User=rtk
+Group=rtk
+ExecStartPre=/bin/mkdir -p /home/rtk/mm_studies
+ExecStart=/usr/bin/rsync --daemon --no-detach --config=/home/rtk/mm_hub_rsyncd.conf
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

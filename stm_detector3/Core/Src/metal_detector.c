@@ -23,11 +23,11 @@
  *                         (aux compares, one CCR value — same clock, both sets)
  *   t = tx + bl + rx      RX pins disconnect (aux OPM update clears the PWM2
  *                         ref in hardware); TIM1's UIE starts the ADC reads.
- *   + ~3 µs               all four ADCs finish their 2-channel injected
- *                         sequences (all 8 inputs, every cycle); the last
- *                         JEOS releases gain + integ — deliberately
- *                         non-critical (integrators hold until they have
- *                         been sampled).
+ *   + ~45 µs              all four ADCs finish their 2-channel injected
+ *                         sequences (16x oversampled — all 8 inputs, every
+ *                         cycle); the last JEOS releases gain + integ —
+ *                         deliberately non-critical (integrators hold until
+ *                         they have been sampled).
  *
  * ADC plan: each ADC converts its own pin pair as a software-started
  * injected sequence (results in JDR1/JDR2 — no DMA). TIM1 runs the
@@ -35,6 +35,18 @@
  * cross-reads come for free.
  *   ADC1: PA0/PA1 (IN1/IN2)    ADC2: PA6/PA7  (IN3/IN4)
  *   ADC3: PB1/PB13 (IN1/IN5)   ADC4: PB12/PB14 (IN3/IN4)
+ *
+ * RASTER MODE ('r' key): instead of one simultaneous cycle per sample
+ * tick, the pacer runs 8 slots at a fixed slot period (md_slot_ticks x
+ * 100 µs, min 200 µs). Slot k fires ONLY channel k's bus with channel k's
+ * own {tx, blanking, rx} from the per-channel table, and converts only
+ * channel k (single-conversion JSQR, ~23 µs). The idle set's TX and aux
+ * outputs are parked Force-Inactive — its coils don't fire and its
+ * integrators stay reset. One md_frame_t publishes per completed sweep,
+ * so the wire format is unchanged: value k was measured at
+ * sweep_start + k*slot_period (the host learns slot_us from the info
+ * line). This is the only route to per-channel timing — the gain/integ/RX
+ * gates are bussed per set with a single compare value each.
  *
  * TX channels use PWM mode 2 (ref = CNT >= CCR) with CCR = 1 tick: while a
  * timer sits stopped at CNT=0 the ref is LOW, so idle pins are safe — the
@@ -115,6 +127,32 @@ volatile uint32_t md_ts_opm;
 #define MD_COIL_SPACING_MM_MAX    5000U
 #define MD_COIL_OFFSET_MM_LIMIT   5000
 
+/* ---------------------------------------------------------------------------
+ * Raster mode: per-channel slot timing (see the header comment above).
+ *
+ * Channel -> bus map: even channels ride Set/Bus A (TX PA5/TIM2), odd
+ * channels Set/Bus B (TX PB4/TIM3). INFERRED from the ADC pair structure
+ * (each ADC's injected pair is one even + one odd channel, i.e. one Set A
+ * + one Set B front end); the pre-raster firmware never needed this map
+ * because both sets always fired with identical timing. VALIDATE ON THE
+ * ANALYZER before trusting raster data — if it is backwards, flip this
+ * macro and nothing else.
+ * ------------------------------------------------------------------------- */
+#define MD_CH_SET_B(k)    ((k) & 1U)  /* 1 = Set B fires channel k's slot   */
+
+#define MD_SEL_ALL        8U    /* md_sel_ch value: edit all 8 in lockstep  */
+#define MD_SLOT_TICKS_MIN 2U    /* 200 µs floor: eddy settle between slots  */
+#define MD_SLOT_ADC_US    25U   /* one 16x-oversampled conversion is ~23 µs */
+#define MD_SLOT_MARGIN_US 5U    /* UIE-to-JADSTART latency + slack          */
+#define MD_PACE_TICKS_PER_MS 10U   /* TIM7 timebase: 0.1 ms ticks (10 kHz)  */
+
+static volatile uint8_t md_raster = 0U;         /* 0 = all-at-once, 1 = raster */
+static volatile uint8_t md_sel_ch = MD_SEL_ALL; /* console edit target         */
+static volatile uint8_t md_ch_tx_us[8];         /* per-channel table — raster  */
+static volatile uint8_t md_ch_bl_us[8];         /*   mode only; seeded by      */
+static volatile uint8_t md_ch_rx_us[8];         /*   MD_Load_Settings          */
+static volatile uint8_t md_slot_ticks = MD_SLOT_TICKS_MIN;   /* slot period   */
+
 static inline uint32_t dwt_cyccnt(void)
 {
     if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk))
@@ -185,6 +223,27 @@ static volatile uint32_t md_sample_tick   = 0U;
 static volatile uint32_t md_tick_inflight = 0U;
 volatile uint32_t md_tick_completed       = 0U;
 
+/* Raster sweep state — written by the TIM7 pacer ISR (priority 6), read
+ * by the aux-UIE (2) and JEOS (3) ISRs. Every field settles microseconds
+ * before the hardware event that reads it (a slot's UIE can't fire until
+ * tx+bl+rx after the pacer armed it), so no locking is needed — the same
+ * timing argument md_start_cycle already relies on. */
+static volatile uint8_t md_slot        = 0U;  /* next slot to fire (0..7)   */
+static volatile uint8_t md_sweep_ok    = 0U;  /* all slots so far started   */
+static volatile uint8_t md_slot_ch     = 0U;  /* channel converting now     */
+/* Mode latches: md_raster is read ONLY at cycle/slot start (pacer) — the
+ * in-flight cycle's UIE routing reads md_cycle_raster and the JEOS collect
+ * reads md_kick_raster, both latched when their phase began, so a console
+ * toggle mid-cycle can't misroute a cycle already in the hardware. */
+static volatile uint8_t md_cycle_raster = 0U; /* latched at CEN write       */
+static volatile uint8_t md_kick_raster  = 0U; /* latched at JADSTART        */
+/* GPS fix that lands mid-sweep: the resync is deferred to the sweep
+ * boundary (re-arming TIM7 mid-sweep would cut the slot cadence). The
+ * boundary arm subtracts the slots that fired since the fix — ±1 slot
+ * period of phase error once, corrected by the next fix. */
+static volatile uint32_t md_fix_defer_ticks = 0U;
+static volatile uint8_t  md_fix_defer_slot  = 0U;
+
 /* Completed-frame ring: last-JEOS ISR writes (the ADC IRQs share priority
  * 3, so writes never nest), app task reads. Free-running indices, same
  * discipline as gps.c's echo ring. A full ring drops the frame — the
@@ -225,6 +284,81 @@ static uint8_t md_rate_valid(uint32_t sp)
 static uint32_t md_sample_rate_hz(void)
 {
     return 1000U * md_samples_per_period / MD_GPS_PERIOD_MS;
+}
+
+/* Sample interval in TIM7 ticks (0.1 ms): 20 ticks at 500 Hz .. 500 at 20. */
+static uint32_t md_interval_ticks(void)
+{
+    return MD_GPS_PERIOD_MS * MD_PACE_TICKS_PER_MS / md_samples_per_period;
+}
+
+/* Recompute the raster slot period from the worst channel's timeline and
+ * check the sweep fits the sample interval. Applies (md_slot_ticks) and
+ * returns 1, or changes nothing and returns 0. The slot period stretches
+ * past the 200 µs floor only when a channel's tx+bl+rx grows too long for
+ * it — always reported (info line / rastercfg echo), never truncated. */
+static uint8_t md_raster_apply(void)
+{
+    uint32_t worst = 0U;
+    for (uint32_t k = 0U; k < 8U; k++) {
+        uint32_t t = (uint32_t)md_ch_tx_us[k] + md_ch_bl_us[k] + md_ch_rx_us[k];
+        if (t > worst) worst = t;
+    }
+    uint32_t ticks = (worst + MD_SLOT_ADC_US + MD_SLOT_MARGIN_US + 99U) / 100U;
+    if (ticks < MD_SLOT_TICKS_MIN)
+        ticks = MD_SLOT_TICKS_MIN;
+    if (8U * ticks > md_interval_ticks())
+        return 0U;
+    md_slot_ticks = (uint8_t)ticks;
+    return 1U;
+}
+
+/* Would the current slot period still fit at sp samples per GPS period? */
+static uint8_t md_raster_rate_ok(uint32_t sp)
+{
+    return !md_raster
+        || 8U * (uint32_t)md_slot_ticks
+           <= MD_GPS_PERIOD_MS * MD_PACE_TICKS_PER_MS / sp;
+}
+
+/* Seed the per-channel table from the shared globals (legacy settings
+ * records, defaults, CLEAR). */
+static void md_table_seed(void)
+{
+    for (uint32_t k = 0U; k < 8U; k++) {
+        md_ch_tx_us[k] = (uint8_t)md_tx_pulse_us;
+        md_ch_bl_us[k] = (uint8_t)md_blanking_us;
+        md_ch_rx_us[k] = (uint8_t)md_rx_window_us;
+    }
+}
+
+static void md_table_copy(uint8_t *dst, const volatile uint8_t *src)
+{
+    for (uint32_t k = 0U; k < 8U; k++)
+        dst[k] = src[k];
+}
+
+static void md_table_restore(volatile uint8_t *dst, const uint8_t *src)
+{
+    for (uint32_t k = 0U; k < 8U; k++)
+        dst[k] = src[k];
+}
+
+/* Nudge the selected channel(s) of one table field by delta, clamped.
+ * Returns 1 if any value changed. */
+static int md_table_adj(volatile uint8_t *tab, int delta,
+                        uint32_t lo, uint32_t hi)
+{
+    int any = 0;
+    uint32_t k0 = (md_sel_ch == MD_SEL_ALL) ? 0U : md_sel_ch;
+    uint32_t k1 = (md_sel_ch == MD_SEL_ALL) ? 7U : md_sel_ch;
+    for (uint32_t k = k0; k <= k1; k++) {
+        int32_t v = (int32_t)tab[k] + delta;
+        if (v < (int32_t)lo) v = (int32_t)lo;
+        if (v > (int32_t)hi) v = (int32_t)hi;
+        if ((uint8_t)v != tab[k]) { tab[k] = (uint8_t)v; any = 1; }
+    }
+    return any;
 }
 
 typedef struct {
@@ -295,14 +429,36 @@ static void md_adc_init(void)
     HAL_NVIC_EnableIRQ(ADC4_IRQn);
 }
 
-/* Hot path: start all four injected sequences (~4 register writes). */
+/* Hot path: start all four injected sequences. The pair JSQRs are
+ * rewritten on every kick (legal: JADSTART is clear between cycles, and
+ * the previous cycle is complete by the overlap guard) — raster slots
+ * reprogram JSQR to a single conversion, so the simultaneous path is
+ * self-healing after any mode toggle instead of needing a restore step. */
 static inline void md_adc_kick(void)
 {
+    md_kick_raster = 0U;
     md_adc_done_mask = 0U;
-    ADC1->CR |= ADC_CR_JADSTART;
-    ADC2->CR |= ADC_CR_JADSTART;
-    ADC3->CR |= ADC_CR_JADSTART;
-    ADC4->CR |= ADC_CR_JADSTART;
+    for (uint32_t i = 0U; i < 4U; i++) {
+        const md_adc_pair_t *p = &md_adc_pairs[i];
+        p->adc->JSQR = ADC_JSQR_JL_0
+                     | ((uint32_t)p->ch1 << ADC_JSQR_JSQ1_Pos)
+                     | ((uint32_t)p->ch2 << ADC_JSQR_JSQ2_Pos);
+        p->adc->CR |= ADC_CR_JADSTART;
+    }
+}
+
+/* Raster hot path: convert ONLY the slot's channel (JL=0, one conversion,
+ * ~23 µs at 16x oversampling) on the ADC that owns it. The pair-mate
+ * belongs to the parked set — its integrator was never reset or gated
+ * this slot, so there is nothing meaningful to read. */
+static inline void md_adc_kick_one(void)
+{
+    uint32_t k = md_slot_ch;
+    const md_adc_pair_t *p = &md_adc_pairs[k >> 1];
+    md_kick_raster = 1U;
+    md_adc_done_mask = (uint8_t)(0x0FU & ~(1U << (k >> 1)));
+    p->adc->JSQR = (uint32_t)((k & 1U) ? p->ch2 : p->ch1) << ADC_JSQR_JSQ1_Pos;
+    p->adc->CR |= ADC_CR_JADSTART;
 }
 
 /* ---------------------------------------------------------------------------
@@ -384,7 +540,8 @@ void md_status_read(float *vin_volts, float *temp_c)
  * ------------------------------------------------------------------------- */
 #define MD_SETTINGS_PAGE_ADDR  0x0801F000UL
 #define MD_SETTINGS_PAGE       31U            /* 4 KB pages, DBANK=0        */
-#define MD_SETTINGS_MAGIC      0x3354444DUL   /* 'MDT3'                     */
+#define MD_SETTINGS_MAGIC      0x3354444DUL   /* 'MDT3' — legacy 32 B       */
+#define MD_SETTINGS_MAGIC4     0x3454444DUL   /* 'MDT4' — 64 B, raster      */
 
 typedef struct __attribute__((aligned(8))) {
     uint32_t magic;
@@ -403,17 +560,55 @@ typedef struct __attribute__((aligned(8))) {
     uint32_t check;                /* ~(XOR of the 7 words above)          */
 } md_settings_rec_t;               /* 32 bytes = 4 flash doublewords       */
 
-#define MD_SETTINGS_SLOTS  (4096U / sizeof(md_settings_rec_t))
+/* v4 record: the MDT3 layout plus the raster mode flag and the per-channel
+ * timing table. Saves always write this; loads accept either magic (the
+ * newest valid record of any vintage wins), so a board upgraded from MDT3
+ * firmware keeps its tuning. Words 0..6 keep the MDT3 meaning — only the
+ * ex-fire-mode bits 31:24 of blanking_us are repurposed for the mode. */
+typedef struct __attribute__((aligned(8))) {
+    uint32_t magic;                /* 'MDT4'                               */
+    uint32_t blanking_us;          /* bits 23:0 blanking; bits 31:24 mode
+                                      (0 = all-at-once, 1 = raster)        */
+    uint32_t rx_window_us;         /* as MDT3 (rx | samples_per_period<<8) */
+    uint32_t coil_spacing_mm;
+    int32_t  coil_offset_fore_mm;
+    int32_t  coil_offset_right_mm;
+    uint32_t tx_pulse_us;
+    uint8_t  ch_bl_us[8];          /* raster per-channel table             */
+    uint8_t  ch_rx_us[8];
+    uint8_t  ch_tx_us[8];
+    uint32_t reserved[2];          /* written erased (0xFFFFFFFF): a future
+                                      field reads "not present" in old
+                                      records for free, MDT3-style         */
+    uint32_t check;                /* ~(XOR of the 15 words above)         */
+} md_settings_rec4_t;              /* 64 bytes = 8 flash doublewords       */
 
-static uint32_t md_settings_check(const md_settings_rec_t *r)
+_Static_assert(sizeof(md_settings_rec_t)  == 32U, "MDT3 record is 32 bytes");
+_Static_assert(sizeof(md_settings_rec4_t) == 64U, "MDT4 record is 64 bytes");
+
+#define MD_SETTINGS_SLOTS  (4096U / sizeof(md_settings_rec_t))
+#define MD_SETTINGS_SLOTS4 (4096U / sizeof(md_settings_rec4_t))
+
+static uint32_t md_settings_check_words(const uint32_t *w, uint32_t nwords)
 {
-    const uint32_t *w = (const uint32_t *)r;
     uint32_t x = 0U;
-    for (uint32_t i = 0U; i < 7U; i++)
+    for (uint32_t i = 0U; i < nwords - 1U; i++)
         x ^= w[i];
     return ~x;
 }
 
+static uint32_t md_settings_check(const md_settings_rec_t *r)
+{
+    return md_settings_check_words((const uint32_t *)r, 8U);
+}
+
+static uint32_t md_settings_check4(const md_settings_rec4_t *r)
+{
+    return md_settings_check_words((const uint32_t *)r, 16U);
+}
+
+/* Slot addressing stays in 32-byte units: legacy MDT3 records sit at any
+ * 32 B slot, MDT4 records only at even slots (64 B alignment). */
 static const md_settings_rec_t *md_settings_slot(uint32_t i)
 {
     return (const md_settings_rec_t *)(MD_SETTINGS_PAGE_ADDR
@@ -465,12 +660,30 @@ static void md_settings_erase_page(void)
 
 void MD_Load_Settings(void)
 {
-    const md_settings_rec_t *last = NULL;
+    /* Newest valid record of EITHER vintage wins. Words 0..6 of an MDT4
+     * record carry the MDT3 meanings, so `last` reads the shared fields
+     * from both; `last4` is non-NULL only when the winner is MDT4. MDT4
+     * candidates live at even 32 B slots only (64 B records); a matched
+     * one skips the slot holding its second half, whose bytes could
+     * otherwise be misread as a record head. */
+    const md_settings_rec_t  *last  = NULL;
+    const md_settings_rec4_t *last4 = NULL;
 
     for (uint32_t i = 0U; i < MD_SETTINGS_SLOTS; i++) {
         const md_settings_rec_t *r = md_settings_slot(i);
-        if (r->magic == MD_SETTINGS_MAGIC && r->check == md_settings_check(r))
-            last = r;                        /* newest valid record wins     */
+        if ((i & 1U) == 0U && r->magic == MD_SETTINGS_MAGIC4) {
+            const md_settings_rec4_t *r4 = (const md_settings_rec4_t *)r;
+            if (r4->check == md_settings_check4(r4)) {
+                last  = r;
+                last4 = r4;
+                i++;                         /* skip the record's tail half  */
+            }
+            continue;
+        }
+        if (r->magic == MD_SETTINGS_MAGIC && r->check == md_settings_check(r)) {
+            last  = r;                       /* newest valid record wins     */
+            last4 = NULL;
+        }
     }
 
     if (md_settings_ecc_fault) {
@@ -518,13 +731,43 @@ void MD_Load_Settings(void)
                  last->coil_offset_right_mm <=  MD_COIL_OFFSET_MM_LIMIT)
                 ? last->coil_offset_right_mm : 0;
         }
+        if (last4) {
+            /* Per-channel table + mode, each value re-clamped like the
+             * shared fields (a foreign record must not arm a slot with an
+             * out-of-range timeline). */
+            for (uint32_t k = 0U; k < 8U; k++) {
+                md_ch_bl_us[k] = (last4->ch_bl_us[k] <= MD_BLANKING_MAX_US)
+                                 ? last4->ch_bl_us[k] : (uint8_t)MD_BLANKING_MAX_US;
+                md_ch_rx_us[k] = (last4->ch_rx_us[k] >= 1U &&
+                                  last4->ch_rx_us[k] <= MD_RX_WINDOW_MAX_US)
+                                 ? last4->ch_rx_us[k] : (uint8_t)MD_RX_WINDOW_US;
+                md_ch_tx_us[k] = (last4->ch_tx_us[k] >= MD_TX_PULSE_MIN_US &&
+                                  last4->ch_tx_us[k] <= MD_TX_PULSE_MAX_US)
+                                 ? last4->ch_tx_us[k] : (uint8_t)MD_TX_PULSE_US;
+            }
+            md_raster = (((last4->blanking_us >> 24) & 0xFFU) == 1U) ? 1U : 0U;
+        } else {
+            md_table_seed();                 /* legacy record: table = globals */
+            md_raster = 0U;
+        }
+        if (md_raster && !md_raster_apply()) {
+            /* Foreign/stale combo: sweep doesn't fit the sample interval.
+             * Fall back to all-at-once rather than guessing which knob to
+             * clamp; the table survives for after a rate change. */
+            md_raster = 0U;
+            printf("# raster from saved settings does not fit the sample rate -- starting in all mode\r\n");
+        } else if (!md_raster) {
+            (void)md_raster_apply();         /* best-effort slot period      */
+        }
         printf("# settings loaded: blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  sample_rate=%luHz\r\n",
                md_blanking_us, md_rx_window_us, md_tx_pulse_us, md_coil_spacing_mm,
                md_sample_rate_hz());
     } else {
         /* Nothing valid in flash (new board, or the page was just purged
          * after an ECC fault): persist the compile-time defaults so the
-         * unit always carries a valid record. 'D' re-writes them on demand. */
+         * unit always carries a valid record. CLEAR re-writes them on demand. */
+        md_table_seed();
+        (void)md_raster_apply();
         printf("# no saved settings -- writing defaults: blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  sample_rate=%luHz\r\n",
                md_blanking_us, md_rx_window_us, md_tx_pulse_us, md_coil_spacing_mm,
                md_sample_rate_hz());
@@ -543,37 +786,54 @@ void MD_Save_Settings(void)
     /* A cycle started just before the disable may still be in flight; the
      * flash stall would defer its ADC kick too, sampling integrators that
      * drooped for the whole operation (~22 ms on a page erase). Wait it
-     * out: a full cycle is ~150 us, the tick bound is a safety valve. The
-     * TIM1 UIF term covers a kick that is pended but not yet taken. */
+     * out: a full cycle is well under 1 ms, the tick bound is a safety
+     * valve. The TIM1/TIM8 UIF terms cover a kick that is pended but not
+     * yet taken (TIM8 kicks Set B slots in raster mode). */
     uint32_t t0 = HAL_GetTick();
     while ((((TIM2->CR1 | TIM3->CR1 | TIM1->CR1 | TIM8->CR1) & TIM_CR1_CEN)
-            || (TIM1->SR & TIM_SR_UIF)
+            || (TIM1->SR & TIM_SR_UIF) || (TIM8->SR & TIM_SR_UIF)
             || md_adc_done_mask != 0x0FU)
            && (HAL_GetTick() - t0) < 2U) {}
 
-    /* First fully-erased slot; page full -> erase and restart at slot 0. */
+    /* A raster sweep frozen mid-way (its remaining slots pend behind the
+     * disabled pacer) resumes with a flash-op-sized hole in its slot
+     * spacing — drop the frame instead of publishing one with lying skew.
+     * The pacer IRQ is off, so md_sweep_ok is ours to write here. */
+    if (md_raster && md_slot != 0U)
+        md_sweep_ok = 0U;
+
+    /* First fully-erased 64 B (even-32B-slot-aligned) region; legacy 32 B
+     * records occupying half a region make it non-erased, so mixed pages
+     * from an MDT3-era board just appear fuller. Page full -> erase. */
     uint32_t slot = MD_SETTINGS_SLOTS;
-    for (uint32_t i = 0U; i < MD_SETTINGS_SLOTS && slot == MD_SETTINGS_SLOTS; i++) {
+    for (uint32_t i = 0U; i < MD_SETTINGS_SLOTS && slot == MD_SETTINGS_SLOTS;
+         i += 2U) {
         const uint32_t *w = (const uint32_t *)md_settings_slot(i);
         uint32_t j;
-        for (j = 0U; j < 8U; j++)
+        for (j = 0U; j < 16U; j++)
             if (w[j] != 0xFFFFFFFFU)
                 break;
-        if (j == 8U)
+        if (j == 16U)
             slot = i;
     }
 
-    md_settings_rec_t rec;
+    md_settings_rec4_t rec;
     memset(&rec, 0xFF, sizeof(rec));
-    rec.magic                = MD_SETTINGS_MAGIC;
-    rec.blanking_us          = md_blanking_us;
+    rec.magic                = MD_SETTINGS_MAGIC4;
+    rec.blanking_us          = md_blanking_us
+                             | ((uint32_t)(md_raster ? 1U : 0U) << 24);
     rec.rx_window_us         = md_rx_window_us
                              | ((uint32_t)md_samples_per_period << 8);
     rec.tx_pulse_us          = md_tx_pulse_us;
     rec.coil_spacing_mm      = md_coil_spacing_mm;
     rec.coil_offset_fore_mm  = md_coil_offset_fore_mm;
     rec.coil_offset_right_mm = md_coil_offset_right_mm;
-    rec.check                = md_settings_check(&rec);
+    for (uint32_t k = 0U; k < 8U; k++) {
+        rec.ch_bl_us[k] = md_ch_bl_us[k];
+        rec.ch_rx_us[k] = md_ch_rx_us[k];
+        rec.ch_tx_us[k] = md_ch_tx_us[k];
+    }
+    rec.check                = md_settings_check4(&rec);
 
     HAL_FLASH_Unlock();
 
@@ -601,8 +861,8 @@ void MD_Save_Settings(void)
 
     HAL_StatusTypeDef st = HAL_OK;
     const uint64_t *src = (const uint64_t *)&rec;
-    uint32_t dst = MD_SETTINGS_PAGE_ADDR + slot * sizeof(rec);
-    for (uint32_t i = 0U; i < 4U && st == HAL_OK; i++)
+    uint32_t dst = MD_SETTINGS_PAGE_ADDR + slot * sizeof(md_settings_rec_t);
+    for (uint32_t i = 0U; i < 8U && st == HAL_OK; i++)
         st = HAL_FLASH_Program(FLASH_TYPEPROGRAM_DOUBLEWORD,
                                dst + 8U * i, src[i]);
 
@@ -617,15 +877,15 @@ void MD_Save_Settings(void)
     HAL_FLASH_Lock();
     HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
 
-    const md_settings_rec_t *r = md_settings_slot(slot);
-    if (st == HAL_OK && r->magic == MD_SETTINGS_MAGIC
-        && r->check == md_settings_check(r))
+    const md_settings_rec4_t *r = (const md_settings_rec4_t *)md_settings_slot(slot);
+    if (st == HAL_OK && r->magic == MD_SETTINGS_MAGIC4
+        && r->check == md_settings_check4(r))
         printf("# saved (slot %lu/%u): blanking=%luus  rx_window=%luus  tx_pulse=%luus  coil_spacing=%lumm  sample_rate=%luHz\r\n",
-               slot, (unsigned)MD_SETTINGS_SLOTS,
+               slot / 2U, (unsigned)MD_SETTINGS_SLOTS4,
                md_blanking_us, md_rx_window_us, md_tx_pulse_us, md_coil_spacing_mm,
                md_sample_rate_hz());
     else
-        printf("# save FAILED: program/verify at slot %lu\r\n", slot);
+        printf("# save FAILED: program/verify at slot %lu\r\n", slot / 2U);
 }
 
 /* ---------------------------------------------------------------------------
@@ -638,14 +898,53 @@ void md_print_info(void)
     printf("# info fw=%s gps_ver=%s gps_id=%s"
            " blanking_us=%lu rx_window_us=%lu tx_pulse_us=%lu"
            " coil_spacing_mm=%lu coil_offset_fore_mm=%ld coil_offset_right_mm=%ld"
-           " sample_rate_hz=%lu adc_oversample=16 adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14\r\n",
+           " sample_rate_hz=%lu adc_oversample=16 adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14"
+           " detector_mode=%s slot_us=%u"
+           " bl8=%u,%u,%u,%u,%u,%u,%u,%u"
+           " rx8=%u,%u,%u,%u,%u,%u,%u,%u"
+           " tx8=%u,%u,%u,%u,%u,%u,%u,%u\r\n",
            FW_GIT_HASH,
            gps_version_str[0] ? gps_version_str : "?",
            gps_uniqid_str[0]  ? gps_uniqid_str  : "?",
            md_blanking_us, md_rx_window_us, md_tx_pulse_us,
            md_coil_spacing_mm,
            (long)md_coil_offset_fore_mm, (long)md_coil_offset_right_mm,
-           md_sample_rate_hz());
+           md_sample_rate_hz(),
+           md_raster ? "raster" : "all",
+           (unsigned)md_slot_ticks * 100U,
+           md_ch_bl_us[0], md_ch_bl_us[1], md_ch_bl_us[2], md_ch_bl_us[3],
+           md_ch_bl_us[4], md_ch_bl_us[5], md_ch_bl_us[6], md_ch_bl_us[7],
+           md_ch_rx_us[0], md_ch_rx_us[1], md_ch_rx_us[2], md_ch_rx_us[3],
+           md_ch_rx_us[4], md_ch_rx_us[5], md_ch_rx_us[6], md_ch_rx_us[7],
+           md_ch_tx_us[0], md_ch_tx_us[1], md_ch_tx_us[2], md_ch_tx_us[3],
+           md_ch_tx_us[4], md_ch_tx_us[5], md_ch_tx_us[6], md_ch_tx_us[7]);
+}
+
+/* Raster-state echo — printed on any mode/selection/table change. Same
+ * token names as the info line (the daemon tracks them as <key>_current
+ * and flags mid-study drift), plus ch= for the UI's selector state. The
+ * legacy '# blanking=..' echo keys are deliberately absent: those are the
+ * all-at-once globals, unchanged by raster edits, and reusing their names
+ * here would spam the daemon's drift tracking. */
+static void md_print_rastercfg(void)
+{
+    char sel[4] = "all";
+    if (md_sel_ch != MD_SEL_ALL) {
+        sel[0] = (char)('0' + md_sel_ch);
+        sel[1] = '\0';
+    }
+    printf("# rastercfg detector_mode=%s slot_us=%u ch=%s"
+           " bl8=%u,%u,%u,%u,%u,%u,%u,%u"
+           " rx8=%u,%u,%u,%u,%u,%u,%u,%u"
+           " tx8=%u,%u,%u,%u,%u,%u,%u,%u\r\n",
+           md_raster ? "raster" : "all",
+           (unsigned)md_slot_ticks * 100U, sel,
+           md_ch_bl_us[0], md_ch_bl_us[1], md_ch_bl_us[2], md_ch_bl_us[3],
+           md_ch_bl_us[4], md_ch_bl_us[5], md_ch_bl_us[6], md_ch_bl_us[7],
+           md_ch_rx_us[0], md_ch_rx_us[1], md_ch_rx_us[2], md_ch_rx_us[3],
+           md_ch_rx_us[4], md_ch_rx_us[5], md_ch_rx_us[6], md_ch_rx_us[7],
+           md_ch_tx_us[0], md_ch_tx_us[1], md_ch_tx_us[2], md_ch_tx_us[3],
+           md_ch_tx_us[4], md_ch_tx_us[5], md_ch_tx_us[6], md_ch_tx_us[7]);
 }
 
 /* Console key map — printed at boot so the bindings are on screen for
@@ -656,6 +955,8 @@ void md_print_keys(void)
     printf("# keys: a/z blanking +-1us (0..200)    s/x rx window +-1us (1..50)\r\n"
            "# keys: f/v tx pulse +-1us (10..120)   d/c coil spacing +-10mm (50..5000)\r\n"
            "# keys: g/b sample rate up/down (20/40/100/200/500 Hz)\r\n"
+           "# keys: r raster/all mode   0-7 select channel, 8 selects all\r\n"
+           "# keys: (raster: a/z s/x f/v edit the selected channel's slot timing)\r\n"
            "# keys: SAVE+enter save settings   CLEAR+enter restore defaults+save\r\n"
            "# keys: I info   G gps passthrough\r\n");
 }
@@ -664,6 +965,16 @@ void md_print_keys(void)
  * CLEAR command — was the single-key 'D'). */
 static void md_restore_defaults(void)
 {
+    /* Mode OFF before the rate write: the pacer IRQ is still live here (it
+     * only stops inside MD_Save_Settings), and its sweep-wrap arm computes
+     * interval - 7*slot_ticks under the fit invariant that raster mode
+     * maintains. An expiry landing between a new (higher) rate and the
+     * raster clear would see a shrunken interval with the old slot_ticks
+     * and underflow that subtraction (16-bit ARR truncation -> multi-
+     * second stall on a GPS-less bench). Raster cleared first, the same
+     * expiry just runs one simultaneous cycle at the old cadence. */
+    md_raster               = 0U;
+    md_sel_ch               = MD_SEL_ALL;
     md_blanking_us          = MD_BLANKING_US;
     md_rx_window_us         = MD_RX_WINDOW_US;
     md_tx_pulse_us          = MD_TX_PULSE_US;
@@ -671,7 +982,14 @@ static void md_restore_defaults(void)
     md_coil_offset_fore_mm  = 0;
     md_coil_offset_right_mm = MD_COIL_OFFSET_RIGHT_MM_DEFAULT;
     md_samples_per_period   = MD_SAMPLES_PER_GPS_PERIOD;
+    md_table_seed();
+    (void)md_raster_apply();
     printf("# defaults restored\r\n");
+    /* CLEAR is a mode + selection + table change like any other — without
+     * this echo the daemon's <key>_current / raster_sel meta (and so the
+     * raw view's panel) would keep describing the pre-CLEAR raster state:
+     * the saved banner below carries only the legacy global tokens. */
+    md_print_rastercfg();
     MD_Save_Settings();
 }
 
@@ -705,6 +1023,8 @@ void md_console_poll(void)
     int geom_changed = 0;
     int tx_changed = 0;
     int rate_changed = 0;
+    int ras_changed = 0;
+    int ras_warn = 0;
     /* Flash writes are word-gated: SAVE+Enter saves, CLEAR+Enter restores
      * defaults and saves. A single stray byte (RX crosstalk from the host's
      * other data line lands as valid-looking key bytes) can never commit to
@@ -738,24 +1058,84 @@ void md_console_poll(void)
             if (used)
                 continue;
         }
-        if      (ch == 'a') { if (md_blanking_us < MD_BLANKING_MAX_US) md_blanking_us += 1U;            changed = 1; }
-        else if (ch == 'z') { md_blanking_us  = (md_blanking_us  > 1U) ? md_blanking_us - 1U : 0U;      changed = 1; }
-        else if (ch == 's') { if (md_rx_window_us < MD_RX_WINDOW_MAX_US) md_rx_window_us += 1U;         changed = 1; }
-        else if (ch == 'x') { md_rx_window_us = (md_rx_window_us > 1U) ? md_rx_window_us - 1U : 1U;     changed = 1; }
+        if (ch == 'a' || ch == 'z' || ch == 's' || ch == 'x'
+            || ch == 'f' || ch == 'v') {
+            if (md_raster) {
+                /* Route the edit to the per-channel table (selected channel,
+                 * or all 8 in lockstep). An increase that would stretch the
+                 * sweep past the sample interval is reverted whole — the
+                 * snapshot matters for 'all' edits, where clamped channels
+                 * must not walk on a naive undo. */
+                int up = (ch == 'a' || ch == 's' || ch == 'f');
+                volatile uint8_t *tab;
+                uint32_t lo, hi;
+                if (ch == 'a' || ch == 'z') {
+                    tab = md_ch_bl_us; lo = 0U; hi = MD_BLANKING_MAX_US;
+                } else if (ch == 's' || ch == 'x') {
+                    tab = md_ch_rx_us; lo = 1U; hi = MD_RX_WINDOW_MAX_US;
+                } else {
+                    tab = md_ch_tx_us; lo = MD_TX_PULSE_MIN_US; hi = MD_TX_PULSE_MAX_US;
+                }
+                uint8_t snap[8];
+                md_table_copy(snap, tab);
+                if (md_table_adj(tab, up ? 1 : -1, lo, hi)) {
+                    if (md_raster_apply()) {
+                        ras_changed = 1;
+                    } else {
+                        md_table_restore(tab, snap);
+                        ras_warn = 1;
+                    }
+                }
+            }
+            else if (ch == 'a') { if (md_blanking_us < MD_BLANKING_MAX_US) md_blanking_us += 1U;         changed = 1; }
+            else if (ch == 'z') { md_blanking_us  = (md_blanking_us  > 1U) ? md_blanking_us - 1U : 0U;   changed = 1; }
+            else if (ch == 's') { if (md_rx_window_us < MD_RX_WINDOW_MAX_US) md_rx_window_us += 1U;      changed = 1; }
+            else if (ch == 'x') { md_rx_window_us = (md_rx_window_us > 1U) ? md_rx_window_us - 1U : 1U;  changed = 1; }
+            else if (ch == 'f') { if (md_tx_pulse_us < MD_TX_PULSE_MAX_US) md_tx_pulse_us += 1U;         tx_changed = 1; }
+            else                { if (md_tx_pulse_us > MD_TX_PULSE_MIN_US) md_tx_pulse_us -= 1U;         tx_changed = 1; }
+        }
         else if (ch == 'd') { if (md_coil_spacing_mm < MD_COIL_SPACING_MM_MAX) md_coil_spacing_mm += 10U; geom_changed = 1; }
         else if (ch == 'c') { if (md_coil_spacing_mm > MD_COIL_SPACING_MM_MIN) md_coil_spacing_mm -= 10U; geom_changed = 1; }
-        else if (ch == 'f') { if (md_tx_pulse_us < MD_TX_PULSE_MAX_US) md_tx_pulse_us += 1U;            tx_changed = 1; }
-        else if (ch == 'v') { if (md_tx_pulse_us > MD_TX_PULSE_MIN_US) md_tx_pulse_us -= 1U;            tx_changed = 1; }
         else if (ch == 'g' || ch == 'b') {
             /* Step through the divisor list — the pacer picks the new
-             * interval up at its next arm; the next fix re-syncs fully. */
+             * interval up at its next arm; the next fix re-syncs fully.
+             * In raster mode a step whose interval can't hold the sweep is
+             * refused (the echo still confirms the unchanged rate). */
             uint32_t i = 0U;
             while (i < MD_RATE_STEPS - 1U && md_rate_steps[i] != md_samples_per_period)
                 i++;
-            if (ch == 'g' && i < MD_RATE_STEPS - 1U) i++;
-            else if (ch == 'b' && i > 0U) i--;
-            md_samples_per_period = md_rate_steps[i];
+            uint32_t ni = i;
+            if (ch == 'g' && i < MD_RATE_STEPS - 1U) ni = i + 1U;
+            else if (ch == 'b' && i > 0U) ni = i - 1U;
+            if (ni != i && !md_raster_rate_ok(md_rate_steps[ni]))
+                ras_warn = 1;
+            else
+                md_samples_per_period = md_rate_steps[ni];
             rate_changed = 1;
+        }
+        else if (ch >= '0' && ch <= '8') {
+            md_sel_ch = (uint8_t)(ch - '0');   /* '8' = all channels */
+            ras_changed = 1;
+        }
+        else if (ch == 'r') {
+            if (md_raster) {
+                /* Back to all-at-once: nothing to restore — the globals were
+                 * never touched by raster edits and md_adc_kick reprograms
+                 * the pair JSQRs itself. A sweep in flight is abandoned (one
+                 * tick gap). */
+                md_raster = 0U;
+                md_fix_defer_ticks = 0U;
+                ras_changed = 1;
+            } else if (md_raster_apply()) {
+                md_slot     = 0U;   /* ordered before the mode flag: the pacer
+                                       reads slot state only when raster is on */
+                md_sweep_ok = 0U;
+                md_fix_defer_ticks = 0U;
+                md_raster   = 1U;
+                ras_changed = 1;
+            } else {
+                ras_warn = 1;       /* sweep wouldn't fit the sample interval */
+            }
         }
         else if (ch == 'I') { md_print_info(); }
         else if (ch == 'G') {
@@ -774,6 +1154,11 @@ void md_console_poll(void)
     if (rate_changed)
         printf("# sample_rate=%luHz (%u per fix)\r\n",
                md_sample_rate_hz(), md_samples_per_period);
+    if (ras_changed)
+        md_print_rastercfg();
+    if (ras_warn)
+        printf("# raster limit: 8 slots of %uus must fit the %luus sample interval -- lower rate or shrink timings\r\n",
+               (unsigned)md_slot_ticks * 100U, md_interval_ticks() * 100U);
 }
 
 /* Common one-pulse timebase setup: 170 MHz ticks, given end-of-timeline. */
@@ -798,6 +1183,14 @@ static void md_pace_init(void);   /* TIM7 cycle pacer — defined below */
 void MD_Hardware_Init(void)
 {
     MD_Load_Settings();   /* apply saved timing before first cycle */
+
+    /* Boot raster-state echo. An MCU reset mid-study reverts RAM state
+     * (channel selection to 'all'; mode/tables to the saved record) while
+     * the daemon keeps the port — without this line its <key>_current and
+     * raster_sel meta would keep describing the pre-reset state, and the
+     * raw view would highlight one channel while edits hit all 8. The
+     * info line can't carry it: ch= is live UI state, not a header key. */
+    md_print_rastercfg();
 
     const uint32_t tx_arr  = md_tx_pulse_us * MD_TICKS_PER_US;
     const uint32_t aux_arr = (md_tx_pulse_us + md_blanking_us + md_rx_window_us)
@@ -898,26 +1291,82 @@ uint8_t md_start_cycle(void)
     md_arm_set(&md_set_a, tx_arr, aux_ccr, aux_arr);
     md_arm_set(&md_set_b, tx_arr, aux_ccr, aux_arr);
 
+    md_cycle_raster = 0U;
     md_ts_cen = dwt_cyccnt();
     TIM2->CR1 |= TIM_CR1_CEN;      /* master + all armed slaves start here   */
+    return 1U;
+}
+
+/* Park one set for a raster slot it doesn't own: every output forced
+ * inactive (coils don't fire, integrators stay reset, RX disconnected —
+ * the same refs as the between-cycles idle state). The timers still RUN —
+ * they are trigger-slaved to TIM2 and start with it regardless — so they
+ * get the slot's ARRs to run out quietly; their UIE is filtered in the
+ * handlers below instead of churning DIER per slot. */
+static void md_park_set(md_set_t *s, uint32_t tx_arr, uint32_t aux_arr)
+{
+    s->tx->ARR  = tx_arr;
+    s->opm->ARR = aux_arr;
+    md_oc_mode(s->tx, 1, MD_OCM_FORCE_INACT);
+    md_oc_mode(s->opm, s->gain_ch,  MD_OCM_FORCE_INACT);
+    md_oc_mode(s->opm, s->integ_ch, MD_OCM_FORCE_INACT);
+    md_oc_mode(s->opm, s->rx_ch,    MD_OCM_FORCE_INACT);
+}
+
+/* ============================================================================
+ * md_start_slot  (raster mode; called from the TIM7 pacer IRQ)
+ * One channel's private cycle: its bus fires with its own {tx, bl, rx},
+ * the other bus is parked, and only its ADC channel converts. Same
+ * hardware-trigger start and same overlap guard as md_start_cycle.
+ * ========================================================================== */
+static uint8_t md_start_slot(uint32_t k)
+{
+    if (((TIM2->CR1 | TIM3->CR1 | TIM1->CR1 | TIM8->CR1) & TIM_CR1_CEN)
+        || md_adc_done_mask != 0x0FU)
+        return 0U;            /* previous slot (timers or ADC) still running */
+
+    uint32_t tx = md_ch_tx_us[k];
+    uint32_t bl = md_ch_bl_us[k];
+    uint32_t rx = md_ch_rx_us[k];
+    uint32_t tx_arr  = tx * MD_TICKS_PER_US;
+    uint32_t aux_ccr = (tx + bl) * MD_TICKS_PER_US + 1U;
+    uint32_t aux_arr = (tx + bl + rx) * MD_TICKS_PER_US;
+
+    md_set_t *fire = MD_CH_SET_B(k) ? &md_set_b : &md_set_a;
+    md_set_t *idle = MD_CH_SET_B(k) ? &md_set_a : &md_set_b;
+
+    md_arm_set(fire, tx_arr, aux_ccr, aux_arr);
+    md_park_set(idle, tx_arr, aux_arr);
+
+    md_slot_ch = (uint8_t)k;       /* settles long before the UIE reads it   */
+    md_cycle_raster = 1U;
+
+    md_ts_cen = dwt_cyccnt();
+    TIM2->CR1 |= TIM_CR1_CEN;      /* master clock runs every slot; only the
+                                      firing set's outputs are armed         */
     return 1U;
 }
 
 /* ============================================================================
  * OPM expiry (UIE at end of RX window). Every critical edge this cycle
  * already happened in hardware — the RX disconnect was the PWM2 self-clear
- * at this same update event. TIM1 runs the timeline in every fire mode, so
- * its UIE does the cycle-wide work: start all four ADC injected sequences.
+ * at this same update event. All-at-once: TIM1's UIE starts all four ADC
+ * sequences. Raster: both aux timers run every slot with the same ARR, so
+ * both UIEs fire — only the set that owns the slot's channel kicks.
  * ========================================================================== */
 void md_tim1_uie_fired(void)
 {
     md_ts_opm = dwt_cyccnt();
-    md_adc_kick();
+    if (!md_cycle_raster)
+        md_adc_kick();
+    else if (!MD_CH_SET_B(md_slot_ch))
+        md_adc_kick_one();
 }
 
 void md_tim8_uie_fired(void)
 {
-    /* nothing — TIM1's UIE covers the cycle; kept for future per-set work */
+    if (md_cycle_raster && MD_CH_SET_B(md_slot_ch))
+        md_adc_kick_one();
 }
 
 /* ============================================================================
@@ -929,23 +1378,33 @@ void md_tim8_uie_fired(void)
  * can interleave, but every interleaving still leaves the timer armed —
  * worst case is one odd first interval, re-synced by the next fix.)
  * ========================================================================== */
-#define MD_PACE_TICKS_PER_MS 10U
-
 /* An expiry that lands while the other arm site runs (equal priority, so
  * it can only pend, never preempt) is superseded by this re-arm: clearing
  * SR alone is not enough — the NVIC latches pending on the UIF edge and
  * only exception entry or an ICPR write releases it. The SR readback
  * orders the flag clear ahead of the pend clear so the still-asserted
  * line can't re-latch. */
-static void md_pace_arm(uint32_t ms)
+static void md_pace_arm_ticks(uint32_t ticks)
 {
+    /* Floor 2, not 1: ARR gets ticks-1, and a basic timer's counter is
+     * BLOCKED while ARR == 0 (RM0440) — a 1-tick arm would park TIM7 dead
+     * until the next GGA happens to re-arm it (forever on a GPS-less
+     * bench). No caller legitimately wants 1 tick: every path arms at
+     * least one slot period (>= 2 ticks) or >= 1 ms (10 ticks). */
+    if (ticks < 2U)
+        ticks = 2U;
     TIM7->CR1 &= ~TIM_CR1_CEN;
-    TIM7->ARR  = ms * MD_PACE_TICKS_PER_MS - 1U;
+    TIM7->ARR  = ticks - 1U;
     TIM7->EGR  = TIM_EGR_UG;   /* latch ARR, reset CNT (URS: no UIF)   */
     TIM7->SR   = 0U;           /* drop a stale expiry UIF              */
     (void)TIM7->SR;            /* drain the posted SR write            */
     HAL_NVIC_ClearPendingIRQ(TIM7_DAC_IRQn);
     TIM7->CR1 |= TIM_CR1_CEN;
+}
+
+static void md_pace_arm(uint32_t ms)
+{
+    md_pace_arm_ticks(ms * MD_PACE_TICKS_PER_MS);
 }
 
 static void md_pace_init(void)
@@ -964,8 +1423,18 @@ static void md_pace_init(void)
 
 void md_pace_on_fix(void)
 {
-    md_pace_arm(MD_GPS_PERIOD_MS / md_samples_per_period
-                - MD_SAMPLE_LEAD_MS);
+    uint32_t ticks = md_interval_ticks()
+                     - MD_SAMPLE_LEAD_MS * MD_PACE_TICKS_PER_MS;
+    if (md_raster && md_slot != 0U) {
+        /* Mid-sweep: re-arming now would cut the slot cadence (and the
+         * frame's promised skew). Defer to the sweep-boundary arm, which
+         * subtracts the slots that fired in between. */
+        md_fix_defer_slot  = md_slot;
+        md_fix_defer_ticks = ticks;
+        return;
+    }
+    md_fix_defer_ticks = 0U;
+    md_pace_arm_ticks(ticks);
 }
 
 void md_pace_fired(void)
@@ -973,21 +1442,80 @@ void md_pace_fired(void)
     if ((TIM7->SR & TIM_SR_UIF) == 0U)
         return;                             /* superseded expiry (see arm) */
     TIM7->SR = 0U;                          /* clear UIF */
-    /* Every fire consumes a tick, started or not: a skipped slot (previous
-     * cycle still in flight — never happens at a 2 ms interval vs ~185 us
-     * cycles, but the guard stands) leaves a tick gap instead of quietly
-     * relabeling time. The in-flight number is set only on a real start
-     * so a frame still converting keeps its own tick. */
-    uint32_t tick = md_sample_tick + 1U;
-    md_sample_tick = tick;
-    if (md_start_cycle())
-        md_tick_inflight = tick;
-    /* Re-arm at the sample interval unconditionally. A valid fix re-syncs
-     * the phase (md_pace_on_fix, arming interval-minus-lead); without one
-     * the stream free-runs at the same interval — full rate for bench
-     * work with no GPS attached, and the front end keeps its field
-     * thermal duty cycle (see the cadence contract in metal_detector.h). */
-    md_pace_arm(MD_GPS_PERIOD_MS / md_samples_per_period);
+
+    if (!md_raster) {
+        /* Every fire consumes a tick, started or not: a skipped slot
+         * (previous cycle still in flight — never happens at a 2 ms
+         * interval vs ~185 us cycles, but the guard stands) leaves a tick
+         * gap instead of quietly relabeling time. The in-flight number is
+         * set only on a real start so a frame still converting keeps its
+         * own tick. */
+        uint32_t tick = md_sample_tick + 1U;
+        md_sample_tick = tick;
+        if (md_start_cycle())
+            md_tick_inflight = tick;
+        /* Re-arm at the sample interval unconditionally. A valid fix
+         * re-syncs the phase (md_pace_on_fix, arming interval-minus-lead);
+         * without one the stream free-runs at the same interval — full
+         * rate for bench work with no GPS attached, and the front end
+         * keeps its field thermal duty cycle (see the cadence contract in
+         * metal_detector.h). */
+        md_pace_arm_ticks(md_interval_ticks());
+        return;
+    }
+
+    /* Raster: one tick per SWEEP (the frame keeps today's cadence and the
+     * host's tick math is untouched); the 8 slots ride TIM7 re-arms at the
+     * fixed slot period, so value k is measured k*slot_period after the
+     * sweep start — the deterministic skew the host corrects for. A slot
+     * that finds the previous one still running (budget overrun) kills
+     * the sweep: no frame, tick gap, remaining slots skipped (no point
+     * heating coils for a frame that won't publish). */
+    if (md_slot == 0U) {
+        uint32_t tick = md_sample_tick + 1U;
+        md_sample_tick = tick;
+        md_sweep_ok = md_start_slot(0U);
+        if (md_sweep_ok)
+            md_tick_inflight = tick;
+        md_slot = 1U;
+        md_pace_arm_ticks(md_slot_ticks);
+        return;
+    }
+
+    if (md_sweep_ok && !md_start_slot(md_slot))
+        md_sweep_ok = 0U;
+    md_slot++;
+    if (md_slot < 8U) {
+        md_pace_arm_ticks(md_slot_ticks);
+        return;
+    }
+
+    /* Slot 7 just fired: arm the remainder of the sample interval (the
+     * fit check guarantees interval >= 8 slots, so this never underflows
+     * below one slot), or apply a fix resync that landed mid-sweep. */
+    md_slot = 0U;
+    if (md_fix_defer_ticks != 0U) {
+        uint32_t elapsed = (8U - (uint32_t)md_fix_defer_slot)
+                           * (uint32_t)md_slot_ticks;
+        uint32_t arm = (md_fix_defer_ticks > elapsed)
+                       ? md_fix_defer_ticks - elapsed : 0U;
+        /* Floor at one slot period, not 1 tick. A fix that landed early in
+         * the sweep can leave elapsed >= the deferred delay (at 500 Hz the
+         * defer is 10 ticks and a fix in slots 1-3 gives elapsed >= 10) —
+         * and slot 7's cycle is still RUNNING for most of its slot, so an
+         * earlier arm would fire into md_start_slot's overlap guard, zero
+         * md_sweep_ok, and (the flag spanning the boundary) drop the sweep
+         * that just completed along with the new one. One slot period is
+         * exactly the spacing slot 7 needs; the residual phase error
+         * (< 1 slot) is healed by the next fix ~50 ms later. */
+        if (arm < (uint32_t)md_slot_ticks)
+            arm = (uint32_t)md_slot_ticks;
+        md_fix_defer_ticks = 0U;
+        md_pace_arm_ticks(arm);
+    } else {
+        md_pace_arm_ticks(md_interval_ticks()
+                          - 7U * (uint32_t)md_slot_ticks);
+    }
 }
 
 /* ============================================================================
@@ -1000,6 +1528,34 @@ static void md_adc_collect(uint32_t i)
     const md_adc_pair_t *p = &md_adc_pairs[i];
 
     p->adc->ISR = ADC_ISR_JEOS | ADC_ISR_JEOC;          /* clear flags       */
+
+    if (md_kick_raster) {
+        /* Raster slot: one conversion, one channel. Release gain+integ on
+         * the firing set (the parked set is already forced inactive) and
+         * publish the frame only when slot 7 completes a clean sweep. */
+        uint32_t k = md_slot_ch;
+        md_adc[k] = (uint16_t)p->adc->JDR1;
+        md_adc_done_mask = 0x0FU;
+        md_set_t *s = MD_CH_SET_B(k) ? &md_set_b : &md_set_a;
+        md_oc_mode(s->opm, s->gain_ch,  MD_OCM_FORCE_INACT);
+        md_oc_mode(s->opm, s->integ_ch, MD_OCM_FORCE_INACT);
+        if (k == 7U && md_sweep_ok) {
+            md_cycle_count++;
+            uint32_t head = md_frame_head;
+            if (head - md_frame_tail < MD_FRAME_RING) {
+                md_frame_t *f = &md_frame_ring[head & (MD_FRAME_RING - 1U)];
+                f->tick = md_tick_inflight;
+                for (uint32_t j = 0U; j < MD_ADC_COUNT; j++)
+                    f->adc[j] = md_adc[j];
+                md_frame_head = head + 1U;
+            } else {
+                md_frame_overruns++;
+            }
+            md_tick_completed = md_tick_inflight;
+        }
+        return;
+    }
+
     md_adc[p->idx]      = (uint16_t)p->adc->JDR1;
     md_adc[p->idx + 1U] = (uint16_t)p->adc->JDR2;
 

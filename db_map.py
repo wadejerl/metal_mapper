@@ -35,6 +35,7 @@ import math
 import os
 import re
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -78,7 +79,20 @@ DEFAULT_CONFIG = {
     # heading aligned to the antenna baseline instead of direction of travel.
     # A property of the vehicle mounting, so it lives here, not per study.
     'heading_offset_deg': 270,
+    # rsync destination for the studies hub (the RTK base Pi), e.g.
+    # 'rsync://northpole:8730/mm_studies'. Empty = sync disabled;
+    # sync_studies.sh (run by jlw_mm_sync.timer) reads it from here.
+    'sync_hub': '',
 }
+
+# This unit's identity in filenames. New study ids end in '__<tag>' and dig
+# targets flagged here go to '<study>.targets__<tag>.json' — ownership that
+# sync_studies.sh routes by. The tag can never contain '_' (sanitized to
+# '-'), so the trailing '__<tag>' token is unambiguous even in ids whose
+# user-chosen name part contains '__'. MM_HOST_TAG is a test hook.
+HOST_TAG = (os.environ.get('MM_HOST_TAG')
+            or re.sub(r'[^A-Za-z0-9-]', '-',
+                      socket.gethostname().split('.')[0]) or 'unit')
 
 # CLI overrides (bench runs); never written back to config.json.
 _cli_overrides = {}
@@ -100,6 +114,9 @@ def load_config():
     for key in ('serial_port', 'nav_host', 'studies_dir'):
         if not isinstance(cfg.get(key), str) or not cfg[key]:
             cfg[key] = DEFAULT_CONFIG[key]
+    # sync_hub: empty means disabled, so '' is a legitimate value here.
+    if not isinstance(cfg.get('sync_hub'), str):
+        cfg['sync_hub'] = ''
     try:
         cfg['nav_port'] = int(cfg['nav_port'])
         if not (0 < cfg['nav_port'] <= 65535):
@@ -336,24 +353,33 @@ def load_columns(db_path):
     fills typed arrays straight from these; dict-per-point at 20 Hz study
     sizes is megabytes of JSON key overhead and object churn on both ends.
     adc is 8 arrays (one per channel), values raw counts. Only the fields
-    the renderer/popups need — ts/gps_ts/vin/temp stay row-level (/stream).
+    the renderer/popups need — ts/vin/temp stay row-level (/stream).
+    gps_ts (TEXT in the db) ships as floats: the sync filter folds on it.
     """
     empty = {'id': [], 'lat': [], 'lon': [], 'heading': [], 'fix': [],
-             'adc': [[] for _ in range(8)]}
+             'adc': [[] for _ in range(8)], 'gps_ts': []}
     try:
         conn = db_ro(db_path)
         rows = conn.execute(
             'SELECT id,lat,lon,heading,fix,'
-            'adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7 '
+            'adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7,gps_ts '
             'FROM points ORDER BY id').fetchall()
         conn.close()
     except Exception:
         return empty
     if not rows:
         return empty
+
+    def num(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+
     t = list(zip(*rows))                     # transpose at C speed
     return {'id': t[0], 'lat': t[1], 'lon': t[2], 'heading': t[3],
-            'fix': t[4], 'adc': t[5:13]}
+            'fix': t[4], 'adc': t[5:13],
+            'gps_ts': [num(x) for x in t[13]]}
 
 
 def env_stats(db_path):
@@ -374,6 +400,173 @@ def env_stats(db_path):
     def trio(mn, avg, mx):
         return None if avg is None else {'min': mn, 'avg': avg, 'max': mx}
     return {'vin': trio(*r[0:3]), 'temp': trio(*r[3:6])}
+
+
+# ── Multi-unit ownership + dig-target sidecars ────────────────────────────────
+# Two head units share studies through a hub (the RTK base Pi) via
+# sync_studies.sh. The whole scheme rests on ONE invariant: every synced
+# file has exactly one writing unit, so rsync never needs to merge.
+#   - Study dbs are written only by the unit that recorded them (its tag is
+#     the id's trailing '__<tag>'); everyone else treats them read-only —
+#     in-db writes made elsewhere (view settings, legacy targets) are local
+#     and get overwritten by the next pull.
+#   - Dig targets flagged on ANY unit therefore go to a per-host sidecar,
+#     '<study>.targets__<tag>.json', not into the db. Each unit writes only
+#     its own sidecar; views render the union of all of them.
+
+def study_owner(study_id):
+    """Host tag a study id carries, or None for pre-sync (legacy) ids.
+    The tag can't contain '_', so a trailing '__<something-with-_>' (e.g.
+    a legacy id whose NAME had '__': 'my__probe_1758...') parses as legacy,
+    never as a bogus owner."""
+    if '__' not in study_id:
+        return None
+    tail = study_id.rsplit('__', 1)[1]
+    return tail if re.fullmatch(r'[A-Za-z0-9-]+', tail) else None
+
+
+def is_foreign_study(study_id):
+    owner = study_owner(study_id)
+    return owner is not None and owner != HOST_TAG
+
+
+# One writer at a time within THIS process (workers=1 gthread): two
+# concurrent target POSTs must not interleave their read-modify-write.
+_sidecar_lock = threading.Lock()
+
+
+def _own_sidecar_path(study_id):
+    return studies_dir() / f'{study_id}.targets__{HOST_TAG}.json'
+
+
+def _read_sidecar(path):
+    """Tolerant read: a torn or hand-mangled sidecar reads as empty rather
+    than 500ing every map view that merges it."""
+    try:
+        d = json.loads(Path(path).read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _write_own_sidecar(data):
+    """tmp+fsync+rename in the studies dir, so a power cut can't leave a
+    torn file and rsync always ships a complete document. Torn sidecars
+    matter more than most files: a truncated one reads as empty, and an
+    empty sidecar resets the seq that keeps 'host:N' keys unique."""
+    path = _own_sidecar_path(data['study'])
+    tmp = path.with_suffix('.tmp')
+    with open(tmp, 'w') as f:
+        f.write(json.dumps(data, indent=1))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    # the rename itself is only metadata until the DIRECTORY is synced —
+    # ext4 on the Pi commits that every ~5 s, and a power cut inside the
+    # window reverts to the previous version (a just-acked flag vanishes,
+    # or worse, a seq already pushed to the hub rolls back and re-mints a
+    # key a peer's found-mark points at)
+    try:
+        dfd = os.open(os.path.dirname(path) or '.', os.O_RDONLY)
+        try:
+            os.fsync(dfd)
+        finally:
+            os.close(dfd)
+    except OSError:
+        pass    # some filesystems refuse directory fsync; best effort
+
+
+def _load_own_sidecar(study_id):
+    d = _read_sidecar(_own_sidecar_path(study_id))
+    targets = d.get('targets') if isinstance(d.get('targets'), list) else []
+    seq = d.get('seq') if isinstance(d.get('seq'), int) else 0
+    # Floor seq at the highest id present: '<host>:N' keys are what OTHER
+    # units' found-marks point at, so a mangled seq field must never let N
+    # be reused — a stale mark would strike a brand-new target. Ids beyond
+    # _TARGET_KEY_RE's 9 digits are hand-edit garbage; flooring on one
+    # would push every future key past the parseable range. The raw seq
+    # scalar gets the same ceiling (a mangled seq mints unparseable keys
+    # just as surely as a mangled id); the target-id floor below recovers
+    # the true max, and add_target refuses to mint past the ceiling.
+    if not 0 <= seq <= 999999999:
+        seq = 0
+    for t in targets:
+        if isinstance(t, dict) and isinstance(t.get('id'), int) \
+                and 0 < t['id'] <= 999999999:
+            seq = max(seq, t['id'])
+    return {'version': 1, 'study': study_id, 'host': HOST_TAG,
+            'seq': seq, 'targets': targets,
+            'cleared': d.get('cleared') if isinstance(d.get('cleared'), dict)
+                       else {}}
+
+
+def load_targets(db_path, study_id=None):
+    """Merged dig targets: the legacy in-db table plus every per-host
+    sidecar present for the study. Keys 'src:id' are globally unique
+    ('db' = the in-db table); ids never renumber (AUTOINCREMENT in the db,
+    a monotonic seq per sidecar), so a dig list survives edits. 'cleared'
+    is an annotation any unit may add in its OWN sidecar — a target is
+    cleared if anyone marked it found."""
+    merged = []
+    try:
+        conn = db_ro(db_path)
+        try:
+            rows = conn.execute('SELECT id, lat, lon, created_at '
+                                'FROM targets ORDER BY id').fetchall()
+        finally:
+            conn.close()
+    except Exception:
+        rows = []
+    for r in rows:
+        merged.append({'src': 'db', 'id': r[0], 'lat': r[1], 'lon': r[2],
+                       'created_at': r[3]})
+
+    cleared = {}                        # key -> set of hosts that marked it
+    if study_id and study_id != RAW_ID:
+        for p in sorted(studies_dir().glob(f'{study_id}.targets__*.json')):
+            d = _read_sidecar(p)
+            host = d.get('host')
+            if not isinstance(host, str) \
+                    or not re.fullmatch(r'[A-Za-z0-9-]+', host):
+                continue
+            for t in d.get('targets') or []:
+                try:
+                    merged.append({'src': host, 'id': int(t['id']),
+                                   'lat': float(t['lat']),
+                                   'lon': float(t['lon']),
+                                   'created_at': t.get('created_at')})
+                except (TypeError, KeyError, ValueError):
+                    continue        # one bad entry must not hide the rest
+            for k in (d.get('cleared') or {}):
+                cleared.setdefault(k, set()).add(host)
+
+    foreign_study = is_foreign_study(study_id) if study_id else False
+    for t in merged:
+        t['key'] = f"{t['src']}:{t['id']}"
+        t['own'] = t['src'] == HOST_TAG
+        # Legacy pins keep their bare number; sidecar pins carry the
+        # flagging unit so 'mm1-3' and 'mm2-3' never collide on a radio.
+        t['label'] = str(t['id']) if t['src'] == 'db' \
+            else f"{t['src']}-{t['id']}"
+        marks = cleared.get(t['key']) or set()
+        t['cleared'] = bool(marks)
+        # cleared_own: whether OUR sidecar holds a mark — only that one can
+        # be un-marked here (popping our sidecar can't undo another unit's).
+        t['cleared_own'] = HOST_TAG in marks
+        t['cleared_by'] = (HOST_TAG if t['cleared_own'] else min(marks)) \
+            if marks else None
+        # Deletable = we own the file it lives in: our sidecar, or the
+        # study db when this unit recorded it (foreign db writes would
+        # just be silently reverted by the next sync pull).
+        t['deletable'] = t['own'] or (t['src'] == 'db' and not foreign_study)
+
+    def _created(t):
+        try:
+            return float(t['created_at'])
+        except (TypeError, ValueError):
+            return 0.0
+    merged.sort(key=_created)
+    return merged
 
 
 def load_points(db_path, since_id=0):
@@ -448,7 +641,12 @@ def samples_max_id(db_path):
 
 # ── Status derivation — THE single source of truth for every view ────────────
 
-TIMING_KEYS = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz')
+TIMING_KEYS = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz',
+               # Raster mode: detector_mode/slot_us and the per-channel tables
+               # come from the info line (stamped) or rastercfg echoes
+               # (<key>_current); raster_sel is echo-only live UI state, so the
+               # meta.get(k) fallback below just returns None until one arrives.
+               'detector_mode', 'slot_us', 'bl8', 'rx8', 'tx8', 'raster_sel')
 
 
 def derive_status(db_path, meta=None):
@@ -586,12 +784,16 @@ def list_studies():
                 # corrupt-but-present db: list it so the operator sees it
                 meta, count = {}, 0
                 read_ok = False
+            owner = study_owner(p.stem)
             summary = {
                 'id':         p.stem,
                 'name':       meta.get('study_name', p.stem),
                 'created_at': meta.get('created_at', ctime),
                 'count':      count,
                 'fw':         meta.get('fw_git_hash', ''),
+                # badge for studies another unit recorded (synced in)
+                'foreign_owner': owner if owner and owner != HOST_TAG
+                                 else None,
             }
             if read_ok:
                 # Never cache the failure fallback: a quiescent file's
@@ -653,11 +855,24 @@ def purge_empty_studies():
     start that just failed — 'Daemon did not start, see the log' must not
     point at a file this same page load deleted)."""
     removed = []
+
+    def _purgeable(p):
+        """Only studies THIS unit is authoritative for. A foreign study
+        pulled mid-recording legitimately has 0 points (daemon up, gate not
+        passed yet) — purging it here would just re-pull it next sync, a
+        delete/resurrect churn loop. Legacy (pre-sync) ids are purgeable
+        only while sync is off: once a hub exists, the pull would resurrect
+        those too."""
+        owner = study_owner(p.stem)
+        if owner is not None:
+            return owner == HOST_TAG
+        return not load_config()['sync_hub']
+
     # Pass 1, lock-free: the COUNT scan walks every study db and can take
     # a while over a season of studies on an SD card — a Start tap must
     # not queue behind it.
     candidates = [p for p in sorted(studies_dir().glob('*.db'))
-                  if _points_count(p) == 0]
+                  if _purgeable(p) and _points_count(p) == 0]
     # Pass 2, under the spawn lock: /start_daemon and /start_raw hold it
     # from before the daemon spawns until its PID file exists, so no daemon
     # can be mid-birth while this runs. Re-verify each candidate right
@@ -673,6 +888,10 @@ def purge_empty_studies():
             if _points_count(p) != 0:
                 continue                  # gained rows (or vanished) since
             victims = [str(p), str(p) + '-wal', str(p) + '-shm']
+            # its target sidecars too — an orphan sidecar would linger in
+            # the dir forever with no study to render it
+            victims += [str(sc) for sc in
+                        studies_dir().glob(f'{p.stem}.targets__*.json')]
             log = str(p.with_suffix('.log'))
             if _older_than_boot(log):
                 victims.append(log)
@@ -903,6 +1122,7 @@ def get_data(study_id):
         'status':    derive_status(db_path, meta),
         'env_stats': env_stats(db_path),
         'nav':       nav().snapshot(),
+        'targets':   load_targets(db_path, study_id),
     })
 
 
@@ -1006,6 +1226,10 @@ def stream_study(study_id):
                 'samples': samples,
                 'status':  status,
                 'nav':     nav().snapshot(),
+                # Sync can land another unit's flags (or a found-mark) at
+                # any moment — ship the merged list every tick; the client
+                # only re-renders when it actually changed.
+                'targets': load_targets(db_path, study_id),
             }
             yield f'id: {since_id}\ndata: {json.dumps(payload)}\n\n'
             time.sleep(SSE_PERIOD_S)
@@ -1024,13 +1248,40 @@ def save_settings(study_id):
     if not os.path.exists(db_path):
         return jsonify({'error': 'Not found'}), 404
     data = request.get_json(force=True)
+
+    def arr8(key):
+        """zero8/bias8 must be exactly 8 finite in-scale numbers — junk here
+        round-trips into every future /view load, so reject at the door."""
+        a = data.get(key)
+        if a is None:
+            return None
+        if (not isinstance(a, list) or len(a) != 8
+                or not all(isinstance(v, (int, float))
+                           and not isinstance(v, bool)
+                           # also rejects NaN/±inf (compares False) and is
+                           # int-exact: isfinite() would OverflowError on a
+                           # JSON int too big for float — a 500, not our 400
+                           and abs(v) <= 65535
+                           for v in a)):
+            raise ValueError('%s must be 8 finite numbers' % key)
+        return json.dumps(a)
+
+    try:
+        zero8_json = arr8('zero8')
+        bias8_json = arr8('bias8')
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
     mapping = {
         'sl_plus_range':  data.get('plus_range'),
         'sl_minus_range': data.get('minus_range'),
         'sl_offset':      data.get('offset'),
         'sl_filter':      data.get('filter'),
+        'sl_sync_period': data.get('sync_period'),
+        'sl_sync_res':    data.get('sync_res'),
+        'sl_cm_group':    data.get('cm_group'),
         'sl_combine':     data.get('combine'),
-        'sl_zero8':       json.dumps(data['zero8']) if data.get('zero8') is not None else None,
+        'sl_zero8':       zero8_json,
+        'sl_bias8':       bias8_json,
     }
     try:
         conn = sqlite3.connect(db_path)
@@ -1044,6 +1295,161 @@ def save_settings(study_id):
     except Exception as e:
         return jsonify({'error': str(e)}), 500
     return jsonify({'ok': True})
+
+
+@app.route('/targets/<study_id>')
+def get_targets(study_id):
+    """Recall a study's marked dig targets (also shipped inside /data)."""
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'targets': load_targets(db_path, study_id)})
+
+
+_TARGET_KEY_RE = re.compile(r'(db|[A-Za-z0-9-]{1,64}):(\d{1,9})')
+
+
+def _parse_target_key(data):
+    """'src:id' from a request body; legacy bodies ({'id': N}) mean the
+    in-db table. Returns (src, id) or None."""
+    if not isinstance(data, dict):    # 'null'/'[1]'/'"x"' are valid JSON
+        return None
+    key = data.get('key')
+    if key is None and 'id' in data:
+        key = f"db:{data['id']}"
+    m = _TARGET_KEY_RE.fullmatch(str(key)) if key is not None else None
+    return (m.group(1), int(m.group(2))) if m else None
+
+
+@app.route('/targets/<study_id>', methods=['POST'])
+def add_target(study_id):
+    """Mark a dig target at an exact lat/lon; returns its key. Targets go
+    to THIS unit's sidecar file, never into the study db — the db belongs
+    to whoever recorded it, and sidecars are what lets two head units flag
+    targets on the same study without ever writing the same file (see the
+    ownership block above load_targets)."""
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        return jsonify({'error': 'Not found'}), 404
+    data = request.get_json(force=True)
+    try:
+        lat, lon = float(data['lat']), float(data['lon'])
+    except (KeyError, TypeError, ValueError):
+        return jsonify({'error': 'lat/lon required'}), 400
+    if not (math.isfinite(lat) and math.isfinite(lon)
+            and -90 <= lat <= 90 and -180 <= lon <= 180):
+        return jsonify({'error': 'lat/lon out of range'}), 400
+    if study_id == RAW_ID:
+        # Raw sessions are ephemeral bench affairs with no map view — a
+        # sidecar here would only leak '__raw__' files into the sync.
+        return jsonify({'error': 'raw sessions have no targets'}), 400
+    try:
+        with _sidecar_lock:
+            sc = _load_own_sidecar(study_id)
+            if sc['seq'] >= 999999999:
+                # the key regex tops out at 9 digits; minting past it would
+                # create a pin no unit can ever delete or mark found
+                return jsonify({'error': 'target ids exhausted'
+                                         ' for this study'}), 400
+            sc['seq'] += 1
+            sc['targets'].append({'id': sc['seq'], 'lat': lat, 'lon': lon,
+                                  'created_at': time.time()})
+            _write_own_sidecar(sc)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'key': f'{HOST_TAG}:{sc["seq"]}',
+                    'targets': load_targets(db_path, study_id)})
+
+
+@app.route('/targets/<study_id>/delete', methods=['POST'])
+def delete_target(study_id):
+    """Delete a target THIS unit is allowed to delete: one from our own
+    sidecar, or a legacy in-db one when we recorded the study. Anything
+    else lives in a file another unit owns — deleting it here would either
+    do nothing (their sidecar) or be reverted by the next sync pull (their
+    db), so refuse and point at mark-found instead."""
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        return jsonify({'error': 'Not found'}), 404
+    parsed = _parse_target_key(request.get_json(force=True))
+    if not parsed:
+        return jsonify({'error': 'key required'}), 400
+    src, tid = parsed
+    if src == HOST_TAG and study_id != RAW_ID:
+        try:
+            with _sidecar_lock:
+                sc = _load_own_sidecar(study_id)
+                sc['targets'] = [t for t in sc['targets']
+                                 if t.get('id') != tid]
+                sc['cleared'].pop(f'{src}:{tid}', None)
+                _write_own_sidecar(sc)
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    elif src == 'db':
+        if is_foreign_study(study_id):
+            return jsonify({'error': f'recorded on {study_owner(study_id)} '
+                                     '— mark it found instead'}), 403
+        try:
+            conn = sqlite3.connect(db_path)
+            conn.execute('PRAGMA busy_timeout=1000')
+            try:
+                conn.execute('DELETE FROM targets WHERE id=?', (tid,))
+                conn.commit()
+            except sqlite3.OperationalError as e:
+                # no targets table yet — nothing to delete, like GET.
+                # Anything else (locked, readonly, I/O) must NOT
+                # masquerade as success.
+                if 'no such table' not in str(e).lower():
+                    raise
+            conn.close()
+        except Exception as e:
+            return jsonify({'error': str(e)}), 500
+    else:
+        return jsonify({'error': f'flagged on {src} '
+                                 '— mark it found instead'}), 403
+    return jsonify({'ok': True, 'targets': load_targets(db_path, study_id)})
+
+
+@app.route('/targets/<study_id>/clear', methods=['POST'])
+def clear_target(study_id):
+    """Mark any unit's target found (or un-mark it). The annotation goes in
+    OUR sidecar keyed by the target's 'src:id' — the dig crew on either
+    unit can retire a pin without touching the file that defines it."""
+    db_path = get_db_path(study_id)
+    if not os.path.exists(db_path):
+        return jsonify({'error': 'Not found'}), 404
+    if study_id == RAW_ID:
+        return jsonify({'error': 'raw sessions have no targets'}), 400
+    data = request.get_json(force=True)
+    parsed = _parse_target_key(data)
+    if not parsed:
+        return jsonify({'error': 'key required'}), 400
+    key = f'{parsed[0]}:{parsed[1]}'
+    want = bool(data.get('cleared', True))
+    try:
+        with _sidecar_lock:      # checks atomic with the write, so a
+            # racing delete can't strand an orphan mark past validation
+            target = next((t for t in load_targets(db_path, study_id)
+                           if t['key'] == key), None)
+            if target is None:
+                # never annotate a key no target carries: each bogus entry
+                # would live in the sidecar forever and ride the sync
+                return jsonify({'error': 'no such target'}), 404
+            if not want and target['cleared'] and not target['cleared_own']:
+                # the mark lives in another unit's sidecar; popping ours
+                # would change nothing (views OR every sidecar's marks)
+                return jsonify({'error': "marked found on "
+                                         f"{target['cleared_by']} "
+                                         "— un-mark it there"}), 403
+            sc = _load_own_sidecar(study_id)
+            if want:
+                sc['cleared'][key] = time.time()
+            else:
+                sc['cleared'].pop(key, None)
+            _write_own_sidecar(sc)
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    return jsonify({'ok': True, 'targets': load_targets(db_path, study_id)})
 
 
 @app.route('/rename/<study_id>', methods=['POST'])
@@ -1102,9 +1508,12 @@ def recalibrate(study_id):
 
 def new_study_id(name):
     """Study id from a user-entered name. ASCII-only by construction — the
-    id doubles as the db filename and must always satisfy safe_study_id()."""
+    id doubles as the db filename and must always satisfy safe_study_id().
+    The trailing '__<host>' marks which unit recorded it: sync routing
+    (push mine, pull theirs) keys on it, and it keeps two units that start
+    a study the same second from colliding at the hub."""
     safe = re.sub(r'[^A-Za-z0-9_-]', '_', name).strip('_-') if name else ''
-    return f'{safe or "study"}_{int(time.time())}'
+    return f'{safe or "study"}_{int(time.time())}__{HOST_TAG}'
 
 
 # One spawn request at a time: the not-running check, the raw-db unlink and

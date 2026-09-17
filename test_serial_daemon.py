@@ -150,6 +150,42 @@ m = sd.RE_RATE.search('# saved (slot 3/128): blanking=16us  rx_window=3us  '
 check('saved banner rate match', m is not None and m.group(1) == '200')
 check('no bare-number match', sd.RE_RATE.search('# sample_rate=500') is None)
 
+# ── raster config echo regex ──────────────────────────────────────────────────
+print('RE_RASTER:')
+RC = ('# rastercfg detector_mode=raster slot_us=200 ch=3 '
+      'bl8=16,16,16,16,20,16,16,16 rx8=3,3,3,3,3,3,3,3 '
+      'tx8=120,120,120,120,120,120,120,120')
+m = sd.RE_RASTER.search(RC)
+check('rastercfg echo', m is not None and m.group(1) == 'raster'
+      and m.group(2) == '200' and m.group(3) == '3'
+      and m.group(4) == '16,16,16,16,20,16,16,16'
+      and m.group(5) == '3,3,3,3,3,3,3,3'
+      and m.group(6) == '120,120,120,120,120,120,120,120')
+m = sd.RE_RASTER.search(RC.replace('ch=3', 'ch=all'))
+check('ch=all echo', m is not None and m.group(3) == 'all')
+m = sd.RE_RASTER.search('# rastercfg detector_mode=all slot_us=200 ch=all '
+                        'bl8=16,16,16,16,16,16,16,16 rx8=3,3,3,3,3,3,3,3 '
+                        'tx8=120,120,120,120,120,120,120,120')
+check('mode=all echo', m is not None and m.group(1) == 'all')
+# The info-line tail carries the same keys with no ch= — the regex must not
+# require it (dispatch consumes info lines first, but keep the grammar honest)
+m = sd.RE_RASTER.search('detector_mode=raster slot_us=300 '
+                        'bl8=1,1,1,1,1,1,1,1 rx8=2,2,2,2,2,2,2,2 '
+                        'tx8=99,99,99,99,99,99,99,99')
+check('no-ch form matches, ch group None', m is not None and m.group(3) is None
+      and m.group(2) == '300')
+# Token isolation both ways: bl8=/rx8=/tx8= were chosen so a per-channel edit
+# echo can never fake a global blanking=/rx_window=/tx_pulse= drift — and the
+# legacy echoes must not half-match the raster grammar either.
+check('rastercfg trips no legacy timing', sd.RE_TIMING.search(RC) is None)
+check('rastercfg trips no legacy tx', sd.RE_TXPULSE.search(RC) is None)
+check('legacy echo no raster match',
+      sd.RE_RASTER.search('# blanking=16us  rx_window=3us') is None)
+check('raster warn line no match',
+      sd.RE_RASTER.search('# raster limit: 8 slots of 200us must fit the '
+                          '2000us sample interval -- lower rate or shrink '
+                          'timings') is None)
+
 # ── gate_reason ───────────────────────────────────────────────────────────────
 print('gate_reason:')
 def mk(lat=40.1, lon=-119.1, fix=4, heading=180.0):
@@ -352,15 +388,39 @@ full = sd.parse_info_line(
     '# info fw=abc1234 gps_ver=LC29H gps_id=UID9 blanking_us=16 rx_window_us=3 '
     'tx_pulse_us=120 coil_spacing_mm=500 coil_offset_fore_mm=0 '
     'coil_offset_right_mm=0 sample_rate_hz=500 adc_oversample=16 '
-    'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14')
+    'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14 '
+    'detector_mode=all slot_us=200 bl8=16,16,16,16,16,16,16,16 '
+    'rx8=3,3,3,3,3,3,3,3 tx8=120,120,120,120,120,120,120,120')
 sd.stamp_info(mc, full)
 check('later info fills gaps', sd.meta_get(mc, 'coil_spacing_mm') == '500'
       and sd.meta_get(mc, 'gps_id') == 'UID9'
       and sd.meta_get(mc, 'tx_pulse_us') == '120'
       and sd.meta_get(mc, 'sample_rate_hz') == '500')
+check('raster keys stamped', sd.meta_get(mc, 'detector_mode') == 'all'
+      and sd.meta_get(mc, 'slot_us') == '200'
+      and sd.meta_get(mc, 'bl8') == '16,16,16,16,16,16,16,16'
+      and sd.meta_get(mc, 'rx8') == '3,3,3,3,3,3,3,3'
+      and sd.meta_get(mc, 'tx8') == '120,120,120,120,120,120,120,120')
 check('info_ok now 1', sd.meta_get(mc, 'info_ok') == '1')
 check('no false drift flags', sd.meta_get(mc, 'timing_changed') is None
       and sd.meta_get(mc, 'geometry_changed') is None)
+# Old firmware still emits the retired fire_mode token in its info line —
+# it must be ignored (never stamped into meta). With the raster keys in the
+# whitelist an old-FW info line can no longer complete the header: info_ok
+# stays 0 and the UI shows its incomplete-header warning — a visible nudge
+# to reflash (boards track HEAD). Data still streams and records fine.
+mo = sd.db_open(':memory:')
+legacy = sd.parse_info_line(
+    '# info fw=abc1234 gps_ver=LC29H gps_id=UID9 blanking_us=16 rx_window_us=3 '
+    'tx_pulse_us=120 coil_spacing_mm=500 coil_offset_fore_mm=0 '
+    'coil_offset_right_mm=0 fire_mode=both sample_rate_hz=500 '
+    'adc_oversample=16 adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14')
+sd.stamp_info(mo, legacy)
+check('old-fw fire_mode token not stamped', sd.meta_get(mo, 'fire_mode') is None)
+check('old-fw shared keys still stamped', sd.meta_get(mo, 'gps_id') == 'UID9')
+check('old-fw header incomplete (raster keys missing)',
+      sd.meta_get(mo, 'info_ok') == '0')
+mo.close()
 # Geometry drift: flagged, never applied to the header
 sd.note_drift(mc, 'geometry', {'coil_spacing_mm': '520'})
 check('geometry drift flagged', 'coil_spacing_mm 500->520' in (sd.meta_get(mc, 'geometry_changed') or ''))
@@ -376,6 +436,18 @@ sd.note_drift(mc, 'timing', {'sample_rate_hz': '200'})
 check('rate drift flagged', 'sample_rate_hz 500->200' in (sd.meta_get(mc, 'timing_changed') or ''))
 check('header rate untouched', sd.meta_get(mc, 'sample_rate_hz') == '500')
 check('current rate tracked', sd.meta_get(mc, 'sample_rate_hz_current') == '200')
+# Raster drift ('r' toggle / per-channel edit rastercfg echoes): same contract
+sd.note_drift(mc, 'timing', {'detector_mode': 'raster', 'slot_us': '200',
+                             'bl8': '16,16,16,16,16,16,16,18'})
+check('mode drift flagged',
+      'detector_mode all->raster' in (sd.meta_get(mc, 'timing_changed') or ''))
+check('bl8 drift flagged',
+      'bl8 16,16,16,16,16,16,16,16->16,16,16,16,16,16,16,18'
+      in (sd.meta_get(mc, 'timing_changed') or ''))
+check('unchanged slot_us not flagged',
+      'slot_us' not in (sd.meta_get(mc, 'timing_changed') or ''))
+check('header mode untouched', sd.meta_get(mc, 'detector_mode') == 'all')
+check('current mode tracked', sd.meta_get(mc, 'detector_mode_current') == 'raster')
 check('synchronous=NORMAL', mc.execute('PRAGMA synchronous').fetchone()[0] == 1)
 mc.close()
 
@@ -464,7 +536,9 @@ INFO = (b'# info fw=a5c5006 gps_ver=LC29H,2023/10/26 gps_id=UID123 '
         b'blanking_us=16 rx_window_us=3 tx_pulse_us=120 coil_spacing_mm=500 '
         b'coil_offset_fore_mm=0 coil_offset_right_mm=0 '
         b'sample_rate_hz=500 adc_oversample=16 '
-        b'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14\r\n')
+        b'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14 '
+        b'detector_mode=all slot_us=200 bl8=16,16,16,16,16,16,16,16 '
+        b'rx8=3,3,3,3,3,3,3,3 tx8=120,120,120,120,120,120,120,120\r\n')
 
 def read_master():
     try:
@@ -523,6 +597,16 @@ send('# coil_spacing=510mm')
 send('# tx_pulse=100us')
 # 5d) sample-rate echo mid-study ('b' key pressed) → timing drift flag
 send('# sample_rate=200Hz (10 per fix)')
+# 5e) raster echo mid-study ('r' then '3' pressed) → mode drift flag + the
+#     channel selection lands in meta for the raw-view chips. Every value
+#     is distinct PER KEY POSITION (slot 300, bl8 leads 17, rx8 unchanged,
+#     tx8 leads 110): the dispatcher's regex-group→meta-key binding in
+#     serial_daemon main() is only reachable through this pty path, and
+#     identical-looking CSVs let a rotated mapping (bl8 ← group 5, ...)
+#     pass the whole suite — proven by mutation during review.
+send('# rastercfg detector_mode=raster slot_us=300 ch=3 '
+     'bl8=17,16,16,16,16,16,16,16 rx8=3,3,3,3,3,3,3,3 '
+     'tx8=110,120,120,120,120,120,120,120')
 # 5f) noise-corrupted sample — the high-bit byte must poison the field
 #     (errors='replace'), not splice it into a valid-looking value
 os.write(master, b',,,1,2,3,4,5,\xb26,7,8,,,1005\n')
@@ -559,6 +643,37 @@ check('current blanking tracked', meta.get('blanking_us_current') == '18')
 check('tx pulse change flagged', 'tx_pulse_us 120->100' in meta.get('timing_changed', ''),
       repr(meta.get('timing_changed')))
 check('rate change flagged', 'sample_rate_hz 500->200' in meta.get('timing_changed', ''),
+      repr(meta.get('timing_changed')))
+check('raster mode change flagged',
+      'detector_mode all->raster' in meta.get('timing_changed', ''),
+      repr(meta.get('timing_changed')))
+check('header detector_mode NOT overwritten', meta.get('detector_mode') == 'all')
+check('raster selection tracked', meta.get('raster_sel') == '3',
+      repr(meta.get('raster_sel')))
+check('meta slot_us stamped', meta.get('slot_us') == '200')
+check('meta bl8 stamped', meta.get('bl8') == '16,16,16,16,16,16,16,16')
+# Exact _current values, one per regex group — a swapped group→key binding
+# in the dispatcher fails here even though every downstream shape matches.
+check('slot_us_current exact', meta.get('slot_us_current') == '300',
+      repr(meta.get('slot_us_current')))
+check('bl8_current exact',
+      meta.get('bl8_current') == '17,16,16,16,16,16,16,16',
+      repr(meta.get('bl8_current')))
+check('rx8_current exact (unchanged)',
+      meta.get('rx8_current') == '3,3,3,3,3,3,3,3',
+      repr(meta.get('rx8_current')))
+check('tx8_current exact',
+      meta.get('tx8_current') == '110,120,120,120,120,120,120,120',
+      repr(meta.get('tx8_current')))
+check('slot_us drift flagged',
+      'slot_us 200->300' in meta.get('timing_changed', ''))
+check('bl8 drift flagged (pty)',
+      'bl8 16,16,16,16,16,16,16,16->17,16,16,16,16,16,16,16'
+      in meta.get('timing_changed', ''))
+check('tx8 drift flagged (pty)',
+      'tx8 120,120,120,120,120,120,120,120->110,120,120,120,120,120,120,120'
+      in meta.get('timing_changed', ''))
+check('unchanged rx8 not flagged', 'rx8' not in meta.get('timing_changed', ''),
       repr(meta.get('timing_changed')))
 check('geometry change flagged', 'coil_spacing_mm 500->510' in meta.get('geometry_changed', ''),
       repr(meta.get('geometry_changed')))

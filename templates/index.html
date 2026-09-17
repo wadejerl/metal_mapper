@@ -213,6 +213,8 @@
     <td>
       {{ s.name }}
       {% if s.live %}<span class="badge badge-live">● LIVE</span>{% endif %}
+      {% if s.foreign_owner %}<span class="badge badge-sync"
+        title="recorded on {{ s.foreign_owner }}, synced in via the hub">⇄ {{ s.foreign_owner }}</span>{% endif %}
     </td>
     {# nowrap: the whole point of dropping the Last Activity column was
        giving this date room to render on one line at 800px #}

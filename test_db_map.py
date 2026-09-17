@@ -41,6 +41,10 @@ SCRATCH = tempfile.mkdtemp(prefix='dbmap_test_')
 STUDIES = os.path.join(SCRATCH, 'studies')
 os.makedirs(STUDIES)
 
+# Deterministic host identity: HOST_TAG is read once at import, and the
+# multi-unit tests below depend on knowing whose sidecar is whose.
+os.environ['MM_HOST_TAG'] = 'benchA'
+
 import db_map  # noqa: E402
 
 db_map._cli_overrides.update({
@@ -59,9 +63,14 @@ def make_study(name, n_points=5, heading=90.0, with_live=None, meta=None):
     """Build a study db exactly the way serial_daemon would."""
     path = os.path.join(STUDIES, f'{name}.db')
     conn = sd.db_open(path)
+    # gps_ts varies per row (a column shift/reorder can't hide behind equal
+    # values); row 3 is NULL and row 4 junk text, exercising both error arms
+    # of load_columns' num() — those rows must come through as None, not 500.
     rows = [{'lat': 40.1 + i * 1e-6, 'lon': -119.1, 'heading': heading,
              'fix': 4, 'adc': [1000 + ch * 100 + i for ch in range(8)],
-             'gps_ts': '123519.10'} for i in range(n_points)]
+             'gps_ts': (None if i == 3 else 'garbled' if i == 4
+                        else '%.3f' % (123519.10 + i * 0.025))}
+            for i in range(n_points)]
     sd.insert_rows(conn, rows, 12.4, 25.0)
     for k, v in (meta or {}).items():
         sd.meta_set(conn, k, v)
@@ -258,6 +267,11 @@ p_warn = make_study('warn1', meta={
     'blanking_us': '16', 'blanking_us_current': '18',
     'rx_window_us': '3', 'tx_pulse_us': '120', 'tx_pulse_us_current': '80',
     'sample_rate_hz': '500', 'sample_rate_hz_current': '100',
+    'detector_mode': 'all', 'detector_mode_current': 'raster',
+    'slot_us': '200',
+    'bl8': '16,16,16,16,16,16,16,16', 'bl8_current': '16,16,16,16,16,16,16,18',
+    'rx8': '3,3,3,3,3,3,3,3', 'tx8': '120,120,120,120,120,120,120,120',
+    'raster_sel': '3',
 })
 st = db_map.derive_status(p_warn)
 check('identity warning', any('identity' in w for w in st['warnings']), repr(st['warnings']))
@@ -270,6 +284,16 @@ check('timing prefers _current', st['timing']['blanking_us'] == '18'
 # a g/b echo lands in meta as sample_rate_hz_current and must win here.
 check('timing carries sample_rate_hz (prefers _current)',
       st['timing']['sample_rate_hz'] == '100', repr(st['timing']))
+# The raster keys ride the same timing dict (raw view's mode row, chips and
+# per-channel readout). raster_sel is echo-only live state — no _current
+# twin ever exists, so the plain-key fallback is what carries it.
+check('timing carries raster keys (prefers _current)',
+      st['timing']['detector_mode'] == 'raster'
+      and st['timing']['slot_us'] == '200'
+      and st['timing']['bl8'] == '16,16,16,16,16,16,16,18'
+      and st['timing']['rx8'] == '3,3,3,3,3,3,3,3'
+      and st['timing']['tx8'] == '120,120,120,120,120,120,120,120'
+      and st['timing']['raster_sel'] == '3', repr(st['timing']))
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
@@ -304,6 +328,14 @@ cols = d['points']
 check('data is columnar', len(cols['lat']) == 5 and len(cols['adc']) == 8
       and len(cols['adc'][0]) == 5 and cols['heading'][0] == 90.0,
       repr({k: (v if k != 'adc' else v[0]) for k, v in cols.items()}))
+# gps_ts rides along as floats — the client's sync filter folds on it.
+# Per-row values differ (alignment is observable), NULL and junk text both
+# come through as None (num()'s TypeError/ValueError arms).
+check('data carries gps_ts column', len(cols['gps_ts']) == 5
+      and abs(cols['gps_ts'][0] - 123519.10) < 1e-6
+      and abs(cols['gps_ts'][2] - 123519.15) < 1e-6
+      and cols['gps_ts'][3] is None and cols['gps_ts'][4] is None,
+      repr(cols.get('gps_ts')))
 check('data last_id from id column', d['last_id'] == cols['id'][-1] == 5)
 check('data carries meta + status + nav',
       'meta' in d and d['status']['state'] == 'stopped' and 'connected' in d['nav'])
@@ -443,6 +475,48 @@ check('purge keeps this-boot orphan log', os.path.exists(orph_new))
 
 db_map._BOOT_TS = _saved_boot
 
+# Ownership gates: a foreign study pulled mid-recording legitimately has 0
+# points — purging it would just start a delete/resurrect churn with the
+# next sync pull. Legacy (untagged) ids are purgeable only while sync is
+# off; our own tagged studies purge as usual (and take their sidecars).
+db_map._BOOT_TS = time.time() + 3600
+p_for0 = _mini_study('pull_1758000001__mm9', 0)
+p_own0 = _mini_study('mine_1758000002__benchA', 0)
+sc_own0 = os.path.join(_purge_dir,
+                       'mine_1758000002__benchA.targets__mm9.json')
+Path(sc_own0).write_text('{}')
+gone = db_map.purge_empty_studies()
+check('purge keeps foreign 0-point study',
+      os.path.exists(p_for0) and 'pull_1758000001__mm9' not in gone,
+      repr(gone))
+check('purge takes own 0-point study + its sidecars',
+      not os.path.exists(p_own0) and not os.path.exists(sc_own0), repr(gone))
+p_leg0 = _mini_study('legacy_zero', 0)
+db_map.CONFIG_FILE.write_text(json.dumps({'sync_hub': 'rsync://hub/mod'}))
+gone = db_map.purge_empty_studies()
+check('purge keeps legacy 0-point study while sync is on',
+      os.path.exists(p_leg0) and gone == [], repr(gone))
+db_map.CONFIG_FILE.unlink()
+gone = db_map.purge_empty_studies()
+check('purge takes legacy 0-point study with sync off',
+      not os.path.exists(p_leg0) and gone == ['legacy_zero'], repr(gone))
+os.unlink(p_for0)
+db_map._BOOT_TS = _saved_boot
+
+# study_owner / new_study_id: the '__<host>' tag routes the sync; a legacy
+# id whose NAME part contains '__' must never parse as foreign.
+sid = db_map.new_study_id('geo test')
+check('new study id carries host tag', sid.endswith('__benchA')
+      and db_map.safe_study_id(sid) == sid
+      and db_map.study_owner(sid) == 'benchA', repr(sid))
+check('ownership parse',
+      db_map.study_owner('run_123') is None
+      and db_map.study_owner('my__probe_1758') is None
+      and db_map.study_owner('x_1758__mm9') == 'mm9'
+      and db_map.is_foreign_study('x_1758__mm9') is True
+      and db_map.is_foreign_study('x_1758__benchA') is False
+      and db_map.is_foreign_study('run_123') is False)
+
 # A candidate that gains rows between the lock-free scan and the locked
 # delete pass must survive (the recount under the lock catches it). The
 # hook rides get_daemon_status, which pass 2 calls right before recounting.
@@ -508,11 +582,23 @@ db_map._study_cache.clear()
 # a divergence would render live points differently from loaded ones).
 rows = db_map.load_points(os.path.join(STUDIES, 'saved1.db'))
 colsd = db_map.load_columns(os.path.join(STUDIES, 'saved1.db'))
+
+
+def _num(x):
+    """Mirror load_columns' tolerant float: NULL/junk gps_ts → None."""
+    try:
+        return float(x)
+    except (TypeError, ValueError):
+        return None
+
+
 check('rows/columns equivalent',
       all(colsd['id'][i] == p['id'] and colsd['lat'][i] == p['lat']
           and colsd['lon'][i] == p['lon'] and colsd['heading'][i] == p['heading']
           and colsd['fix'][i] == p['fix']
           and [colsd['adc'][ch][i] for ch in range(8)] == p['adc']
+          and (colsd['gps_ts'][i] is None if _num(p['gps_ts']) is None
+               else abs(colsd['gps_ts'][i] - _num(p['gps_ts'])) < 1e-9)
           for i, p in enumerate(rows)))
 check('columns empty on missing db',
       db_map.load_columns('/nonexistent.db')['id'] == [])
@@ -531,7 +617,9 @@ check('traversal blocked (geojson)', r.status_code == 404, r.status_code)
 r = client.post('/settings/saved1', json={
     'plus_range': 250, 'minus_range': 50, 'offset': -10,
     'filter': 'cm', 'combine': '0',
+    'sync_period': '1', 'sync_res': '25', 'cm_group': 'sets',
     'zero8': [1000.5] * 8,
+    'bias8': [0, 10, -20, 0, 0, 0, 0, 40],
     'channels': [True, True, False, True, True, True, True, False],
     'heading_offset': -90,
 })
@@ -544,8 +632,313 @@ check('obsolete channel/rotation keys ignored',
       repr(sorted(m)))
 check('filter persisted', m.get('sl_filter') == 'cm',
       repr(m.get('sl_filter')))
+check('sync tuning persisted', m.get('sl_sync_period') == '1'
+      and m.get('sl_sync_res') == '25',
+      repr((m.get('sl_sync_period'), m.get('sl_sync_res'))))
+check('cm grouping persisted', m.get('sl_cm_group') == 'sets',
+      repr(m.get('sl_cm_group')))
 check('combine persisted', m.get('sl_combine') == '0',
       repr(m.get('sl_combine')))
+check('bias8 persisted', json.loads(m.get('sl_bias8', 'null'))
+      == [0, 10, -20, 0, 0, 0, 0, 40], repr(m.get('sl_bias8')))
+# zero8/bias8 junk must be rejected at the door (400), never persisted:
+# stored junk would round-trip into every future /view load.
+# 10**400: json parses to an unbounded int — math.isfinite() would
+# OverflowError into a 500; the validator must still answer 400.
+for bad in ('abc', 5, {'a': 1}, [1] * 9, [1] * 7, ['x'] * 8,
+            [True] * 8, [1e308] * 8, [70000] * 8, [10 ** 400] * 8):
+    r = client.post('/settings/saved1', json={'bias8': bad})
+    check('bias8 junk rejected: %.20r' % (bad,), r.status_code == 400,
+          (bad, r.status_code))
+    r = client.post('/settings/saved1', json={'zero8': bad})
+    check('zero8 junk rejected: %.20r' % (bad,), r.status_code == 400,
+          (bad, r.status_code))
+m = db_map.read_meta(p_saved)
+check('junk save left settings untouched',
+      json.loads(m['sl_bias8']) == [0, 10, -20, 0, 0, 0, 0, 40]
+      and json.loads(m['sl_zero8']) == [1000.5] * 8, repr(m.get('sl_bias8')))
+
+# ── Dig targets: per-host sidecars, merged views, cross-unit rules ───────────
+# New flags always go to THIS unit's sidecar json (never into the study db):
+# the db belongs to whoever recorded it, and one-writer-per-file is the
+# invariant the studies sync (sync_studies.sh) rests on.
+
+
+def db_ro_has_no_targets_table(path):
+    conn = sqlite3.connect(path)
+    try:
+        n = conn.execute("SELECT COUNT(*) FROM sqlite_master "
+                         "WHERE type='table' AND name='targets'").fetchone()[0]
+    finally:
+        conn.close()
+    return n == 0
+
+
+_sc_own = Path(STUDIES) / 'saved1.targets__benchA.json'
+r = client.get('/targets/saved1')
+check('targets empty before any mark', r.status_code == 200
+      and r.get_json()['targets'] == [], repr(r.get_json()))
+# legacy delete body ({'id': N}) before the db table exists — graceful no-op
+r = client.post('/targets/saved1/delete', json={'id': 1})
+check('target delete without table is ok', r.status_code == 200
+      and r.get_json().get('ok') is True
+      and r.get_json()['targets'] == [], repr(r.get_json()))
+r = client.post('/targets/saved1', json={'lat': 40.1000005, 'lon': -119.1})
+d = r.get_json()
+check('target marked and keyed', r.status_code == 200
+      and d.get('key') == 'benchA:1'
+      and len(d['targets']) == 1
+      and d['targets'][0]['lat'] == 40.1000005
+      and d['targets'][0]['lon'] == -119.1
+      and d['targets'][0]['key'] == 'benchA:1'
+      and d['targets'][0]['own'] is True
+      and d['targets'][0]['deletable'] is True
+      and d['targets'][0]['label'] == 'benchA-1'
+      and d['targets'][0]['cleared'] is False, repr(d))
+check('target went to the sidecar, not the db',
+      _sc_own.exists()
+      and json.loads(_sc_own.read_text())['host'] == 'benchA'
+      and db_ro_has_no_targets_table(p_saved))
+r = client.post('/targets/saved1', json={'lat': 40.2, 'lon': -119.2})
+check('second target keyed benchA:2', r.get_json().get('key') == 'benchA:2')
+d = client.get('/data/saved1').get_json()
+check('data ships targets',
+      [t['key'] for t in d.get('targets', [])] == ['benchA:1', 'benchA:2'],
+      repr(d.get('targets')))
+r = client.post('/targets/saved1/delete', json={'key': 'benchA:1'})
+check('target delete keeps survivors',
+      [t['key'] for t in r.get_json()['targets']] == ['benchA:2'],
+      repr(r.get_json()))
+r = client.post('/targets/saved1', json={'lat': 40.3, 'lon': -119.3})
+check('numbers never reused after delete',
+      r.get_json().get('key') == 'benchA:3', repr(r.get_json()))
+r = client.post('/targets/saved1', json={'lat': 'junk'})
+check('target bad payload 400', r.status_code == 400, r.status_code)
+r = client.post('/targets/saved1', json={'lat': 91.0, 'lon': 0.0})
+check('target out-of-range 400', r.status_code == 400, r.status_code)
+r = client.get('/targets/no_such_study')
+check('targets 404 on unknown study', r.status_code == 404, r.status_code)
+
+# Legacy in-db targets (pre-sidecar studies) still render and still delete —
+# on a study this unit is authoritative for.
+conn = sqlite3.connect(p_saved)
+conn.execute('CREATE TABLE IF NOT EXISTS targets ('
+             ' id INTEGER PRIMARY KEY AUTOINCREMENT,'
+             ' lat REAL NOT NULL, lon REAL NOT NULL, created_at REAL)')
+conn.execute('INSERT INTO targets (id, lat, lon, created_at) '
+             'VALUES (7, 40.5, -119.5, 100.0)')
+conn.commit()
+conn.close()
+d = client.get('/targets/saved1').get_json()
+legacy = [t for t in d['targets'] if t['src'] == 'db']
+check('legacy in-db target merges in',
+      len(legacy) == 1 and legacy[0]['key'] == 'db:7'
+      and legacy[0]['label'] == '7' and legacy[0]['deletable'] is True,
+      repr(d['targets']))
+
+# The other unit's sidecar (as the sync would deliver it): renders merged,
+# refuses deletion here, but can be marked found from here.
+_sc_mm9 = Path(STUDIES) / 'saved1.targets__mm9.json'
+_sc_mm9.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'mm9', 'seq': 1,
+    'targets': [{'id': 1, 'lat': 40.9, 'lon': -119.9, 'created_at': 50.0}],
+    'cleared': {}}))
+d = client.get('/targets/saved1').get_json()
+mm9 = [t for t in d['targets'] if t['src'] == 'mm9']
+check('foreign sidecar target merges in',
+      len(mm9) == 1 and mm9[0]['key'] == 'mm9:1'
+      and mm9[0]['own'] is False and mm9[0]['deletable'] is False
+      and mm9[0]['label'] == 'mm9-1', repr(d['targets']))
+check('merged list sorts by created_at',
+      [t['key'] for t in d['targets']][:2] == ['mm9:1', 'db:7'],
+      repr([t['key'] for t in d['targets']]))
+r = client.post('/targets/saved1/delete', json={'key': 'mm9:1'})
+check('foreign target delete refused 403', r.status_code == 403
+      and 'found' in r.get_json()['error'], (r.status_code, r.get_json()))
+r = client.post('/targets/saved1/clear', json={'key': 'mm9:1'})
+d = r.get_json()
+mm9 = [t for t in d['targets'] if t['key'] == 'mm9:1']
+check('foreign target marked found from here',
+      r.status_code == 200 and mm9[0]['cleared'] is True
+      and mm9[0]['cleared_by'] == 'benchA', repr(d['targets']))
+check('found-mark went to OUR sidecar',
+      json.loads(_sc_own.read_text())['cleared'].get('mm9:1') is not None
+      and json.loads(_sc_mm9.read_text())['cleared'] == {})
+r = client.post('/targets/saved1/clear', json={'key': 'mm9:1',
+                                               'cleared': False})
+mm9 = [t for t in r.get_json()['targets'] if t['key'] == 'mm9:1']
+check('found-mark toggles back off', mm9[0]['cleared'] is False,
+      repr(r.get_json()['targets']))
+r = client.post('/targets/saved1/clear', json={'key': 'bad key!'})
+check('clear bad key 400', r.status_code == 400, r.status_code)
+r = client.post('/targets/saved1/clear', json={'key': 'benchA:999'})
+check('clear of a key naming no target 404 (no sidecar litter)',
+      r.status_code == 404
+      and 'benchA:999' not in json.loads(_sc_own.read_text())['cleared'],
+      r.status_code)
+codes = []
+for body in ('null', '[1, 2]', '"x"'):
+    for route in ('delete', 'clear'):
+        r = client.post(f'/targets/saved1/{route}', data=body,
+                        content_type='application/json')
+        codes.append(r.status_code)
+check('non-dict JSON bodies → 400, never 500', codes == [400] * 6, codes)
+
+# A found-mark set by the OTHER unit can't be un-marked here — it lives in
+# their sidecar, so popping ours would silently change nothing. Our own
+# mark layered on top pops fine, leaving theirs standing.
+_sc_mm9.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'mm9', 'seq': 1,
+    'targets': [{'id': 1, 'lat': 40.9, 'lon': -119.9, 'created_at': 50.0}],
+    'cleared': {'db:7': 55.0}}))
+d = client.get('/targets/saved1').get_json()
+db7 = [t for t in d['targets'] if t['key'] == 'db:7'][0]
+check("other unit's mark: cleared, not cleared_own",
+      db7['cleared'] is True and db7['cleared_own'] is False
+      and db7['cleared_by'] == 'mm9', repr(db7))
+r = client.post('/targets/saved1/clear', json={'key': 'db:7',
+                                               'cleared': False})
+check("un-marking another unit's mark refused 403, names the unit",
+      r.status_code == 403 and 'mm9' in r.get_json()['error'],
+      (r.status_code, r.get_json()))
+r = client.post('/targets/saved1/clear', json={'key': 'db:7'})
+db7 = [t for t in r.get_json()['targets'] if t['key'] == 'db:7'][0]
+check('our mark on top: cleared_own true', r.status_code == 200
+      and db7['cleared_own'] is True and db7['cleared_by'] == 'benchA',
+      repr(db7))
+r = client.post('/targets/saved1/clear', json={'key': 'db:7',
+                                               'cleared': False})
+db7 = [t for t in r.get_json()['targets'] if t['key'] == 'db:7'][0]
+check("popping our layer leaves the other unit's mark standing",
+      r.status_code == 200 and db7['cleared'] is True
+      and db7['cleared_own'] is False, repr(db7))
+_sc_mm9.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'mm9', 'seq': 1,
+    'targets': [{'id': 1, 'lat': 40.9, 'lon': -119.9, 'created_at': 50.0}],
+    'cleared': {}}))
+
+# Concurrent flags must not lose an update: the route serializes the
+# sidecar read-modify-write under _sidecar_lock. The monkeypatched sleep
+# widens the race window so a MISSING lock fails deterministically here,
+# not once a season in the field.
+_orig_load = db_map._load_own_sidecar
+def _slow_load(study_id):
+    sc = _orig_load(study_id)
+    time.sleep(0.05)
+    return sc
+db_map._load_own_sidecar = _slow_load
+try:
+    conc_keys = []
+    def _flag(i):
+        r = db_map.app.test_client().post(
+            '/targets/saved1', json={'lat': 40.5 + i * 1e-4, 'lon': -119.5})
+        conc_keys.append((r.get_json() or {}).get('key'))
+    ths = [threading.Thread(target=_flag, args=(i,)) for i in range(4)]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+finally:
+    db_map._load_own_sidecar = _orig_load
+own_now = [t['key'] for t in client.get('/targets/saved1').get_json()['targets']
+           if t['own']]
+check('4 concurrent flags: 4 distinct keys, none lost',
+      len(set(conc_keys)) == 4 and None not in conc_keys
+      and set(conc_keys) <= set(own_now)
+      and len(own_now) == len(set(own_now)), (conc_keys, own_now))
+for k in conc_keys:
+    client.post('/targets/saved1/delete', json={'key': k})
+
+# seq floor: a mangled/rolled-back seq field must never renumber — other
+# units' found-marks point at 'benchA:N' keys forever.
+_sc_own.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'benchA', 'seq': 0,
+    'targets': [{'id': 6, 'lat': 40.6, 'lon': -119.6, 'created_at': 60.0}],
+    'cleared': {}}))
+r = client.post('/targets/saved1', json={'lat': 40.61, 'lon': -119.61})
+check('mangled seq floors at max existing id (no key reuse)',
+      r.get_json().get('key') == 'benchA:7', repr(r.get_json()))
+for k in ('benchA:6', 'benchA:7'):
+    client.post('/targets/saved1/delete', json={'key': k})
+
+# ...but a hand-edited GIANT id must not poison the floor: ids beyond the
+# key-regex ceiling (9 digits) are ignored, so new keys stay parseable.
+_sc_own.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'benchA', 'seq': 0,
+    'targets': [{'id': 10**12, 'lat': 40.6, 'lon': -119.6,
+                 'created_at': 60.0}],
+    'cleared': {}}))
+r = client.post('/targets/saved1', json={'lat': 40.62, 'lon': -119.62})
+check('giant hand-edited id does not poison the seq floor',
+      r.get_json().get('key') == 'benchA:1', repr(r.get_json()))
+client.post('/targets/saved1/delete', json={'key': 'benchA:1'})
+
+# the raw seq SCALAR gets the same ceiling: a mangled giant seq would mint
+# a 10-digit key no unit could ever delete or mark found
+_sc_own.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'benchA', 'seq': 5000000000,
+    'targets': [{'id': 3, 'lat': 40.6, 'lon': -119.6, 'created_at': 60.0}],
+    'cleared': {}}))
+r = client.post('/targets/saved1', json={'lat': 40.63, 'lon': -119.63})
+check('giant seq scalar clamped; floor recovers from target ids',
+      r.get_json().get('key') == 'benchA:4', repr(r.get_json()))
+client.post('/targets/saved1/delete', json={'key': 'benchA:4'})
+
+# AT the 9-digit ceiling, refuse the flag instead of minting past it
+_sc_own.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'benchA', 'seq': 999999999,
+    'targets': [], 'cleared': {}}))
+r = client.post('/targets/saved1', json={'lat': 40.64, 'lon': -119.64})
+check('seq at the key ceiling: flag refused, no unparseable key',
+      r.status_code == 400 and 'exhausted' in r.get_json()['error'],
+      (r.status_code, r.get_json()))
+_sc_own.write_text(json.dumps({
+    'version': 1, 'study': 'saved1', 'host': 'benchA', 'seq': 0,
+    'targets': [], 'cleared': {}}))
+
+# A study RECORDED on the other unit: our flags still work (they go to our
+# sidecar), but its in-db legacy targets are not ours to delete.
+p_foreign = make_study('run_1758000000__mm9', n_points=2)
+conn = sqlite3.connect(p_foreign)
+conn.execute('CREATE TABLE targets (id INTEGER PRIMARY KEY AUTOINCREMENT,'
+             ' lat REAL NOT NULL, lon REAL NOT NULL, created_at REAL)')
+conn.execute('INSERT INTO targets (lat, lon, created_at) '
+             'VALUES (40.7, -119.7, 60.0)')
+conn.commit()
+conn.close()
+r = client.post('/targets/run_1758000000__mm9',
+                json={'lat': 40.71, 'lon': -119.71})
+check('flagging on a foreign study goes to our sidecar',
+      r.get_json().get('key') == 'benchA:1'
+      and (Path(STUDIES)
+           / 'run_1758000000__mm9.targets__benchA.json').exists(),
+      repr(r.get_json()))
+r = client.post('/targets/run_1758000000__mm9/delete', json={'id': 1})
+check('foreign study in-db target delete refused 403',
+      r.status_code == 403 and 'mm9' in r.get_json()['error'],
+      (r.status_code, r.get_json()))
+d = client.get('/data/run_1758000000__mm9').get_json()
+check('foreign study data merges db + our sidecar',
+      sorted(t['key'] for t in d['targets']) == ['benchA:1', 'db:1']
+      and [t for t in d['targets'] if t['key'] == 'db:1'][0]['deletable']
+      is False, repr(d['targets']))
+
+# The landing page badges studies the other unit recorded.
+r = client.get('/')
+check('index badges foreign study', b'badge-sync' in r.data
+      and '⇄ mm9'.encode() in r.data)
+
+# leave saved1 with no targets — and no foreign fixtures — so later payload
+# checks see the base study set
+for key in ('benchA:2', 'benchA:3', 'db:7'):
+    client.post('/targets/saved1/delete', json={'key': key})
+_sc_mm9.unlink()
+_sc_own.unlink()          # drops the leftover cleared-map entries too
+os.unlink(p_foreign)
+(Path(STUDIES) / 'run_1758000000__mm9.targets__benchA.json').unlink()
+db_map._study_cache.clear()
+check('targets cleared',
+      client.get('/targets/saved1').get_json()['targets'] == [])
 
 # Rotation: /data serves config.json's heading_offset_deg unless the study
 # saved its own sl_heading_offset_deg before the move to config.
@@ -575,6 +968,36 @@ check('rename keeps filename', os.path.exists(p_saved))
 r = client.get('/view/saved1')
 check('view shows new name', b'Renamed Run' in r.data)
 check('view has meta panel', b'metaPanel' in r.data and b'META_GROUPS' in r.data)
+# filters: independent checkboxes + tuning controls in the template, and
+# the renderer API they drive in map_core.js
+check('view ships filter checkboxes + tuning', b'cmChk' in r.data
+      and b'syncChk' in r.data and b'cm_sync' in r.data
+      and b'syncPer' in r.data and b'syncRes' in r.data
+      and b'cmGrp' in r.data)
+check('view ships target marking UI', b'markBtn' in r.data
+      and b'tgtPanel' in r.data and b'/targets/' in r.data
+      and b'updateApproach' in r.data)
+# multi-unit target UI: key-based selection, found toggle, delete gating,
+# foreign/cleared pin styling, SSE-driven refresh via setTargets
+check('view ships multi-unit target UI', b'tgtFoundBtn' in r.data
+      and b'toggleFound' in r.data and b'setTargets' in r.data
+      and b'tgt-foreign' in r.data and b'tgt-cleared' in r.data
+      and b'selTargetKey' in r.data and b'tgtDelBtn' in r.data
+      and b'cleared_own' in r.data)
+check('view ships per-channel bias panel', b'biasBtn' in r.data
+      and b'biasPanel' in r.data and b'sl_bias8' in r.data
+      and b'effZero8' in r.data)
+check('view ships bias sliders + AGC auto', b'onBiasSlide' in r.data
+      and b'autoBias' in r.data and b'biasS' in r.data)
+check('view ships HUD dead-stream gates', b'lastAdcAt' in r.data
+      and b'lastNavAt' in r.data)
+_vjs = client.get('/static/map_core.js').data
+check('renderer ships sync filter API',
+      b'setSyncCfg' in _vjs and b'ensureSync' in _vjs
+      and b'setCmSets' in _vjs)
+check('renderer LOD bins coil footprint', b'cellCh' in _vjs)
+check('renderer applies bias upstream of filters',
+      b'zEff' in _vjs and b'bias8' in _vjs)
 r = client.get('/')
 check('index shows new name', b'Renamed Run' in r.data)
 r = client.post('/rename/saved1', json={'name': '   '})
@@ -625,6 +1048,10 @@ check('sse tick shape', evt['type'] == 'tick' and len(evt['rows']) == 5
       repr(list(evt.keys())))
 check('sse: no samples while stopped', evt['samples'] == [],
       repr(evt['samples'])[:120])
+# targets ride every tick: a flag synced in from the other unit must show
+# up on an open map without a reload.
+check('sse tick carries targets', evt.get('targets') == [],
+      repr(evt.get('targets')))
 r.response.close()
 
 # Landing-page nav chip is SSE-fed: the kiosk loads the page at boot,
@@ -866,6 +1293,13 @@ check('raw mode: streaming banner, no start form',
 # raw is the ONLY home of the detector timing controls (removed from view)
 check('raw has timing controls', b'TX Pulse' in r.data
       and b'timing-panel' in r.data)
+# Raster UI: mode toggle (fw 'r' key), client-built channel chips
+# (buildChips), and the per-channel table readout (tableVal indexes the
+# bl8/rx8/tx8 CSVs by the selected chip via st.timing.raster_sel).
+check('raw ships raster mode toggle + chips wiring',
+      b"sendCmd('r')" in r.data and b'buildChips' in r.data
+      and b'id="chipRow"' in r.data and b'tableVal' in r.data
+      and b'raster_sel' in r.data)
 # Channel legend: per-channel show/hide checkboxes + σ readout. The rows
 # are client-built (buildVals), so assert the wiring ships, not the DOM.
 check('raw ships channel-visibility + σ wiring',

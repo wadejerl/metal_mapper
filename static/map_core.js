@@ -158,7 +158,10 @@ const MM = (() => {
   /* ── Columnar point store ─────────────────────────────────────────────────
    * Typed arrays, one slot per point — no per-point JS objects. ~90 B/point,
    * so a 200k-point study is ~18 MB flat instead of GB-scale marker objects.
-   * heading NaN = none (drift test / --no-gate); fix 255 = none. */
+   * heading NaN = none (drift test / --no-gate); fix 255 = none.
+   * gt = the row's interpolated GPS timestamp in seconds (the firmware's
+   * seconds-of-minute, wrapping at 60), NaN = none — the sync filter folds
+   * on it, nothing else reads it. */
   function PointStore() {
     let cap = 1024, n = 0;
     let id  = new Uint32Array(cap);
@@ -166,6 +169,7 @@ const MM = (() => {
     let hdg = new Float32Array(cap);
     let fix = new Uint8Array(cap);
     let adc = new Uint16Array(cap * 8);        // interleaved, 8 per point
+    let gt  = new Float64Array(cap);
 
     function ensure(min) {
       if (min <= cap) return;
@@ -177,6 +181,7 @@ const MM = (() => {
       hdg = grow(hdg, Float32Array, 1);
       fix = grow(fix, Uint8Array,   1);
       adc = grow(adc, Uint16Array,  8);
+      gt  = grow(gt,  Float64Array, 1);
     }
 
     return {
@@ -185,22 +190,27 @@ const MM = (() => {
         id[n]  = p.id; lat[n] = p.lat; lon[n] = p.lon;
         hdg[n] = (p.heading == null) ? NaN : p.heading;
         fix[n] = (p.fix == null) ? 255 : p.fix;
+        // SSE rows carry gps_ts as the daemon's TEXT column; + parses or NaNs
+        const g = p.gps_ts == null ? NaN : +p.gps_ts;
+        gt[n] = Number.isFinite(g) ? g : NaN;
         for (let ch = 0; ch < 8; ch++) adc[n * 8 + ch] = p.adc[ch];
         n++;
       },
       fillColumns(cols) {                      // bulk /data columns
         const m = cols.lat.length;
         ensure(n + m);
+        const gcol = cols.gps_ts;              // absent on a pre-sync server
         for (let i = 0; i < m; i++) {
           id[n]  = cols.id[i]; lat[n] = cols.lat[i]; lon[n] = cols.lon[i];
           hdg[n] = (cols.heading[i] == null) ? NaN : cols.heading[i];
           fix[n] = (cols.fix[i] == null) ? 255 : cols.fix[i];
+          gt[n]  = (gcol && gcol[i] != null) ? gcol[i] : NaN;
           for (let ch = 0; ch < 8; ch++) adc[n * 8 + ch] = cols.adc[ch][i];
           n++;
         }
       },
       get length() { return n; },
-      view() { return {n, id, lat, lon, hdg, fix, adc}; },  // live refs: re-fetch after push
+      view() { return {n, id, lat, lon, hdg, fix, adc, gt}; },  // live refs: re-fetch after push
       adcRow(i) { return Array.from(adc.subarray(i * 8, i * 8 + 8)); },
       headingAt(i) { const h = hdg[i]; return Number.isNaN(h) ? null : h; },
       fixAt(i) { return fix[i] === 255 ? null : fix[i]; },
@@ -226,24 +236,142 @@ const MM = (() => {
 
     let store = null;
     const visible = new Array(8).fill(true);
-    let calib = {zero8: null, offset: -140, plusRange: 450, minusRange: 450};
+    let calib = {zero8: null, bias8: null,
+                 offset: -140, plusRange: 450, minusRange: 450};
+
+    /* Effective per-channel zeros: the calibrated zero plus the operator's
+     * per-channel bias trim (balances coil-to-coil mismatch the single
+     * global Offset can't). Trimming the ZERO (not the display offset)
+     * makes the trim behave like calibration everywhere — including the
+     * common-mode mean and combine-mode accumulation across re-passes. */
+    function zEff() {
+      const z = calib.zero8;
+      if (!z) return null;
+      const b = calib.bias8;
+      if (!b) return z;
+      const out = new Float64Array(8);
+      for (let ch = 0; ch < 8; ch++) out[ch] = z[ch] + (b[ch] || 0);
+      return out;
+    }
     let geom  = {spacing_mm: 500, fore_mm: 0, right_mm: 0, rot_deg: 0};
-    let filter = 'abs';   // 'abs' | 'cm' (subtract the array's common mode)
-    let combine = true;   // true: overlaps accumulate (re-pass adds);
-                          // false: classic paint, newest dots cover older
+    let useCm   = false; // subtract the array's common mode ('cm' filters)
+    let useSync = false; // subtract the GPS-synchronous template ('sync')
+    let cmSets  = true;  // common mode per 2×4 same-instant ADC set (see cmOf)
+    let combine = true;  // true: overlaps accumulate (re-pass adds);
+                         // false: classic paint, newest dots cover older
+
+    /* ── GPS-synchronous noise template ('sync' filter) ──────────────────
+     * Field finding (2026-09): a broadband transient hits the front end
+     * once per second, phase-locked to the GPS second (PPS-family source).
+     * Fold every point on gps_ts mod period, take the per-channel MEDIAN
+     * per phase bin (median so real targets — which land at random phases
+     * while driving — can't bias it), re-center each channel's template to
+     * zero mean (so subtracting it never shifts the calibrated zero), and
+     * subtract at draw time. Points without gps_ts get no correction.
+     * gps_ts wraps at 60 s, so only periods dividing 60 fold cleanly —
+     * the UI offers 0.5/1/2 s, all sub/harmonics of the 1 Hz source. */
+    const NOSYNC = 65535;            // bin sentinel: no gps_ts on this point
+    let syncPeriod = 1.0, syncBins = 40;
+    let syncTmpl = null;             // Float32Array(8 * syncBins), 0-mean/ch
+    let syncBinIdx = new Uint16Array(0);   // phase bin per point
+    let syncN = 0;                   // points binned so far
+    let syncTmplN = 0;               // points in the current template
+    const SYNC_REBUILD = 512;        // live: re-estimate every N new points
+
+    function syncReset() { syncN = 0; syncTmplN = 0; syncTmpl = null; }
+
+    /* Bin new points and (re)build the template when it is stale. Bins are
+     * centered ON the fold's sample-phase grid (round, not floor): row
+     * timestamps land exactly on 1/fs edges and float jitter must not
+     * split one slot across two bins. */
+    function ensureSync(v) {
+      if (syncBinIdx.length < v.n) {
+        const a = new Uint16Array(Math.max(v.n * 2, 1024));
+        a.set(syncBinIdx.subarray(0, syncN));
+        syncBinIdx = a;
+      }
+      for (let i = syncN; i < v.n; i++) {
+        const g = v.gt[i];
+        syncBinIdx[i] = Number.isNaN(g) ? NOSYNC
+          : Math.round(((g % syncPeriod) + syncPeriod) % syncPeriod
+                       / syncPeriod * syncBins) % syncBins;
+      }
+      syncN = v.n;
+      if (syncTmpl && v.n - syncTmplN < SYNC_REBUILD) return;
+
+      const B = syncBins;
+      const counts = new Int32Array(B);
+      for (let i = 0; i < v.n; i++) {
+        if (syncBinIdx[i] !== NOSYNC) counts[syncBinIdx[i]]++;
+      }
+      const offs = new Int32Array(B + 1);
+      for (let b = 0; b < B; b++) offs[b + 1] = offs[b] + counts[b];
+      const total = offs[B];
+      syncTmpl = new Float32Array(8 * B);
+      syncTmplN = v.n;
+      if (!total) return;
+      const vals = new Float32Array(total);
+      const cur = new Int32Array(B);
+      for (let ch = 0; ch < 8; ch++) {
+        cur.set(offs.subarray(0, B));
+        for (let i = 0; i < v.n; i++) {
+          const b = syncBinIdx[i];
+          if (b !== NOSYNC) vals[cur[b]++] = v.adc[i * 8 + ch];
+        }
+        let mean = 0, nb = 0;
+        for (let b = 0; b < B; b++) {
+          const len = offs[b + 1] - offs[b];
+          if (!len) continue;                  // empty bin: correction 0
+          const s = vals.subarray(offs[b], offs[b + 1]);
+          s.sort();                            // typed-array sort is numeric
+          const med = len & 1 ? s[len >> 1] : (s[len / 2 - 1] + s[len / 2]) / 2;
+          syncTmpl[ch * B + b] = med;
+          mean += med; nb++;
+        }
+        if (!nb) continue;
+        mean /= nb;
+        for (let b = 0; b < B; b++) {
+          if (offs[b + 1] > offs[b]) syncTmpl[ch * B + b] -= mean;
+        }
+      }
+    }
+
+    /* Per-channel sync correction at point i (0 when off / no gps_ts). */
+    function scOf(sb, ch) {
+      return (sb === NOSYNC || !syncTmpl) ? 0 : syncTmpl[ch * syncBins + sb];
+    }
 
     /* Common mode at point i: mean zeroed deviation across ENABLED channels
      * (enabled-only so a dead/railed coil can be toggled out of the mean).
      * Subtracting it hides anything that moves all coils together — drift,
-     * ground response — leaving only differential (target-like) signal. */
-    function cmOf(v, i, zero8) {
-      let sum = 0, cnt = 0;
+     * ground response — leaving only differential (target-like) signal.
+     * sb: the point's sync bin (NOSYNC when the sync filter is off), so the
+     * common mode is computed over sync-corrected values when both are on.
+     *
+     * The 8 channels are NOT sampled at one instant: the four ADCs each
+     * convert an injected pair, so first-of-pair channels (even index) all
+     * sample at one instant and second-of-pair (odd index) at the next.
+     * A fast transient therefore lands with a different amplitude on the
+     * two time-sets. cmSets=true averages each 2×4 set separately so the
+     * mean is taken over same-instant samples; false keeps the classic
+     * all-8 mean. Returns a 2-slot scratch indexed by (ch & 1). */
+    const cmPair = new Float64Array(2);
+    const CM_OFF = new Float64Array(2);      // constant zeros: cm disabled
+    function cmOf(v, i, zero8, sb) {
+      let s0 = 0, c0 = 0, s1 = 0, c1 = 0;
       for (let ch = 0; ch < 8; ch++) {
         if (!visible[ch]) continue;
-        sum += v.adc[i * 8 + ch] - zero8[ch];
-        cnt++;
+        const d = v.adc[i * 8 + ch] - scOf(sb, ch) - zero8[ch];
+        if (cmSets && (ch & 1)) { s1 += d; c1++; }
+        else { s0 += d; c0++; }
       }
-      return cnt ? sum / cnt : 0;
+      if (cmSets) {
+        cmPair[0] = c0 ? s0 / c0 : 0;
+        cmPair[1] = c1 ? s1 / c1 : 0;
+      } else {
+        cmPair[0] = cmPair[1] = c0 ? s0 / c0 : 0;
+      }
+      return cmPair;
     }
 
     const D = Math.PI / 180;
@@ -289,6 +417,7 @@ const MM = (() => {
     let visIdx = new Int32Array(4096);   // in-bbox point indices
     let cellIdx = new Int32Array(0);     // LOD: winning point per cell
     let cellDev = new Float32Array(0);   // LOD: its deviation
+    let cellCh  = new Int8Array(0);      // LOD: its channel
     let accVal  = new Float32Array(0);   // detail: settled sum of past visits
     let accSeg  = new Float32Array(0);   // detail: current visit's extreme
     let accLast = new Int32Array(0);     // detail: last point index per cell
@@ -365,57 +494,77 @@ const MM = (() => {
       ctx.lineWidth = 1; ctx.stroke();
       ctx.globalAlpha = 0.75;
 
-      const zero8 = calib.zero8, off = calib.offset;
+      const zero8 = zEff(), off = calib.offset;
       const minus = calib.minusRange, plus = calib.plusRange;
       /* Dot width = coil spacing on screen: adjacent coil tracks tile into
        * a seamless carpet at every zoom — touching, never overlapping. */
       const d = Math.max(1, (geom.spacing_mm / 1000) * P.pxPerM);
       const r = d / 2;
-      const cmMode = filter === 'cm' && !!zero8;
+      const cmMode = useCm && !!zero8;
+      const syncMode = useSync && !!zero8;
+      if (syncMode) ensureSync(v);
 
       if (nVis > LOD_POINTS) {
-        /* ── LOD: bin antenna positions, keep the strongest hit per cell ── */
+        /* ── LOD: bin COIL positions, keep the strongest hit per cell ──
+         * Binning the coils (not the antenna point) preserves the array's
+         * true ground footprint at every zoom: the swath stays a band that
+         * touches/overlaps the neighboring pass, exactly as the coils did,
+         * instead of collapsing into a one-cell-wide track line. */
         const gw = Math.ceil(size.x / LOD_CELL), gh = Math.ceil(size.y / LOD_CELL);
         const cells = gw * gh;
         if (cellIdx.length < cells) {
           cellIdx = new Int32Array(cells); cellDev = new Float32Array(cells);
+          cellCh = new Int8Array(cells);
         }
         cellIdx.fill(-1, 0, cells);
         cellDev.fill(-1, 0, cells);
+        const spacingML = geom.spacing_mm / 1000;
+        const rightM0L  = geom.right_mm / 1000, foreML = geom.fore_mm / 1000;
+        const rotL = geom.rot_deg || 0;
         for (let k = 0; k < nVis; k++) {
           const i = visIdx[k];
-          const cx = (projX(P, v.lon[i]) / LOD_CELL) | 0;
-          const cy = (projY(P, v.lat[i]) / LOD_CELL) | 0;
-          if (cx < 0 || cy < 0 || cx >= gw || cy >= gh) continue;
-          const c = cy * gw + cx;
-          let dev = 0;
-          if (zero8) {
-            const cm = cmMode ? cmOf(v, i, zero8) : 0;
-            for (let ch = 0; ch < 8; ch++) {
-              if (!visible[ch]) continue;
-              const e = Math.abs(v.adc[i * 8 + ch] - cm - (zero8[ch] + off));
-              if (e > dev) dev = e;
-            }
+          const ax = projX(P, v.lon[i]), ay = projY(P, v.lat[i]);
+          const sb = syncMode ? syncBinIdx[i] : NOSYNC;
+          const cm = cmMode ? cmOf(v, i, zero8, sb) : CM_OFF;
+          const h = v.hdg[i];
+          const noHdg = Number.isNaN(h);   // no heading: all 8 at the antenna
+          let fwdN = 0, fwdE = 0, dN0 = 0, dE0 = 0;
+          if (!noHdg) {
+            const a = (h + rotL) * D;
+            fwdN = Math.cos(a); fwdE = Math.sin(a);
+            dN0 = foreML * fwdN; dE0 = foreML * fwdE;
           }
-          if (dev >= cellDev[c]) { cellDev[c] = dev; cellIdx[c] = i; }
+          for (let ch = 0; ch < 8; ch++) {
+            if (!visible[ch]) continue;
+            let x = ax, y = ay;
+            if (!noHdg) {
+              const rightM = rightM0L + (ch - 3.5) * spacingML;
+              const dE = dE0 + rightM * fwdN;          // rgtE =  fwdN
+              const dN = dN0 - rightM * fwdE;          // rgtN = -fwdE
+              x = ax + dE * P.pxPerM; y = ay - dN * P.pxPerM;
+            }
+            const cx = (x / LOD_CELL) | 0, cy = (y / LOD_CELL) | 0;
+            if (cx < 0 || cy < 0 || cx >= gw || cy >= gh) continue;
+            const c = cy * gw + cx;
+            const e = zero8
+              ? Math.abs(v.adc[i * 8 + ch] - scOf(sb, ch) - cm[ch & 1]
+                         - (zero8[ch] + off)) : 0;
+            if (e >= cellDev[c]) { cellDev[c] = e; cellIdx[c] = i; cellCh[c] = ch; }
+          }
         }
+        /* Paint at the cell, sized so covered cells tile into a carpet. */
         const s = Math.max(d, LOD_CELL);
         for (let c = 0; c < cells; c++) {
           const i = cellIdx[c];
           if (i < 0) continue;
-          /* color by the winning channel's actual value (signed) */
-          const cm = cmMode ? cmOf(v, i, zero8) : 0;
-          let best = -1, bch = -1;
-          for (let ch = 0; ch < 8; ch++) {
-            if (!visible[ch]) continue;
-            const e = zero8
-              ? Math.abs(v.adc[i * 8 + ch] - cm - (zero8[ch] + off)) : 0;
-            if (e >= best) { best = e; bch = ch; }
-          }
-          if (bch < 0) continue;                       // all channels hidden
-          const x = projX(P, v.lon[i]), y = projY(P, v.lat[i]);
+          const ch = cellCh[c];
+          const sb = syncMode ? syncBinIdx[i] : NOSYNC;
+          const cm = cmMode ? cmOf(v, i, zero8, sb) : CM_OFF;
+          const x = (c % gw) * LOD_CELL + LOD_CELL / 2;
+          const y = ((c / gw) | 0) * LOD_CELL + LOD_CELL / 2;
           ctx.fillStyle = zero8
-            ? styleFor(v.adc[i * 8 + bch] - cm, zero8[bch] + off, minus, plus)
+            ? styleFor(v.adc[i * 8 + ch] - scOf(sb, ch) - cm[ch & 1],
+                       zero8[ch] + off, minus, plus)
             : 'rgb(128,128,128)';
           ctx.fillRect(x - s / 2, y - s / 2, s, s);
         }
@@ -453,7 +602,8 @@ const MM = (() => {
           const a = (h + rot) * D;
           const fwdN = Math.cos(a), fwdE = Math.sin(a);
           const dN0 = foreM * fwdN, dE0 = foreM * fwdE;
-          const cm = cmMode ? cmOf(v, i, zero8) : 0;
+          const sb = syncMode ? syncBinIdx[i] : NOSYNC;
+          const cm = cmMode ? cmOf(v, i, zero8, sb) : CM_OFF;
           for (let ch = 0; ch < 8; ch++) {
             if (!visible[ch]) continue;
             const rightM = rightM0 + (ch - 3.5) * spacingM;
@@ -461,7 +611,8 @@ const MM = (() => {
             const dN = dN0 - rightM * fwdE;            // rgtN = -fwdE
             /* raw zeroed deviation only — the display offset is applied ONCE
              * at colorize, else a re-pass would double it into the tint */
-            const dev = zero8 ? v.adc[i * 8 + ch] - cm - zero8[ch] : 0;
+            const dev = zero8
+              ? v.adc[i * 8 + ch] - scOf(sb, ch) - cm[ch & 1] - zero8[ch] : 0;
             const x0 = Math.max(0, Math.round(ax + dE * P.pxPerM - r));
             const y0 = Math.max(0, Math.round(ay - dN * P.pxPerM - r));
             const x1 = Math.min(gw, x0 + dI), y1 = Math.min(gh, y0 + dI);
@@ -521,15 +672,16 @@ const MM = (() => {
           const a = (h + rot) * D;
           const fwdN = Math.cos(a), fwdE = Math.sin(a);
           const dN0 = foreM * fwdN, dE0 = foreM * fwdE;
-          const cm = cmMode ? cmOf(v, i, zero8) : 0;
+          const sb = syncMode ? syncBinIdx[i] : NOSYNC;
+          const cm = cmMode ? cmOf(v, i, zero8, sb) : CM_OFF;
           for (let ch = 0; ch < 8; ch++) {
             if (!visible[ch]) continue;
             const rightM = rightM0 + (ch - 3.5) * spacingM;
             const dE = dE0 + rightM * fwdN;            // rgtE =  fwdN
             const dN = dN0 - rightM * fwdE;            // rgtN = -fwdE
-            const val = v.adc[i * 8 + ch];
+            const val = v.adc[i * 8 + ch] - scOf(sb, ch);
             ctx.fillStyle = zero8
-              ? styleFor(val - cm, zero8[ch] + off, minus, plus)
+              ? styleFor(val - cm[ch & 1], zero8[ch] + off, minus, plus)
               : 'rgb(128,128,128)';
             ctx.fillRect(ax + dE * P.pxPerM - r, ay - dN * P.pxPerM - r, d, d);
           }
@@ -595,11 +747,16 @@ const MM = (() => {
         out.latlng = coilPositions(v.lat[i], v.lon[i], out.heading,
                                    geom)[hit.ch];
         out.val = v.adc[i * 8 + hit.ch];
-        if (calib.zero8) {
+        const z8 = zEff();
+        if (z8) {
           /* dev: the zeroed value that drives the color (pre-offset),
-           * common-mode-corrected when the filter is on */
-          const cm = filter === 'cm' ? cmOf(v, i, calib.zero8) : 0;
-          out.dev = out.val - cm - calib.zero8[hit.ch];
+           * filter-corrected the same way the dots are */
+          let sb = NOSYNC;
+          if (useSync) { ensureSync(v); sb = syncBinIdx[i]; }
+          const cm = useCm ? cmOf(v, i, z8, sb)[hit.ch & 1] : 0;
+          const sc = scOf(sb, hit.ch);
+          out.dev = out.val - sc - cm - z8[hit.ch];
+          if (sc) out.sync = sc;   // popup can show what the filter removed
         }
       }
       return out;
@@ -608,10 +765,31 @@ const MM = (() => {
     map.on('moveend zoomend viewreset resize', markDirty);
 
     return {
-      setStore(s) { store = s; markDirty(); },
+      setStore(s) { store = s; syncReset(); markDirty(); },
       setGeometry(g) { geom = g; markDirty(); },
       setCalib(c) { Object.assign(calib, c); markDirty(); },
-      setFilter(f) { filter = f === 'cm' ? 'cm' : 'abs'; markDirty(); },
+      /* 'abs' | 'cm' | 'sync' | 'cm_sync' — cm and sync are independent
+       * corrections and compose (sync first, then common mode). */
+      setFilter(f) {
+        useCm   = f === 'cm' || f === 'cm_sync';
+        useSync = f === 'sync' || f === 'cm_sync';
+        markDirty();
+      },
+      setSyncCfg(cfg) {
+        const p = +cfg.period, b = Math.round(+cfg.bins);
+        const period = (p > 0 && Number.isFinite(p)) ? p : 1.0;
+        const bins = Math.min(400, Math.max(8, Number.isFinite(b) ? b : 40));
+        if (period === syncPeriod && bins === syncBins) return;
+        syncPeriod = period; syncBins = bins;
+        syncReset();                 // rebin + re-estimate on next redraw
+        markDirty();
+      },
+      /* true: common mode per 2×4 same-instant ADC set; false: all-8 mean */
+      setCmSets(on) {
+        on = !!on;
+        if (on === cmSets) return;
+        cmSets = on; markDirty();
+      },
       setCombine(on) { combine = !!on; markDirty(); },
       setVisible(ch, on) { visible[ch] = on; markDirty(); },
       getVisible() { return visible.slice(); },

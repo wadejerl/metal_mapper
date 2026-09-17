@@ -1,0 +1,16 @@
+[Unit]
+Description=Metal Mapper studies sync every 30 s
+
+[Timer]
+# 30 s is the flag-to-other-unit latency AND the growth cadence of a live
+# study on the other unit's map. AccuracySec tightens systemd's default
+# 1-minute coalescing slack; nothing else on the Pi needs batching.
+OnBootSec=45s
+OnUnitActiveSec=30s
+AccuracySec=5s
+# decorrelate the two units (both powered on together) so one's pull isn't
+# perpetually racing the other's multi-MB snapshot push at the hub
+RandomizedDelaySec=8
+
+[Install]
+WantedBy=timers.target

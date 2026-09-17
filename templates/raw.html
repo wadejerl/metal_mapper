@@ -76,6 +76,15 @@
     /* Rate slider: browses the discrete 20/40/100/200/500 Hz list — the
        thumb snaps to 5 stops, each stop = one g/b step at the firmware */
     #rateSl { width:68px; height:4px; }
+    /* raster channel chips: A(ll) + 0-7, colored per trace, filled when
+       selected. Sized so the strip (9×17px + 2px gaps = 169px) stays inside
+       the timing panel's intrinsic width — the panel grows DOWN, never
+       sideways, keeping the hand-tuned one-row toolbar budget at 800px */
+    #chipRow { gap:2px; }
+    .ch-chip { width:17px; height:18px; padding:0; box-sizing:border-box;
+               border:1px solid #666; border-radius:3px; background:transparent;
+               color:#ccc; font-size:10px; font-family:monospace;
+               cursor:pointer; line-height:1; }
     /* the big chart */
     #chartWrap { position:absolute; left:0; right:0; bottom:0;
                  display:flex; gap:8px; padding:6px; box-sizing:border-box; }
@@ -242,20 +251,29 @@ function dismissErr() {
   <div id="timing-panel">
     <h4>Detector Timing</h4>
     <div class="tm-row">
+      <span class="tm-lbl" title="all: 8 coils fire together, shared timing — raster: one channel per time slot, per-channel timing (firmware 'r' key)">Mode</span>
+      <span class="tm-val" id="modeVal" style="min-width:40px;">—</span>
+      <button class="tm-btn" onclick="sendCmd('r')"
+              title="toggle raster / all-at-once">⇄</button>
+      <span class="tm-val" id="slotVal" style="min-width:0; color:#9ab;"
+            title="raster slot period"></span>
+    </div>
+    <div class="tm-row" id="chipRow" style="display:none;"></div>
+    <div class="tm-row">
       <span class="tm-lbl">Blanking</span>
-      <span class="tm-val" id="blankVal">—</span>µs
+      <span class="tm-val" id="blankVal">—</span>
       <button class="tm-btn" onclick="sendCmd('a')">+1</button>
       <button class="tm-btn" onclick="sendCmd('z')">−1</button>
     </div>
     <div class="tm-row">
       <span class="tm-lbl">RX Window</span>
-      <span class="tm-val" id="winVal">—</span>µs
+      <span class="tm-val" id="winVal">—</span>
       <button class="tm-btn" onclick="sendCmd('s')">+1</button>
       <button class="tm-btn" onclick="sendCmd('x')">−1</button>
     </div>
     <div class="tm-row">
       <span class="tm-lbl">TX Pulse</span>
-      <span class="tm-val" id="txVal">—</span>µs
+      <span class="tm-val" id="txVal">—</span>
       <button class="tm-btn" onclick="sendCmd('f')">+1</button>
       <button class="tm-btn" onclick="sendCmd('v')">−1</button>
     </div>
@@ -409,6 +427,59 @@ function sendCmd(byte) {
   return cmdChain;
 }
 
+// ── Raster mode: channel chips + per-channel timing readout ──────────────────
+// Chips pick the channel whose table entry the +/- buttons edit ('A' = all 8
+// in lockstep); they send the firmware's digit keys. Selection is ABSOLUTE
+// (unlike the relative g/b rate walk), so a tap paints optimistically and any
+// later rastercfg echo → meta → SSE tick confirms — a stale tick can only
+// flicker the highlight, never corrupt state, so no two-tick dance needed.
+let selPending = null;   // {val, t}: tap sent, echo not yet seen in meta
+let curSel = 'all';      // painted selection: 'all' or '0'..'7'
+
+function buildChips() {
+  const row = document.getElementById('chipRow');
+  for (let i = 0; i <= 8; i++) {
+    const b = document.createElement('button');
+    b.className = 'ch-chip';
+    b.id = 'chip' + i;
+    if (i === 8) { b.textContent = 'A'; b.title = 'edit all 8 channels in lockstep'; }
+    else {
+      b.textContent = i;
+      b.title = 'edit ch' + i + ' only';
+      b.style.color = CH_COLORS[i];
+      b.style.borderColor = CH_COLORS[i];
+    }
+    b.onclick = () => {
+      selPending = {val: i === 8 ? 'all' : String(i), t: performance.now()};
+      paintChips(selPending.val);
+      sendCmd(String(i));
+    };
+    row.appendChild(b);
+  }
+}
+buildChips();
+
+function paintChips(sel) {
+  curSel = sel;
+  for (let i = 0; i <= 8; i++) {
+    const b = document.getElementById('chip' + i);
+    const on = (i === 8) ? sel === 'all' : sel === String(i);
+    const c = (i === 8) ? '#ccc' : CH_COLORS[i];
+    b.style.background = on ? c : 'transparent';
+    b.style.color = on ? '#000' : c;
+  }
+}
+
+// One value out of an 8-entry CSV table ('16,16,...'): the selected
+// channel's, or the common value under 'all' — 'mixed' when they disagree
+// (the lockstep edit still applies; the readout just can't show one number).
+function tableVal(csv, sel) {
+  const v = (csv || '').split(',');
+  if (v.length !== 8) return null;
+  if (sel !== 'all') return v[+sel];
+  return v.every(x => x === v[0]) ? v[0] : 'mixed';
+}
+
 // ── Sample-rate slider ────────────────────────────────────────────────────────
 // The firmware browses a fixed divisor list with g (up) / b (down); the
 // slider's 5 stops map onto it. A drag can mean several steps sent as
@@ -550,16 +621,38 @@ function updateStatus(st) {
                      MM.reasonText(st.reason);
   }
 
-  for (const [key, id] of [['blanking_us', 'blankVal'],
-                           ['rx_window_us', 'winVal'],
-                           ['tx_pulse_us', 'txVal']]) {
-    if (st.timing && st.timing[key] != null) {
-      document.getElementById(id).textContent = st.timing[key];
-    }
+  // Timing panel. In raster mode the three values show the SELECTED
+  // channel's table entry; in all-at-once mode the shared globals, exactly
+  // as before. An old-firmware stream never sets detector_mode, so the
+  // panel degrades to today's behavior with a '—' mode row.
+  const tm = st.timing || {};
+  const raster = tm.detector_mode === 'raster';
+  setVal('modeVal', tm.detector_mode || '—');
+  document.getElementById('slotVal').textContent =
+      (raster && tm.slot_us != null) ? tm.slot_us + 'µs' : '';
+  document.getElementById('chipRow').style.display = raster ? 'flex' : 'none';
+  if (selPending && (tm.raster_sel === selPending.val ||
+                     performance.now() - selPending.t > 5000)) {
+    selPending = null;
+  }
+  paintChips(selPending ? selPending.val
+                        : (tm.raster_sel != null ? tm.raster_sel : 'all'));
+  const vals = raster
+      ? [['blankVal', tableVal(tm.bl8, curSel), tm.bl8],
+         ['winVal',   tableVal(tm.rx8, curSel), tm.rx8],
+         ['txVal',    tableVal(tm.tx8, curSel), tm.tx8]]
+      : [['blankVal', tm.blanking_us,  null],
+         ['winVal',   tm.rx_window_us, null],
+         ['txVal',    tm.tx_pulse_us,  null]];
+  for (const [id, v, fullCsv] of vals) {
+    if (v == null) continue;
+    const el = document.getElementById(id);
+    el.textContent = v === 'mixed' ? 'mixed' : v + 'µs';
+    el.title = fullCsv || '';
   }
   // meta values arrive as strings; the RATES lookup needs the number
-  if (st.timing && st.timing.sample_rate_hz != null) {
-    updateRateFromFw(parseInt(st.timing.sample_rate_hz, 10));
+  if (tm.sample_rate_hz != null) {
+    updateRateFromFw(parseInt(tm.sample_rate_hz, 10));
   }
 
   const lv = st.live;

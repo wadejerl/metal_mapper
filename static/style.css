@@ -7,6 +7,8 @@ body { font-family: Arial, sans-serif; background: #1a1a2e; color: #eee;
          font-weight: bold; display: inline-block; }
 .badge-live  { background: #1b5e20; color: #a5d6a7; }
 .badge-saved { background: #37474f; color: #90a4ae; }
+/* study recorded on the other head unit, synced in via the hub */
+.badge-sync  { background: #4a148c; color: #ce93d8; }
 
 .btn { border: none; padding: 5px 12px; border-radius: 4px; cursor: pointer;
        font-size: 12px; font-weight: bold; color: #fff; }

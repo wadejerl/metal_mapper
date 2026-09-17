@@ -1,0 +1,13 @@
+[Unit]
+Description=Metal Mapper studies sync (push/pull with the hub)
+# Timer-activated (jlw_mm_sync.timer) — no [Install] section on purpose:
+# this must never be enabled standalone. A cycle with the hub unreachable
+# exits 0 quietly, so bench/home runs don't paint the unit red.
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+Group=pi
+ExecStart=/opt/metal_mapper/sync_studies.sh

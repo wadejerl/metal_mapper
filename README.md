@@ -47,6 +47,8 @@ lat,lon,fix,adc0..adc7,gps_ts,heading,tick[,vin_V,temp_C]
 
 Full protocol details (tick semantics, console keys, flash persistence,
 daemon recording model): [`docs/detector3.md`](docs/detector3.md).
+Multi-unit studies sync (two head units through the RTK base Pi hub,
+per-host dig-target sidecars): [`docs/studies_sync.md`](docs/studies_sync.md).
 
 ---
 

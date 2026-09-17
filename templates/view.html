@@ -31,6 +31,58 @@
     .slider-row label { min-width:52px; }
     .slider-row input[type=range] { width:110px; height:4px; }
     .slider-row .sv { min-width:40px; font-family:monospace; }
+    .slider-row .fchk { min-width:0; display:flex; align-items:center;
+                        gap:2px; font-size:11px; white-space:nowrap; }
+    /* dig-target pins + approach guidance panel */
+    .tgt-pin { width:22px; height:22px; border-radius:50% 50% 50% 0;
+               transform:rotate(-45deg); background:#ff9500;
+               border:2px solid #000; box-shadow:0 0 3px #000; }
+    .tgt-pin span { display:block; transform:rotate(45deg);
+                    font:bold 12px/20px sans-serif; color:#000;
+                    text-align:center; }
+    /* flagged on the other head unit (synced sidecar) — purple */
+    .tgt-pin.tgt-foreign { background:#ce93d8; }
+    /* marked found: retired but still on the map (struck number) */
+    .tgt-pin.tgt-cleared { background:#666; }
+    .tgt-pin.tgt-cleared span { text-decoration:line-through; color:#222; }
+    /* selection trumps all of the above */
+    .tgt-pin.tgt-sel { background:#00e5ff; }
+    .tgt-pin.tgt-sel span { text-decoration:none; color:#000; }
+    #map.marking { cursor:crosshair; }
+    #tgtPanel { display:none; position:fixed; right:10px; z-index:1100;
+                width:150px; background:rgba(10,10,10,0.88); color:#fff;
+                border:1px solid #555; border-radius:6px; padding:8px;
+                text-align:center; font-size:12px; }
+    #tgtHead { display:flex; align-items:center; gap:4px;
+               justify-content:space-between; margin-bottom:4px; }
+    /* labels carry a host tag now ('mm1-3'); a long tag must wrap inside
+       the label, never squeeze the buttons off the 150px panel */
+    #tgtHead > span { overflow-wrap:anywhere; text-align:left; min-width:0; }
+    .tgt-btn { background:#333; color:#ccc; border:1px solid #666;
+               border-radius:3px; font-size:12px; width:22px; height:22px;
+               padding:0; flex:none; }
+    #tgtArrow { font-size:64px; line-height:72px; transition:transform 0.2s; }
+    #tgtDist { font-size:26px; font-weight:bold; font-family:monospace; }
+    #tgtRef { font-size:10px; color:#999; }
+    #tgtDev { margin-top:4px; font-family:monospace; border-radius:4px;
+              padding:1px 0; }
+    #tgtDev.hot { background:#a00; }  #tgtDev.warm { background:#a60; }
+    #tgtLL { font-size:9px; color:#888; font-family:monospace;
+             margin-top:4px; }
+    /* per-channel offset-bias panel */
+    #biasPanel { display:none; position:fixed; left:8px; top:150px;
+                 z-index:1050; background:rgba(0,0,0,0.92); color:#ddd;
+                 border:1px solid rgba(255,255,255,0.25); border-radius:6px;
+                 padding:8px 10px; font-size:12px; font-family:monospace; }
+    #biasPanel h4 { margin:0 0 6px 0; font-size:11px; color:#a5d6a7;
+                    display:flex; justify-content:space-between; gap:10px; }
+    .bias-row { display:flex; align-items:center; gap:5px; margin:2px 0; }
+    .bias-row .bch { width:16px; font-weight:bold; text-align:center; }
+    .bias-row .bv { width:44px; text-align:right; }
+    .bias-row .bsl { width:150px; height:20px; margin:0; }
+    .bias-btn { background:#333; color:#eee; border:1px solid #666;
+                border-radius:3px; width:26px; height:20px; padding:0;
+                font-size:13px; line-height:1; }
     .sliders-col { display:flex; flex-direction:column; gap:4px; }
     /* per-channel strip chart + readout */
     #strip-wrap { display:flex; gap:6px; align-items:stretch; }
@@ -146,12 +198,34 @@
       <input type="range" id="offSl" min="-2000" max="2000" step="10" value="-140"
              oninput="onSliders()">
       <span class="sv" id="offV">-140</span>
+      <button id="biasBtn" onclick="toggleBias()"
+              style="font-size:11px;padding:1px 6px;"
+              title="Per-channel bias: trim each coil's zero on top of the global Offset to balance coil-to-coil mismatch. Applied upstream of the Δ filter.">±ch</button>
     </div>
     <div class="slider-row">
-      <label title="Δ array: subtract the mean of the enabled coils at each instant — hides rises/falls common to the whole array, keeps differential (target) response">Filter</label>
-      <select id="filterSel" onchange="onFilter()">
-        <option value="abs">absolute</option>
-        <option value="cm">Δ array mean</option>
+      <label>Filter</label>
+      {# independent toggles — filters compose (sync first, then Δ), and the
+         list will grow as more interference modes are characterized #}
+      <label class="fchk" title="Δ array: subtract the mean of the enabled coils at each instant — hides rises/falls common to the whole array, keeps differential (target) response.">
+        <input type="checkbox" id="cmChk" onchange="onFilter()">Δ</label>
+      <label class="fchk" title="1 Hz sync: subtract the study's average GPS-second-synchronous waveform per channel — removes once-per-second (PPS-family) interference; real targets don't repeat every second, so they survive.">
+        <input type="checkbox" id="syncChk" onchange="onFilter()">sync</label>
+      <select id="syncPer" onchange="onFilter()" style="font-size:11px;"
+              title="sync filter: fold period (the interference repeat rate)">
+        <option value="0.5">½ s</option>
+        <option value="1" selected>1 s</option>
+        <option value="2">2 s</option>
+      </select>
+      <select id="syncRes" onchange="onFilter()" style="font-size:11px;"
+              title="sync filter: template resolution — finer follows a sharper transient but needs more data per bin">
+        <option value="50">50 ms</option>
+        <option value="25" selected>25 ms</option>
+        <option value="10">10 ms</option>
+      </select>
+      <select id="cmGrp" onchange="onFilter()" style="font-size:11px;"
+              title="Δ filter grouping: the 4 ADCs convert in pairs, so even-index coils sample at one instant and odd-index at the next — 2×4 averages each same-instant set separately (better against fast transients); all 8 is the classic whole-array mean">
+        <option value="sets" selected>2×4</option>
+        <option value="all8">all 8</option>
       </select>
     </div>
     <div class="slider-row">
@@ -160,6 +234,10 @@
       <button class="btn btn-blue"
               style="font-size:11px;padding:2px 8px;margin-left:8px;"
               onclick="saveSliders(this)">{{ ic.save(12) }} Save View</button>
+      <button class="btn btn-grey" id="markBtn"
+              style="font-size:11px;padding:2px 8px;"
+              title="Mark targets: while on, each map click drops a numbered dig target at that exact spot (saved with the study). Click a pin any time to get guidance to it."
+              onclick="toggleMark()">⌖ Mark</button>
     </div>
   </div>
 
@@ -204,6 +282,40 @@
 
 <div id="map"></div>
 
+{# Approach guidance: shown while a dig target is selected. Big arrow +
+   distance — this is read from the driver's seat on the 800x480 kiosk. #}
+<div id="tgtPanel">
+  <div id="tgtHead">
+    <span>Target <b id="tgtNum"></b></span>
+    <button class="tgt-btn" id="tgtFoundBtn" onclick="toggleFound()"
+            title="Mark found">✓</button>
+    <button class="tgt-btn" id="tgtDelBtn" onclick="deleteTarget()"
+            title="Delete this target">✕</button>
+    <button class="tgt-btn" onclick="selectTarget(null)" title="Close guidance">–</button>
+  </div>
+  <div id="tgtArrowWrap"><div id="tgtArrow">⬆</div></div>
+  <div id="tgtDist">—</div>
+  <div id="tgtRef"></div>
+  <div id="tgtDev">live dev —</div>
+  <div id="tgtLL"></div>
+</div>
+
+{# Per-channel offset bias: trims each coil's zero to balance coil-to-coil
+   mismatch. Rows are built by JS from CH_COLORS. #}
+<div id="biasPanel">
+  <h4><span>Per-channel bias</span>
+    <span>
+      <button class="bias-btn" style="width:auto;padding:0 6px;"
+              onclick="autoBias()"
+              title="AGC: balance the channels automatically — trims each zero to the channel's median over the loaded data, then tweak from there">auto</button>
+      <button class="bias-btn" style="width:auto;padding:0 6px;"
+              onclick="resetBias()" title="Zero all biases">reset</button>
+      <button class="bias-btn" onclick="toggleBias()" title="Close">✕</button>
+    </span>
+  </h4>
+  <div id="biasRows"></div>
+</div>
+
 <script>
 // ── Constants injected from Flask ─────────────────────────────────────────────
 const STUDY_ID      = {{ study_id      | tojson }};
@@ -218,7 +330,17 @@ const store    = MM.PointStore();   // columnar; no per-point JS objects
 let lastId     = 0;
 let isPaused   = false;
 let meta       = {};
-let calib      = {zero8: null, offset: -140, plusRange: 450, minusRange: 450};
+let calib      = {zero8: null, bias8: [0, 0, 0, 0, 0, 0, 0, 0],
+                  offset: -140, plusRange: 450, minusRange: 450};
+
+// Effective zeros = calibrated zero + the operator's per-channel bias trim
+// (balances coil-to-coil mismatch one global Offset can't). Applied
+// UPSTREAM of every filter: the renderer folds it into zEff() before the
+// Δ common-mode mean, and the strip/readout/HUD use it via this helper.
+function effZero8() {
+  return calib.zero8
+    ? calib.zero8.map((z, ch) => z + (calib.bias8[ch] || 0)) : null;
+}
 let geom       = {spacing_mm: 330, fore_mm: 0, right_mm: 500, rot_deg: 270};
 let adcLabels  = [];
 
@@ -230,6 +352,8 @@ function relayout() {
   const mapTop = bannerH + toolbar.offsetHeight;
   document.getElementById('map').style.top = mapTop + 'px';
   document.getElementById('metaPanel').style.top = (mapTop + 8) + 'px';
+  document.getElementById('tgtPanel').style.top = (mapTop + 10) + 'px';
+  document.getElementById('biasPanel').style.top = (mapTop + 10) + 'px';
   mapObj.invalidateSize();
 }
 
@@ -285,8 +409,9 @@ const renderer = MM.ChannelRenderer(mapObj);
 renderer.setStore(store);
 const navLayer = MM.NavLayer(mapObj);
 
-// Click → nearest dot (renderer hit-test; every dot inspectable).
+// Click → mark a target (mark mode) or inspect the nearest dot.
 mapObj.on('click', e => {
+  if (markMode) { addTarget(e.latlng); return; }
   const hit = renderer.hitTest(e.containerPoint);
   if (!hit) return;
   const html = (hit.ch == null)
@@ -295,11 +420,228 @@ mapObj.on('click', e => {
       `fix ${MM.fixLabel(hit.fix)}`
     : `ch${hit.ch} · adc ${hit.val}` +
       (hit.dev != null ? ` · Δ ${hit.dev >= 0 ? '+' : ''}${hit.dev.toFixed(0)}` : '') +
+      (hit.sync != null ? ` (sync ${hit.sync >= 0 ? '−' : '+'}${Math.abs(hit.sync).toFixed(0)})` : '') +
       `<br>` +
       `${hit.latlng[0].toFixed(7)}, ${hit.latlng[1].toFixed(7)}<br>` +
       `heading ${hit.heading.toFixed(1)}°  fix ${MM.fixLabel(hit.fix)}`;
   L.popup().setLatLng(hit.latlng).setContent(html).openOn(mapObj);
 });
+
+// ── Dig targets: numbered marks saved with the study + approach guidance ─────
+// Mark mode drops a target at the exact clicked lat/lon; clicking a pin
+// brings up the approach panel: distance, a big arrow (relative to travel
+// direction when moving), and a coarse live deviation readout — the drive-
+// to-dig HUD.
+let targets = [];              // merged across units: [{key, src, id, own,
+                               //  label, cleared, deletable, lat, lon, ...}]
+let targetsJson = '';          // last rendered list, serialized — SSE ships
+                               // the merged list every tick, repaint only
+                               // when it actually changed
+let tgtMarkers = {};           // key ('src:id') -> L.marker
+let selTargetKey = null;
+let markMode = false;
+let tgtLine = null;            // dashed guide line, nav fix → target
+let lastNav = null;            // latest nav snapshot (SSE / initial /data)
+let lastNavAt = 0;             // when it arrived — same dead-stream honesty
+                               // as lastAdcAt, for the distance/arrow side
+let lastAdc = null;            // latest live sample row (SSE)
+let lastAdcAt = 0;             // when it arrived — a dead stream must read
+                               // "—", not freeze a hot number labeled live
+let arrowDeg = 0;              // continuous (unwrapped) arrow angle: CSS
+                               // transitions interpolate numerically, so
+                               // 359°→1° must be +2°, not −358° of spin
+
+const RAD = Math.PI / 180;
+function distM(la1, lo1, la2, lo2) {
+  // equirectangular — sub-mm error at dig-site scale
+  const x = (lo2 - lo1) * RAD * Math.cos((la1 + la2) / 2 * RAD);
+  const y = (la2 - la1) * RAD;
+  return Math.hypot(x, y) * 6371000;
+}
+function bearingTo(la1, lo1, la2, lo2) {
+  const p1 = la1 * RAD, p2 = la2 * RAD, dl = (lo2 - lo1) * RAD;
+  const y = Math.sin(dl) * Math.cos(p2);
+  const x = Math.cos(p1) * Math.sin(p2)
+          - Math.sin(p1) * Math.cos(p2) * Math.cos(dl);
+  return (Math.atan2(y, x) / RAD + 360) % 360;
+}
+
+function tgtIcon(t) {
+  // Pin shows the bare number; the flagging unit reads as color (orange =
+  // this unit / the study db, purple = the other unit) and the panel
+  // carries the full label. Order matters: selection trumps cleared.
+  let cls = '';
+  if (t.src !== 'db' && !t.own) cls += ' tgt-foreign';
+  if (t.cleared) cls += ' tgt-cleared';
+  if (t.key === selTargetKey) cls += ' tgt-sel';
+  // The -45° rotation swings the pin's sharp corner to (13, 13+13·√2):
+  // anchor THERE so the visible tip sits exactly on the marked lat/lon.
+  return L.divIcon({className: '', iconSize: [26, 26], iconAnchor: [13, 31],
+    html: `<div class="tgt-pin${cls}"><span>${t.id}</span></div>`});
+}
+
+function renderTargets() {
+  const keys = new Set(targets.map(t => t.key));
+  for (const k of Object.keys(tgtMarkers)) {
+    if (!keys.has(k)) { mapObj.removeLayer(tgtMarkers[k]); delete tgtMarkers[k]; }
+  }
+  targets.forEach(t => {
+    let m = tgtMarkers[t.key];
+    if (!m) {
+      m = L.marker([t.lat, t.lon], {icon: tgtIcon(t), zIndexOffset: 900});
+      m.on('click', () => selectTarget(t.key));  // marker clicks don't bubble
+      tgtMarkers[t.key] = m.addTo(mapObj);
+    } else {
+      m.setIcon(tgtIcon(t));
+    }
+  });
+  if (selTargetKey != null && !keys.has(selTargetKey)) selTargetKey = null;
+  updateApproach();
+}
+
+function setTargets(list) {
+  const j = JSON.stringify(list);
+  if (j === targetsJson) return;
+  targetsJson = j;
+  targets = list;
+  renderTargets();
+}
+
+function toggleMark() {
+  markMode = !markMode;
+  const b = document.getElementById('markBtn');
+  b.classList.toggle('btn-blue', markMode);
+  b.classList.toggle('btn-grey', !markMode);
+  document.getElementById('map').classList.toggle('marking', markMode);
+}
+
+function addTarget(ll) {
+  fetch('/targets/' + STUDY_ID, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({lat: ll.lat, lon: ll.lng}),
+  }).then(r => r.json()).then(d => {
+    if (d.targets) setTargets(d.targets);
+  }).catch(() => {});
+}
+
+function deleteTarget() {
+  if (selTargetKey == null) return;
+  fetch('/targets/' + STUDY_ID + '/delete', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: selTargetKey}),
+  }).then(r => r.json()).then(d => {
+    // 403 = another unit's flag (its file, not ours) — the server says so
+    if (d.error) { alert(d.error); return; }
+    if (d.targets) { selTargetKey = null; setTargets(d.targets); }
+  }).catch(() => {});
+}
+
+function toggleFound() {
+  const t = targets.find(x => x.key === selTargetKey);
+  if (!t) return;
+  fetch('/targets/' + STUDY_ID + '/clear', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({key: t.key, cleared: !t.cleared}),
+  }).then(r => r.json()).then(d => {
+    // 403 = the mark lives in another unit's sidecar — the server says so
+    if (d.error) { alert(d.error); return; }
+    if (d.targets) setTargets(d.targets);
+  }).catch(() => {});
+}
+
+function selectTarget(key) {
+  selTargetKey = key;
+  targets.forEach(t => tgtMarkers[t.key] && tgtMarkers[t.key].setIcon(tgtIcon(t)));
+  updateApproach();
+}
+
+function updateApproach() {
+  const panel = document.getElementById('tgtPanel');
+  const t = targets.find(x => x.key === selTargetKey);
+  if (!t) {
+    panel.style.display = 'none';
+    if (tgtLine) { mapObj.removeLayer(tgtLine); tgtLine = null; }
+    return;
+  }
+  panel.style.display = 'block';
+  // legacy pins read '#3'; sidecar pins carry the flagging unit ('mm1-3')
+  document.getElementById('tgtNum').textContent =
+    (t.src === 'db' ? '#' : '') + t.label +
+    (t.cleared ? ' ✓' + (t.cleared_own ? '' : ' ' + t.cleared_by) : '');
+  // delete only what lives in a file this unit owns; mark-found always,
+  // but un-mark only OUR OWN mark — another unit's lives in its sidecar,
+  // so popping ours would silently change nothing.
+  document.getElementById('tgtDelBtn').style.display =
+    t.deletable ? '' : 'none';
+  const fb = document.getElementById('tgtFoundBtn');
+  fb.style.display = (t.cleared && !t.cleared_own) ? 'none' : '';
+  fb.textContent = t.cleared ? '↩' : '✓';
+  fb.title = t.cleared ? 'Un-mark found' : 'Mark found';
+  document.getElementById('tgtLL').textContent =
+    t.lat.toFixed(7) + ', ' + t.lon.toFixed(7);
+  const nv = lastNav;
+  const distEl = document.getElementById('tgtDist');
+  const refEl = document.getElementById('tgtRef');
+  // The 5 s transport gate mirrors the sample gate below: ticks come every
+  // 0.5 s, so a silent stream means the fix on screen is no longer live.
+  if (nv && nv.connected && nv.lat != null && !nv.stale
+      && Date.now() - lastNavAt < 5000) {
+    const dm = distM(nv.lat, nv.lon, t.lat, t.lon);
+    const brg = bearingTo(nv.lat, nv.lon, t.lat, t.lon);
+    distEl.textContent = dm >= 100 ? Math.round(dm) + ' m' : dm.toFixed(1) + ' m';
+    // Arrow is steering guidance when we have a course; compass bearing
+    // when parked (COG is undefined while stationary). Advance the
+    // CONTINUOUS angle by the shortest arc — driving straight at the
+    // target jitters rel across the 0°/360° wrap every tick, and a raw
+    // rotate(rel) would animate a near-full wrong-way spin each time.
+    const rel = nv.cog_deg != null ? (brg - nv.cog_deg + 360) % 360 : brg;
+    const cur = ((arrowDeg % 360) + 360) % 360;
+    arrowDeg += ((rel - cur + 540) % 360) - 180;
+    document.getElementById('tgtArrow').style.transform =
+      'rotate(' + arrowDeg + 'deg)';
+    refEl.textContent = nv.cog_deg != null ? 'vs travel' : 'vs north';
+    const pts = [[nv.lat, nv.lon], [t.lat, t.lon]];
+    if (!tgtLine) {
+      tgtLine = L.polyline(pts, {color: '#00e5ff', dashArray: '6 6',
+                                 weight: 2, interactive: false}).addTo(mapObj);
+    } else {
+      tgtLine.setLatLngs(pts);
+    }
+  } else {
+    distEl.textContent = 'no fix';
+    refEl.textContent = '';
+    if (tgtLine) { mapObj.removeLayer(tgtLine); tgtLine = null; }
+  }
+  // Coarse metal reading off the live sample stream: max zeroed |dev| over
+  // the shown channels — climbs as the array crosses buried metal. Colored
+  // against the +Range slider so "hot" tracks the operator's own scale.
+  const devEl = document.getElementById('tgtDev');
+  devEl.classList.remove('hot', 'warm');
+  // Age-gate: SSE ticks every 0.5 s, so >3 s without a sample means the
+  // daemon stopped or wedged — a frozen hot number labeled "live" would
+  // send the crew digging on a dead detector.
+  if (lastAdc && calib.zero8 && Date.now() - lastAdcAt < 3000) {
+    const vis = renderer.getVisible();
+    const z8 = effZero8();
+    let mx = 0;
+    for (let ch = 0; ch < 8; ch++) {
+      if (!vis[ch]) continue;
+      const e = Math.abs(lastAdc[ch] - z8[ch]);
+      if (e > mx) mx = e;
+    }
+    devEl.textContent = 'live dev ' + Math.round(mx);
+    if (mx >= calib.plusRange) devEl.classList.add('hot');
+    else if (mx >= calib.plusRange / 2) devEl.classList.add('warm');
+  } else {
+    devEl.textContent = 'live dev —';
+  }
+}
+
+// The age gate above only runs when updateApproach() runs, and every periodic
+// caller is SSE-driven — if the transport itself dies (wifi drop, gunicorn
+// restart) no tick arrives and a hot "live dev" would freeze on the HUD. This
+// self-tick keeps the gate honest regardless of stream liveness.
+setInterval(() => { if (selTargetKey != null) updateApproach(); }, 1000);
 
 // ── Channel strip chart (shared MM.StripChart, one scale for all channels) ───
 // Fed by the daemon's live sample stream, so it scrolls at the full ADC rate
@@ -332,11 +674,12 @@ function buildStripVals() {
 
 function updateChanReadout(adc) {
   if (!adc) return;
+  const z8r = effZero8();
   for (let ch = 0; ch < 8; ch++) {
     const el = document.getElementById('chv' + ch);
     if (!el || adc[ch] == null) continue;
     el.textContent = adc[ch];
-    const zero = calib.zero8 ? calib.zero8[ch] : null;
+    const zero = z8r ? z8r[ch] : null;
     el.style.color = MM.colorFor(adc[ch], zero, calib.offset,
                                  calib.plusRange, calib.minusRange);
   }
@@ -459,6 +802,8 @@ function toggleMetaPanel() {
     p.style.display = 'none';
   } else {
     renderMetaPanel();               // rebuilt on every open: cheap, current
+    // same corner as the bias panel — never show both
+    document.getElementById('biasPanel').style.display = 'none';
     p.style.display = 'block';
   }
 }
@@ -511,7 +856,13 @@ function updateStatus(st) {
   }
 
   if (st.live) {
-    updateChanReadout(st.live.adc);
+    // Stopped study: this row is the leftover heartbeat from daemon death.
+    // Wedged: it's the frozen heartbeat from before the wedge. Both are
+    // stale and generally differ from the row that seeds the readout (and
+    // that applyBias recolors) — only a daemon with a LIVE heartbeat may
+    // overwrite the numbers, else every SSE tick undoes a bias adjustment.
+    if (st.state !== 'stopped' && st.state !== 'wedged')
+      updateChanReadout(st.live.adc);
     const fq = document.getElementById('fq-text');
     fq.textContent = MM.fixLabel(st.live.fix);
     fq.style.color = MM.fixColor(st.live.fix);
@@ -572,7 +923,10 @@ function renderEnvStats(es) {
 }
 
 function updateNav(nv) {
+  lastNav = nv;
+  lastNavAt = Date.now();
   navLayer.update(nv);
+  if (selTargetKey != null) updateApproach();
   const el = document.getElementById('navLine');
   if (nv && nv.connected && nv.lat != null && !nv.stale) {
     el.className = 'nav-chip nav-ok';
@@ -607,8 +961,28 @@ function onSliders() {
   renderer.setCalib(calib);   // repaint only — O(dots in view), not a rebuild
 }
 
+/* Checkbox states compose into the same token the renderer (and the saved
+ * sl_filter meta) has always used, so old saved views restore unchanged. */
+function filterToken() {
+  const cmOn = document.getElementById('cmChk').checked;
+  const syncOn = document.getElementById('syncChk').checked;
+  return cmOn && syncOn ? 'cm_sync' : cmOn ? 'cm' : syncOn ? 'sync' : 'abs';
+}
+
 function onFilter() {
-  renderer.setFilter(document.getElementById('filterSel').value);
+  const per = document.getElementById('syncPer');
+  const res = document.getElementById('syncRes');
+  const grp = document.getElementById('cmGrp');
+  const syncOn = document.getElementById('syncChk').checked;
+  const cmOn = document.getElementById('cmChk').checked;
+  per.disabled = !syncOn;
+  res.disabled = !syncOn;
+  grp.disabled = !cmOn;
+  // bins = period / resolution; the renderer clamps to a sane range
+  renderer.setSyncCfg({period: +per.value,
+                       bins: Math.round(+per.value * 1000 / +res.value)});
+  renderer.setCmSets(grp.value === 'sets');
+  renderer.setFilter(filterToken());
 }
 
 function onCombine() {
@@ -634,7 +1008,7 @@ function recalibrate() {
       if (!d.success) return;
       calib.zero8 = d.zero8;
       renderer.setCalib(calib);
-      chart.setZero(calib.zero8);  // strip plots deviations from these zeros
+      chart.setZero(effZero8());  // strip plots deviations from these zeros
       chart.draw();
     });
 }
@@ -693,6 +1067,98 @@ function endEditName(commit) {
   });
 })();
 
+// ── Per-channel offset bias panel ─────────────────────────────────────────────
+const BIAS_STEP = 10, BIAS_LIM = 5000;
+const clampBias = v => Math.max(-BIAS_LIM, Math.min(BIAS_LIM, v));
+
+function renderBiasRows() {
+  const box = document.getElementById('biasRows');
+  box.innerHTML = '';
+  for (let ch = 0; ch < 8; ch++) {
+    const row = document.createElement('div');
+    row.className = 'bias-row';
+    row.innerHTML =
+      `<span class="bch" style="color:${CH_COLORS[ch]};">${ch}</span>` +
+      `<button class="bias-btn" onclick="nudgeBias(${ch},-1)">−</button>` +
+      `<input type="range" class="bsl" id="biasS${ch}"` +
+      ` min="-${BIAS_LIM}" max="${BIAS_LIM}" step="1"` +
+      ` value="${calib.bias8[ch]}" oninput="onBiasSlide(${ch}, this.value)">` +
+      `<button class="bias-btn" onclick="nudgeBias(${ch},1)">+</button>` +
+      `<span class="bv" id="biasV${ch}">${calib.bias8[ch]}</span>`;
+    box.appendChild(row);
+  }
+}
+
+function toggleBias() {
+  const p = document.getElementById('biasPanel');
+  const open = p.style.display !== 'block';
+  // same corner as the meta panel — never show both
+  if (open) document.getElementById('metaPanel').style.display = 'none';
+  p.style.display = open ? 'block' : 'none';
+}
+
+function setBias(ch, v) {
+  v = clampBias(Math.round(v));
+  calib.bias8[ch] = v;
+  document.getElementById('biasV' + ch).textContent = v;
+  document.getElementById('biasS' + ch).value = v;
+}
+
+function onBiasSlide(ch, val) {
+  setBias(ch, +val);
+  applyBias();
+}
+
+function nudgeBias(ch, dir) {
+  setBias(ch, calib.bias8[ch] + dir * BIAS_STEP);
+  applyBias();
+}
+
+function resetBias() {
+  calib.bias8 = [0, 0, 0, 0, 0, 0, 0, 0];
+  renderBiasRows();
+  applyBias();
+}
+
+function autoBias() {
+  // AGC: trim each channel's zero to its own median, so every channel's
+  // quiet-ground deviation centers on 0 and one global Offset fits all
+  // coils. Median (strided to ≤16k samples) shrugs off the hot spots the
+  // operator is here to find. Recorded points preferred; before anything
+  // is recorded (bench, gate unmet) the live strip buffer works instead —
+  // the same source the zero8 seed uses in that state.
+  if (!calib.zero8) return;
+  let n, at;
+  if (store.length) {
+    const v = store.view();
+    n = v.n; at = (i, ch) => v.adc[i * 8 + ch];
+  } else {
+    const t = chart.tail(chart.length);
+    if (!t.length) return;
+    n = t.length; at = (i, ch) => t[i][ch];
+  }
+  const stride = Math.max(1, Math.ceil(n / 16384));
+  const buf = new Float64Array(Math.ceil(n / stride));
+  for (let ch = 0; ch < 8; ch++) {
+    let k = 0;
+    for (let i = 0; i < n; i += stride) buf[k++] = at(i, ch);
+    const s = buf.slice(0, k).sort();
+    const med = k & 1 ? s[(k - 1) >> 1] : (s[k / 2 - 1] + s[k / 2]) / 2;
+    setBias(ch, med - calib.zero8[ch]);
+  }
+  applyBias();
+}
+
+function applyBias() {
+  renderer.setCalib(calib);           // map: folds into zEff(), upstream of Δ
+  chart.setZero(effZero8());          // strip chart deviations
+  chart.draw();                       // stopped study: no SSE tick repaints it
+  // stopped study never sets lastAdc — recolor from the last recorded row
+  updateChanReadout(lastAdc ||
+                    (store.length ? store.adcRow(store.length - 1) : null));
+}
+renderBiasRows();   // populate now; restore re-renders if a saved bias8 loads
+
 function saveSliders(btn) {
   fetch('/settings/' + STUDY_ID, {
     method: 'POST',
@@ -701,9 +1167,13 @@ function saveSliders(btn) {
       plus_range:     calib.plusRange,
       minus_range:    calib.minusRange,
       offset:         calib.offset,
-      filter:         document.getElementById('filterSel').value,
+      filter:         filterToken(),
+      sync_period:    document.getElementById('syncPer').value,
+      sync_res:       document.getElementById('syncRes').value,
+      cm_group:       document.getElementById('cmGrp').value,
       combine:        document.getElementById('combineChk').checked ? '1' : '0',
       zero8:          calib.zero8,
+      bias8:          calib.bias8,
     })
   }).then(r => r.json()).then(d => {
     if (d.ok && btn) {
@@ -738,20 +1208,42 @@ fetch('/data/' + STUDY_ID)
     if (mf('sl_plus_range')  != null) setSlider('plusSl', 'plusV', mf('sl_plus_range'));
     if (mf('sl_offset')      != null) setSlider('offSl', 'offV', mf('sl_offset'));
     if (meta.sl_filter) {
-      document.getElementById('filterSel').value = meta.sl_filter;
-      renderer.setFilter(meta.sl_filter);
+      document.getElementById('cmChk').checked =
+        meta.sl_filter === 'cm' || meta.sl_filter === 'cm_sync';
+      document.getElementById('syncChk').checked =
+        meta.sl_filter === 'sync' || meta.sl_filter === 'cm_sync';
     }
+    if (meta.sl_sync_period) {
+      document.getElementById('syncPer').value = meta.sl_sync_period;
+    }
+    if (meta.sl_sync_res) {
+      document.getElementById('syncRes').value = meta.sl_sync_res;
+    }
+    if (meta.sl_cm_group) {
+      document.getElementById('cmGrp').value = meta.sl_cm_group;
+    }
+    onFilter();   // push filter + sync config, set the tuning-enable state
     if (meta.sl_combine != null) {
       const on = meta.sl_combine === '1';
       document.getElementById('combineChk').checked = on;
       renderer.setCombine(on);
     }
     readSliders();
-    try { calib.zero8 = meta.sl_zero8 ? JSON.parse(meta.sl_zero8) : null; }
-    catch (e) { calib.zero8 = null; }
-    if (!calib.zero8) calib.zero8 = autoZero();
+    // saved arrays must be exactly 8 finite numbers — anything else (junk
+    // POST, corrupt meta) falls back instead of TypeError-ing the whole init
+    const arr8 = s => {
+      try {
+        const a = s ? JSON.parse(s) : null;
+        return Array.isArray(a) && a.length === 8 && a.every(Number.isFinite)
+          ? a : null;
+      } catch (e) { return null; }
+    };
+    calib.zero8 = arr8(meta.sl_zero8) || autoZero();
+    const b = arr8(meta.sl_bias8);
+    if (b) calib.bias8 = b.map(clampBias);
+    renderBiasRows();
     renderer.setCalib(calib);
-    chart.setZero(calib.zero8);
+    chart.setZero(effZero8());
 
     renderer.markDirty();
     document.getElementById('ptCount').textContent = store.length;
@@ -772,6 +1264,7 @@ fetch('/data/' + STUDY_ID)
 
     updateStatus(d.status);
     updateNav(d.nav);
+    setTargets(d.targets || []);
 
     openSSE();
     relayout();
@@ -794,7 +1287,7 @@ function openSSE() {
         // First rows of a fresh study: seed zeros. Colors are computed at
         // draw time, so a repaint is all it takes.
         renderer.setCalib(calib);
-        chart.setZero(calib.zero8);
+        chart.setZero(effZero8());
       }
       renderer.markDirty();
       document.getElementById('ptCount').textContent = store.length;
@@ -813,16 +1306,23 @@ function openSSE() {
         const t = chart.tail(10);
         calib.zero8 = Array.from({length: 8}, (_, ch) =>
           Math.round(t.reduce((a, r) => a + r[ch], 0) / t.length * 10) / 10);
-        chart.setZero(calib.zero8);
+        chart.setZero(effZero8());
         renderer.setCalib(calib);
       }
       chart.draw();
-      updateChanReadout(samples[samples.length - 1].adc);
+      lastAdc = samples[samples.length - 1].adc;
+      lastAdcAt = Date.now();
+      updateChanReadout(lastAdc);
+      if (selTargetKey != null) updateApproach();
     }
     if (d.status) {
       updateStatus(d.status);
     }
     if (d.nav) updateNav(d.nav);
+    // Merged target list rides every tick — a flag or found-mark synced in
+    // from the other unit appears without a reload. setTargets no-ops when
+    // nothing changed, so this costs a string compare per tick.
+    if (d.targets) setTargets(d.targets);
   };
   es.onerror = () => {
     // Transport drops auto-reconnect (resuming via Last-Event-ID). A non-200

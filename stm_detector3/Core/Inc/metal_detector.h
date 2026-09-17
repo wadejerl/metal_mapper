@@ -28,7 +28,11 @@ extern "C" {
 /* Runtime-tunable timing (adjusted via console keys, like detector2).
  * md_tx_pulse_us is the coil charge time: longer charges push more energy
  * into the coil but heat the TX FETs — tunable so the thermal/sensitivity
- * trade can be found on the bench. 120 µs (the old fixed value) is the cap. */
+ * trade can be found on the bench. 120 µs (the old fixed value) is the cap.
+ *
+ * These three globals drive the SIMULTANEOUS (all-8-at-once) mode only.
+ * Raster mode has its own per-channel table inside metal_detector.c —
+ * the two never mix, so toggling modes can't mangle either tuning. */
 extern volatile uint32_t md_tx_pulse_us;
 extern volatile uint32_t md_blanking_us;
 extern volatile uint32_t md_rx_window_us;
@@ -147,20 +151,26 @@ void MD_Save_Settings(void);
 uint32_t MD_Settings_ECC_NMI(void);
 
 /* Poll USART1 for tuning keys; call each task-loop iteration. A save
- * ('S') suspends the TIM7 pacer and waits out any cycle in flight before
- * the flash write (an expiry that lands during it pends and runs after).
- * Convention: QWERTY column pairs raise/lower a value (top key raises);
- * capitals are saves/toggles/specials.
- *   a/z blanking +-2us (0..200)      s/x rx window +-1us (1..50)
+ * (word-gated SAVE+Enter) suspends the TIM7 pacer and waits out any cycle
+ * in flight before the flash write (an expiry that lands during it pends
+ * and runs after). Convention: QWERTY column pairs raise/lower a value
+ * (top key raises); capitals/digits are selects/toggles/specials.
+ *   a/z blanking +-1us (0..200)      s/x rx window +-1us (1..50)
  *   d/c coil spacing +-10mm (50..5000)  f/v tx pulse +-1us (10..120)
  *   g/b sample rate up/down (20/40/100/200/500 Hz)
- *   S save   D restore+save defaults   I info line
- *   G toggle GPS passthrough (# PQTMTXT/PQTMTAR/THS lines, default off) */
+ *   0-7 select channel for raster tuning   8 select all channels
+ *   r   toggle raster mode (per-channel slots) vs all-at-once
+ *   SAVE+Enter save   CLEAR+Enter restore+save defaults   I info line
+ *   G toggle GPS passthrough (# PQTMTXT/PQTMTAR/THS lines, default off)
+ * In raster mode a/z, s/x, f/v edit the SELECTED channel's table entry
+ * (or all 8 in lockstep when 'all' is selected); in all-at-once mode they
+ * edit the shared globals exactly as before. */
 void md_console_poll(void);
 
 /* Print the '# info ...' identity line (fw hash, GPS module version/ID,
- * timing, coil geometry, adc order). The daemon requests it with the 'i'
- * key when it connects and stamps the values into the study header. */
+ * timing, coil geometry, adc order, raster mode + per-channel table). The
+ * daemon requests it with the 'I' key when it connects and stamps the
+ * values into the study header. */
 void md_print_info(void);
 
 /* Print the console key map ('# keys:' lines) — boot reminder so a console

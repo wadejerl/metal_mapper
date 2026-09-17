@@ -97,6 +97,15 @@ RE_COIL = re.compile(r'coil_spacing=(\d+)mm')
 # and the settings banners. A mid-study change shifts how many samples land
 # in each saved bin (SNR per row), so it's flagged like a timing change.
 RE_RATE = re.compile(r'sample_rate=(\d+)Hz')
+# Raster-mode config in '#' lines: the r / 0-8 / timing-key echo
+# "# rastercfg detector_mode=raster slot_us=200 ch=3 bl8=16,... rx8=3,...
+# tx8=120,...". Deliberately NEW token names (not blanking=/tx_pulse=) so a
+# per-channel edit can't trip the legacy echo patterns above with one
+# channel's value. ch= only appears on these echoes (not the info line);
+# it's UI selection state, not a header key.
+RE_RASTER = re.compile(
+    r'detector_mode=(all|raster)\s+slot_us=(\d+)\s+(?:ch=(\S+)\s+)?'
+    r'bl8=(\S+)\s+rx8=(\S+)\s+tx8=(\S+)')
 # Info line: "# info fw=... gps_ver=... key=value ..."
 RE_INFO_KV = re.compile(r'(\w+)=(\S+)')
 
@@ -115,6 +124,11 @@ INFO_META_KEYS = {
     'sample_rate_hz':       'sample_rate_hz',   # detector frames per second (fixed per study)
     'adc_oversample':       'adc_oversample',   # ADC counts are sums of this many conversions
     'adc':                  'adc_order',
+    'detector_mode':        'detector_mode',    # 'all' (simultaneous) or 'raster'
+    'slot_us':              'slot_us',          # raster per-channel slot period (us)
+    'bl8':                  'bl8',              # per-channel blanking table, 8 CSV values (us)
+    'rx8':                  'rx8',              # per-channel rx-window table (us)
+    'tx8':                  'tx8',              # per-channel tx-pulse table (us)
 }
 
 
@@ -563,7 +577,8 @@ def insert_rows(conn, rows, vin, temp):
     conn.commit()
 
 
-TIMING_KEYS   = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz')
+TIMING_KEYS   = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz',
+                 'detector_mode', 'slot_us', 'bl8', 'rx8', 'tx8')
 GEOMETRY_KEYS = ('coil_spacing_mm', 'coil_offset_fore_mm', 'coil_offset_right_mm')
 
 
@@ -944,6 +959,19 @@ def main():
                       if m:
                           db_guard(note_drift, conn, 'timing',
                                    {'sample_rate_hz': m.group(1)})
+                      m = RE_RASTER.search(line)
+                      if m:
+                          db_guard(note_drift, conn, 'timing',
+                                   {'detector_mode': m.group(1),
+                                    'slot_us': m.group(2),
+                                    'bl8': m.group(4),
+                                    'rx8': m.group(5),
+                                    'tx8': m.group(6)})
+                          # ch= is the console's raster channel selection —
+                          # live UI state for raw.html's chips, never part of
+                          # the stamped header (so plain meta, not note_drift).
+                          if m.group(3) is not None:
+                              db_guard(meta_set, conn, 'raster_sel', m.group(3))
                       continue
 
                   point = parse_data_line(line)

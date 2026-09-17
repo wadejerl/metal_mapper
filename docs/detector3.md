@@ -54,10 +54,12 @@ or a partial group is corrupt and must be rejected:
 
 ```
 # info fw=a5c5006 gps_ver=<PQTMVERNO reply> gps_id=<PQTMUNIQID reply>
-  blanking_us=16 rx_window_us=3 tx_pulse_us=120 coil_spacing_mm=500
-  coil_offset_fore_mm=0 coil_offset_right_mm=0
+  blanking_us=16 rx_window_us=3 tx_pulse_us=120 coil_spacing_mm=330
+  coil_offset_fore_mm=0 coil_offset_right_mm=500
   sample_rate_hz=500 adc_oversample=16
   adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14
+  detector_mode=all slot_us=200 bl8=16,16,16,16,16,16,16,16
+  rx8=3,3,3,3,3,3,3,3 tx8=120,120,120,120,120,120,120,120
 ```
 
 (One line on the wire; space-separated `key=value`.) Printed at boot and on
@@ -76,27 +78,84 @@ QWERTY column pairs adjust values (top key raises); capitals are specials.
 | `s`/`x` | rx window ±1 µs (1–50) |
 | `d`/`c` | coil spacing ±10 mm (50–5000) |
 | `f`/`v` | TX pulse (coil charge) ±1 µs (10–120) — longer charges push more energy into the coil but heat the TX FETs |
-| `g`/`b` | sample rate up/down through 20/40/100/200/500 Hz (echoes `# sample_rate=..Hz (N per fix)`) |
+| `g`/`b` | sample rate up/down through 20/40/100/200/500 Hz (echoes `# sample_rate=..Hz (N per fix)`; refused in raster mode if 8 slots wouldn't fit the new interval) |
+| `0`–`7` | select the channel raster edits target |
+| `8` | select all 8 channels (raster edits move in lockstep) |
+| `r` | toggle raster mode ↔ all-at-once |
 | `SAVE`+Enter | save settings to flash — word-gated so a stray noise byte on the console RX line can never trigger a flash write |
 | `CLEAR`+Enter | restore compile-time defaults + save — word-gated like `SAVE` (both flash writes; a stray noise byte must never trigger either) |
 | `I` | print info line |
 | `G` | toggle GPS passthrough (`# $PQTMTXT/$PQTMTAR/$--THS` echo, default off) |
 
-Adjusting TX pulse echoes `# tx_pulse=..us`.
+Adjusting TX pulse echoes `# tx_pulse=..us`. In raster mode `a`/`z`,
+`s`/`x`, `f`/`v` edit the **selected channel's** table entry instead of the
+shared globals (all 8 in lockstep when `8` is selected), and every
+raster-affecting change (mode toggle, selection, table edit) echoes one
+`# rastercfg detector_mode=.. slot_us=.. ch=.. bl8=.. rx8=.. tx8=..` line —
+deliberately NEW token names, so a per-channel edit can never trip the
+daemon's legacy `blanking=`/`tx_pulse=` drift patterns with one channel's
+value. The same echo also fires once at boot (an MCU reset mid-study
+reverts the selection to `all` and mode/tables to the saved record — the
+echo re-syncs the daemon's live values) and on `CLEAR` (a defaults restore
+is a mode+table+selection change like any other; the saved banner alone
+carries only the legacy global tokens). A change that would break the
+slot-fit rule is reverted with
+`# raster limit: 8 slots of ..us must fit the ..us sample interval`.
+
+### Raster mode
+
+- Two detector modes, toggled with `r` and persisted. **all** (the original
+  behavior): all 8 coils fire simultaneously with the shared global timing
+  triple. **raster**: each sample interval starts with a sweep of 8
+  fixed-period slots; slot *k* fires only channel *k*'s bus with channel
+  *k*'s own {tx, blanking, rx} from the per-channel table and converts only
+  channel *k* (single injected conversion, ~23 µs). The two tunings are
+  independent — mode flips never mangle either.
+- **One frame per sweep**: wire grammar, tick cadence, daemon and DB are
+  untouched — a raster frame is the same 8-value sample line, its channels
+  just measured `slot_us` apart. At 1.5 m/s the 1.6 ms sweep is ~2 mm of
+  along-track skew — negligible vs the 20 mm bin, and the header carries
+  `slot_us` so the renderer can correct it if it ever matters.
+- **Slot period auto-derives**: max(200 µs, worst-channel tx+bl+rx + ~25 µs
+  ADC + margin), rounded up to the pacer's 100 µs ticks and reported as
+  `slot_us`. Fit rule: `8 × slot ≤ sample interval` — edits, mode toggles,
+  rate steps and even a stale saved record that would break it are refused
+  (reverted / fall back to all mode) with a console notice.
+- **Channel↔bus map**: evens on Bus A (TIM2→PA5), odds on Bus B (TIM3→PB4)
+  — INFERRED from the ADC pair structure, encoded in one firmware macro
+  (`MD_CH_SET_B`) so a logic-analyzer check can flip it in one line. During
+  a slot the idle set's four outputs are forced inactive (coils silent,
+  integrators held in reset); a GPS fix landing mid-sweep defers the pacer
+  resync to the sweep boundary so slot spacing inside a sweep is never
+  disturbed.
 
 ### Settings persistence
 
 Append-log in flash page 31 (0x0801F000, outside the 124 K app region, so
-reflashing firmware never touches it). Newest valid 32-byte record wins;
-page erase only when its 128 slots fill. Fields: blanking (bits 23:0;
-bits 31:24 held the retired fire mode — ignored on load, written 0), rx
-window (bits 7:0; samples-per-period in bits 15:8, where 0 marks a
-pre-rate record and loads the default), coil spacing, fore/starboard
-antenna offsets, TX pulse. Records from older firmware load with defaults
-for the fields they predate (0xFFFFFFFF sentinel / out-of-range word). A
-blank or corrupted (ECC-purged) page auto-writes the defaults at boot, so
-a unit always carries a valid record. Defaults: blanking 16 µs, rx 3 µs,
-TX pulse 120 µs, spacing 500 mm, offsets 0, 25 samples/period (500 Hz).
+reflashing firmware never touches it). Two record generations share the
+page — the loader scans for BOTH magics and the newest valid record of
+either kind wins; page erase only when the slots fill:
+
+- **MDT3** (32 bytes, 128 slots/page — legacy, read-only now): blanking
+  (bits 23:0; bits 31:24 held the retired fire mode — ignored on load), rx
+  window (bits 7:0; samples-per-period in bits 15:8, where 0 marks a
+  pre-rate record and loads the default), coil spacing, fore/starboard
+  antenna offsets, TX pulse. Loading one seeds the raster table from the
+  globals and starts in all mode.
+- **MDT4** (64 bytes, 64 slots/page, only at even 32-byte slots): the MDT3
+  words (detector mode now lives in blanking bits 31:24) plus the three
+  8-entry per-channel tables (bl/rx/tx) and two reserved words written
+  erased, so a future field can tell "older record" from a real 0. Save
+  always writes MDT4.
+
+Records from older firmware load with defaults for the fields they predate
+(0xFFFFFFFF sentinel / out-of-range word); a saved raster mode that no
+longer fits the saved sample rate falls back to all mode with a console
+notice. A blank or corrupted (ECC-purged) page auto-writes the defaults at
+boot, so a unit always carries a valid record. Defaults: blanking 16 µs,
+rx 3 µs, TX pulse 120 µs (per-channel table seeded the same), spacing
+330 mm, fore offset 0, starboard offset 500 mm, 25 samples/period
+(500 Hz), all mode.
 
 ## Host-side design
 
@@ -159,19 +218,27 @@ TX pulse 120 µs, spacing 500 mm, offsets 0, 25 samples/period (500 Hz).
   `fw_git_hash`, `gps_ver`, `gps_id`, `blanking_us`, `rx_window_us`,
   `tx_pulse_us`,
   `coil_spacing_mm`, `coil_offset_fore_mm`, `coil_offset_right_mm`,
-  `adc_order`, plus `schema_version=3`, `gate`, `min_dist_mm`,
+  `adc_order`, `detector_mode`, `slot_us`, `bl8`/`rx8`/`tx8` (the raster
+  per-channel tables, 8-value CSVs), plus `schema_version=3`, `gate`,
+  `min_dist_mm`,
   `study_name`/`created_at` (stamp-once — a daemon restart on the same db
   can't rewrite provenance). Header keys are first-wins **per key** (a
   truncated info reply gets completed by the next one); `info_ok` is '1'
-  only when every header key is present.
+  only when every header key is present — an old-firmware board without
+  the raster tokens now parks at `info_ok=0` (the UI's incomplete-header
+  warning doubles as the reflash nudge; data still records fine).
 - **Mid-study drift**: timing echoes (`# blanking=..us rx_window=..us`,
-  `# tx_pulse=..us`, `# sample_rate=..Hz`) and coil-spacing echoes
-  (`# coil_spacing=..mm`),
+  `# tx_pulse=..us`, `# sample_rate=..Hz`), raster echoes (`# rastercfg
+  detector_mode=.. slot_us=.. ch=.. bl8=.. rx8=.. tx8=..`), coil-spacing
+  echoes (`# coil_spacing=..mm`),
   and any later info line, update `<key>_current` meta and set
   `timing_changed` / `geometry_changed` flags — the header is never
   silently updated (a retune means a new study by convention). The flags
   list every diverged key of their kind, recomputed from the `_current`
-  values, so single-key echoes can't erase an earlier drift.
+  values, so single-key echoes can't erase an earlier drift. The
+  `rastercfg` echo's `ch=` field is the console's live channel selection
+  — pure UI state, stored as plain `raster_sel` meta (never a header key)
+  to drive the raw view's channel chips.
 - **Points schema**: one row per flushed bin — `ts, lat, lon, heading
   (NULL ok), fix, adc0..adc7 (8 int columns), gps_ts`, nullable
   `vin`/`temp` (latest status pair at insert time). Per-coil positions

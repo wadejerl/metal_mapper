@@ -34,11 +34,13 @@ if [ "$REPO" = "/opt/metal_mapper" ]; then
     exit 1
 fi
 
-# ── systemd units: symlink + enable every .service in the repo root ───────
+# ── systemd units: symlink + enable every .service/.timer in the repo root ─
+# (rtkbase/ units are the base Pi's and are deployed there by hand — only
+# the repo ROOT's units belong on a head unit.)
 shopt -s nullglob
-units=("$REPO"/*.service)
+units=("$REPO"/*.service "$REPO"/*.timer)
 if [ ${#units[@]} -eq 0 ]; then
-    echo "error: no .service files found in $REPO" >&2
+    echo "error: no .service/.timer files found in $REPO" >&2
     exit 1
 fi
 
@@ -52,6 +54,12 @@ systemctl daemon-reload
 
 for unit in "${units[@]}"; do
     name="$(basename "$unit")"
+    # a unit with no [Install] is activated by something else (e.g.
+    # jlw_mm_sync.service, which only its timer starts) — enable would fail
+    if ! grep -q '^\[Install\]' "$unit"; then
+        echo "skipped $name (no [Install] — activated by another unit)"
+        continue
+    fi
     systemctl enable "$name"
     echo "enabled $name"
 done
@@ -66,7 +74,7 @@ SVC_USER="${SUDO_USER:-$(stat -c %U "$REPO/db_map.py")}"
 install -d -o "$SVC_USER" -g "$SVC_USER" "$OPT"
 
 app_files=(db_map.py serial_daemon.py nav_gps.py gunicorn_config.py
-           static templates)
+           sync_studies.sh static templates)
 for f in "${app_files[@]}"; do
     # Legacy copy-deployments left REAL dirs here (old README said to cp
     # static/ and templates/); ln -sfn onto a real dir would silently NEST
