@@ -72,6 +72,9 @@
                      background: #666; }
     #svcPanel .dot.on  { background: #4caf50; }
     #svcPanel .dot.err { background: #e94560; }
+    /* 'activating' — the RTK units hold here (ExecStartPre gate) until the
+       base station answers: amber = waiting, distinct from grey = off */
+    #svcPanel .dot.wait { background: #d4a017; }
     /* the box's own IPv4s, under the dots — "is the network side up".
        Green = has address(es); flashing red = positively none (DHCP
        lease lost / WiFi down) — loud on purpose, it's the field signal */
@@ -110,7 +113,8 @@
   {% for unit, state in (services or {}).items() %}
   <span class="svc" id="svc-{{ unit | replace('.service', '') }}"
         title="{{ unit }}: {{ state }}"><i class="dot
-    {{- ' on' if state == 'active' else (' err' if state == 'failed' else '') }}"></i>{{
+    {{- ' on' if state == 'active' else (' err' if state == 'failed'
+        else (' wait' if state == 'activating' else '')) }}"></i>{{
     unit | replace('jlw_', '') | replace('.service', '') }}</span>
   {% endfor %}
   {# always in the DOM when the panel renders (hidden while ipv4s is
@@ -294,7 +298,8 @@ function openNavSSE() {
         const el = document.getElementById('svc-' + unit.replace('.service', ''));
         if (!el) continue;   // unit added since page load — reload picks it up
         el.querySelector('.dot').className = 'dot' +
-          (state === 'active' ? ' on' : state === 'failed' ? ' err' : '');
+          (state === 'active' ? ' on' : state === 'failed' ? ' err'
+           : state === 'activating' ? ' wait' : '');
         el.title = unit + ': ' + state;
       }
     }

@@ -145,5 +145,11 @@ fi
 echo
 echo "done. Units are enabled but not started — reboot, or start them now:"
 for unit in "${units[@]}"; do
-    echo "  sudo systemctl start $(basename "$unit")"
+    # Gated units (ExecStartPre wait + TimeoutStartSec=infinity, i.e. the
+    # RTK feeds) hold in 'activating' until their GPS + the base station
+    # exist — a plain foreground start would sit on that wait forever and
+    # wedge this paste block before the kiosk UI unit ever starts.
+    flags=''
+    grep -q '^TimeoutStartSec=infinity' "$unit" && flags='--no-block '
+    echo "  sudo systemctl start ${flags}$(basename "$unit")"
 done

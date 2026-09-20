@@ -1,12 +1,21 @@
 [Unit]
-Description=Rover RTK service for local nav
+Description=Rover RTK corrections to nav GPS (ttyUSB0)
 After=multi-user.target
+# never park in 'failed' from restart accounting: a field survey must
+# survive the base rebooting or a USB re-enumeration without a hand restart
+StartLimitIntervalSec=0
 
 [Service]
+# Same reachability gate as jlw_rover_rtk.service (see the comment there):
+# hold in 'activating' (steady amber dot) until the nav GPS is present AND
+# the caster answers, so the dot never flaps when there's no base around.
+ExecStartPre=/bin/bash -c 'until [ -e /dev/ttyUSB0 ] && timeout 3 bash -c "</dev/tcp/northpole/2101" 2>/dev/null; do sleep 10; done'
+# unbounded wait: foreground start/restart blocks until the gate passes —
+# use `systemctl restart --no-block` when the base/GPS may be absent
+TimeoutStartSec=infinity
 ExecStart=/home/pi/pygpsclient/bin/gnssntripclient --server northpole --port 2101 --mountpoint pygnssutils --clioutput 2 --output '/dev/ttyUSB0@460800' --verbosity 1  --retryinterval 1 --retries 3
 Restart=always
-RestartSec=2
+RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
-

@@ -13,8 +13,10 @@ appended); which fields are populated says what the line is:
   empty. One per detector frame; the firmware assigns no position.
 - ANCHOR lines (~20 Hz, one per valid GGA fix): lat/lon/fix/gps_ts and tick
   populated, all adc fields empty. tick names the sample the fix belongs
-  with (the frame paced to complete just before it). heading is empty
-  unless the dual-antenna solution is good — never stale, never guessed.
+  with: the newest frame completed when the GGA parsed, i.e. within one
+  sample interval before the fix (the pacer free-runs; nothing lines the
+  frames up with the fix). heading is empty unless the dual-antenna
+  solution is good — never stale, never guessed.
 - Without a fix, sample lines keep coming at the full sample rate
   and no anchors arrive.
 
@@ -42,6 +44,18 @@ info handshake, FIFO command forwarding — but points rows are NEVER
 written and the live row's `recording` flag is pinned 0. System test and
 calibration display with nothing saved.
 
+Link health (meta `link`, JSON, rewritten on the live-row cadence and on
+the no-data / no-port beats): tick arithmetic over the stream —
+sample-tick gaps (frames lost), regressions the stream continued from
+(MCU reboots) vs lone mangled ticks, frames per anchor over the last ~2 s,
+equal-tick anchors, samples/s and anchors/s (LinkStats). It sees what the
+daemon parsed: a line garbled in flight is a one-frame gap; anything
+upstream of the firmware's tick counter is invisible here (that is the
+'P' line's `skips`). The firmware's 'P' pacer-diagnostics
+line ("# pace det=... jit_max_us=...") is kept verbatim in meta
+`pace_last` (+ `pace_at`). Both surface on the raw view via the SSE
+status; neither is part of a study's header.
+
 Usage:
     python serial_daemon.py --port /dev/ttyACM0 --db ~/metal_mapper/studies/foo.db
                             [--baud 460800] [--study-name "Back yard test"]
@@ -49,6 +63,8 @@ Usage:
 """
 
 import argparse
+import collections
+import json
 import math
 import os
 import re
@@ -78,6 +94,9 @@ SCHEMA_VERSION  = '3'
 LIVE_PERIOD_S   = 0.5   # min interval between live-row writes
 NO_DATA_AFTER_S = 2.0   # silence longer than this → reason 'no data'
                         # (firmware emits at least every 500 ms, even indoors)
+INFO_RETRY_S    = 10.0  # re-send 'I' this often while the header is incomplete
+                        # (--info-retry-s); see stamp_info for why it can be
+                        # incomplete for a while (GPS identity not yet known)
 ANCHOR_STALE_S  = 1.0   # no anchor for this long → the fix is gone (they
                         # arrive at 20 Hz whenever the GPS has one)
 
@@ -97,15 +116,25 @@ RE_COIL = re.compile(r'coil_spacing=(\d+)mm')
 # and the settings banners. A mid-study change shifts how many samples land
 # in each saved bin (SNR per row), so it's flagged like a timing change.
 RE_RATE = re.compile(r'sample_rate=(\d+)Hz')
-# Raster-mode config in '#' lines: the r / 0-8 / timing-key echo
-# "# rastercfg detector_mode=raster slot_us=200 ch=3 bl8=16,... rx8=3,...
-# tx8=120,...". Deliberately NEW token names (not blanking=/tx_pulse=) so a
+# Raster-mode config in '#' lines: the r / 0-8 / h-n / timing-key echo
+# "# rastercfg detector_mode=raster slot_us=200 pulse_us=200 ch=3
+# bl8=16,... rx8=3,... tx8=120,...". Deliberately NEW token names (not
+# blanking=/tx_pulse=) so a
 # per-channel edit can't trip the legacy echo patterns above with one
 # channel's value. ch= only appears on these echoes (not the info line);
 # it's UI selection state, not a header key.
 RE_RASTER = re.compile(
-    r'detector_mode=(all|raster)\s+slot_us=(\d+)\s+(?:ch=(\S+)\s+)?'
+    r'detector_mode=(all|raster)\s+slot_us=(\d+)\s+(?:pulse_us=(\d+)\s+)?'
+    r'(?:ch=(\S+)\s+)?'
     r'bl8=(\S+)\s+rx8=(\S+)\s+tx8=(\S+)')
+# Pacer diagnostics: the 'P' key's "# pace det=all ivl_us=5000 fires=...
+# skips=... dev_max_us=... jit_max_us=... fix_n=... fix_span_us=a/b
+# fix_ph_us=... gps_isr_max_us=..." (free-running pacer firmware,
+# 2026-09). Kept verbatim for the raw view; its token names deliberately
+# match none of the echo patterns above, so it can never be mistaken for
+# a timing change. Anchored at the start: only a line that IS the pace
+# report, not one that merely mentions the word.
+RE_PACE = re.compile(r'^#\s*pace\s+(det=\S.*)$')
 # Info line: "# info fw=... gps_ver=... key=value ..."
 RE_INFO_KV = re.compile(r'(\w+)=(\S+)')
 
@@ -125,10 +154,22 @@ INFO_META_KEYS = {
     'adc_oversample':       'adc_oversample',   # ADC counts are sums of this many conversions
     'adc':                  'adc_order',
     'detector_mode':        'detector_mode',    # 'all' (simultaneous) or 'raster'
-    'slot_us':              'slot_us',          # raster per-channel slot period (us)
+    'slot_us':              'slot_us',          # raster per-channel slot period (us, effective)
+    'pulse_us':             'pulse_us',         # requested raster pulse spacing (us); slot_us
+                                                # stretches past it when a timeline demands
     'bl8':                  'bl8',              # per-channel blanking table, 8 CSV values (us)
     'rx8':                  'rx8',              # per-channel rx-window table (us)
     'tx8':                  'tx8',              # per-channel tx-pulse table (us)
+}
+
+# Optional info-line fields: stamped when present, LAST-wins (they describe
+# a state, not provenance), never counted toward info_ok / info_missing —
+# firmware older than the field must not read as an incomplete header.
+INFO_META_OPTIONAL = {
+    'gps_cfg':              'gps_cfg',          # did the GPS module take its boot
+                                                # config burst: boot | resent |
+                                                # pending | noreply | silent
+                                                # (firmware >= 2026-09-20)
 }
 
 
@@ -248,6 +289,138 @@ MAX_SEGMENT_TICKS = 1000
 PENDING_CAP = 2048
 
 
+class LinkStats:
+    """Wire-level health of the sample stream, from tick arithmetic alone.
+
+    Ticks are the protocol's time axis, so they answer "are we dropping
+    data?" without a scope: a sample tick that SKIPS is a frame that never
+    reached the db (firmware ring overrun, or a line the daemon lost); one
+    that goes BACKWARDS is an MCU reboot; the tick delta between
+    consecutive anchors is how many frames that fix interval held —
+    nominally rate/20, wandering by ±1 as the free-running pacer's phase
+    slides against the GPS clock, and legitimately 0 at 20 Hz. Session
+    totals for the faults, a ~2.5 s window for the rates and the per-anchor
+    spread. Pure bookkeeping — steers nothing, saves nothing.
+
+    A tick that goes backwards is held for one sample before it is called
+    a reboot: after a real reboot the stream CONTINUES from the low tick
+    (+1, or +2 with one line lost), whereas a lone line whose tick was
+    mangled in flight (dropped or altered digit) is followed by the true
+    successor of the tick before it — at least 3 above anything that reads
+    lower. Without the hold, one noise byte would read as "reboots 1" plus
+    thousands of frames lost, for the rest of the session.
+    """
+
+    SPA_WINDOW    = 40     # anchors (~2 s at 20 Hz) for the frames-per-anchor spread
+    RATE_WINDOW_S = 2.5    # seconds of snapshot history behind the rates
+    ANCHOR_GAP_S  = 1.0    # longer without an anchor = fix dropout, not pacer spacing
+
+    def __init__(self):
+        self.samples     = 0
+        self.anchors     = 0
+        self.tick_gaps   = 0    # sample-tick discontinuities
+        self.frames_lost = 0    # frames those gaps skipped over
+        self.reboots     = 0    # sample-tick regressions the stream continued from
+        self.bad_ticks   = 0    # lone regressed ticks nothing continued from
+        self.eq_ticks    = 0    # consecutive anchors with the same tick
+        self._last_sample_tick = None
+        self._pending          = None   # regressed tick awaiting its verdict
+        self._last_anchor_tick = None
+        self._last_anchor_t    = None   # wall clock of the last anchor (dropout guard)
+        self._spa  = collections.deque(maxlen=self.SPA_WINDOW)
+        self._hist = collections.deque(maxlen=64)   # (t, samples, anchors)
+
+    def on_sample(self, tick):
+        self.samples += 1
+        lt = self._last_sample_tick
+        if lt is None:
+            self._last_sample_tick = tick
+            return
+        p = self._pending
+        if p is not None:
+            self._pending = None
+            if 0 <= tick - p <= 2:
+                # The stream continued from the regressed tick: a reboot.
+                self.reboots += 1
+                if tick > p + 1:
+                    self.tick_gaps   += 1
+                    self.frames_lost += tick - p - 1
+                # Anchor spacing must not span the epochs (the recorder
+                # restarts too): drop an old-epoch anchor and the spread.
+                # An anchor already from the new epoch (below us) stays.
+                if self._last_anchor_tick is not None and self._last_anchor_tick > tick:
+                    self._last_anchor_tick = None
+                    self._spa.clear()
+                self._last_sample_tick = tick
+                return
+            # Nothing continued from it: that line's tick was mangled. This
+            # sample is judged against the tick before the mangled one; the
+            # mangled frame itself shows up as the gap it left.
+            self.bad_ticks += 1
+        if tick > lt + 1:
+            self.tick_gaps   += 1
+            self.frames_lost += tick - lt - 1
+        elif tick < lt:
+            self._pending = tick            # reboot or noise: next sample decides
+            return                          # last tick stays put until then
+        self._last_sample_tick = tick
+
+    def on_anchor(self, tick, now=None):
+        """now = time.time() at arrival, for the fix-dropout guard (None
+        disables it)."""
+        self.anchors += 1
+        la, la_t = self._last_anchor_tick, self._last_anchor_t
+        self._last_anchor_tick, self._last_anchor_t = tick, now
+        if la is None:
+            return
+        if now is not None and la_t is not None and now - la_t > self.ANCHOR_GAP_S:
+            # No anchor for over a second: the fix went away (the firmware
+            # sends anchors only with one). The frames in between are the
+            # dropout's, not pacer spacing — kept out of the spread, the
+            # same rule the firmware applies to fix_span_us.
+            return
+        d = tick - la
+        if d == 0:
+            self.eq_ticks += 1
+            self._spa.append(0)
+        elif d > 0:
+            self._spa.append(d)
+        else:
+            # Regression the sample side has not ruled on yet (anchor
+            # arrived first): not counted here, spread restarts.
+            self._spa.clear()
+
+    def snapshot(self, now):
+        """Counters plus rates over the last RATE_WINDOW_S seconds of
+        snapshot history. Call on the live-row cadence AND whenever the
+        wire is known dead (no data / no port), so the rates decay
+        honestly instead of freezing at their last live value.
+        JSON-serialisable."""
+        while self._hist and now - self._hist[0][0] > self.RATE_WINDOW_S:
+            self._hist.popleft()
+        samples_s = anchors_s = None
+        if self._hist:
+            t0, s0, a0 = self._hist[0]
+            dt = now - t0
+            if dt > 0.05:
+                samples_s = round((self.samples - s0) / dt, 1)
+                anchors_s = round((self.anchors - a0) / dt, 1)
+        self._hist.append((now, self.samples, self.anchors))
+        return {
+            'samples':     self.samples,
+            'anchors':     self.anchors,
+            'samples_s':   samples_s,
+            'anchors_s':   anchors_s,
+            'spa_min':     min(self._spa) if self._spa else None,
+            'spa_max':     max(self._spa) if self._spa else None,
+            'tick_gaps':   self.tick_gaps,
+            'frames_lost': self.frames_lost,
+            'reboots':     self.reboots,
+            'bad_ticks':   self.bad_ticks,
+            'eq_ticks':    self.eq_ticks,
+        }
+
+
 class TrackRecorder:
     """Position samples between GPS anchors; bin them into saved rows.
 
@@ -336,8 +509,13 @@ class TrackRecorder:
         a, b = self.anchor, point
         self.anchor = b
 
-        if a is not None and b['tick'] <= a['tick']:
-            # Ticks reset — MCU reboot. Everything buffered predates it.
+        if a is not None and b['tick'] < a['tick']:
+            # Ticks went BACKWARDS — MCU reboot. Everything buffered
+            # predates it. Equal ticks are not a reboot: the pacer
+            # free-runs against the GPS clock, so at 20 Hz (one frame per
+            # fix) two fixes can legitimately see the same completed
+            # frame; that segment is simply empty and falls through
+            # (nothing satisfies a.tick < tick <= b.tick).
             self.pending = []
             return self._break_continuity()
 
@@ -477,6 +655,21 @@ def meta_setdefault(conn, key, val):
         meta_set(conn, key, val)
 
 
+def pace_set(conn, text):
+    """Latest '# pace' report + its arrival time, one transaction."""
+    conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)', ('pace_last', text))
+    conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
+                 ('pace_at', f'{time.time():.1f}'))
+    conn.commit()
+
+
+def link_set(conn, link, now):
+    """LinkStats snapshot -> meta 'link' (JSON), on the live-row cadence."""
+    conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
+                 ('link', json.dumps(link.snapshot(now))))
+    conn.commit()
+
+
 def motion_set(conn, dist_mm, paused):
     """Both motion keys in one transaction (one commit, not two)."""
     conn.execute('INSERT OR REPLACE INTO meta VALUES (?,?)',
@@ -578,8 +771,23 @@ def insert_rows(conn, rows, vin, temp):
 
 
 TIMING_KEYS   = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz',
-                 'detector_mode', 'slot_us', 'bl8', 'rx8', 'tx8')
+                 'detector_mode', 'slot_us', 'pulse_us', 'bl8', 'rx8', 'tx8')
 GEOMETRY_KEYS = ('coil_spacing_mm', 'coil_offset_fore_mm', 'coil_offset_right_mm')
+
+
+def header_settled(conn):
+    """True when the read loop need not re-send 'I'.
+
+    Every header key present (info_ok) AND gps_cfg not in a state the
+    firmware can still move on from: 'pending' (re-sends under way, settles
+    within ~10 s) or 'silent' (module never heard — it may be switched on
+    later, at which point the firmware configures it and the header should
+    say so). None (firmware without gps_cfg) and boot/resent/noreply are
+    settled. A function, not an inline test, so the matrix is unit-tested:
+    an old board must never end up with an 'I' every retry period forever.
+    """
+    return (meta_get(conn, 'info_ok') == '1'
+            and meta_get(conn, 'gps_cfg') not in ('pending', 'silent'))
 
 
 def stamp_info(conn, info, debug=False):
@@ -591,21 +799,49 @@ def stamp_info(conn, info, debug=False):
     '0' until every header key is present. Changed timing/geometry on a
     later info line is flagged, not applied — a retune means a new study
     by convention, so a mid-study change must be visible, not silent.
+
+    A value of '?' is the firmware's "the GPS module never told me" marker
+    (gps_ver / gps_id when the module powered up after the MCU's boot-time
+    query, or was off). It counts as ABSENT here — never stamped, and a '?'
+    already stored (by a daemon from before 2026-09-20) yields to a real
+    value: stamping it would lock the header to '?' for the daemon's
+    lifetime, while the firmware re-asks the module on every 'I' and the
+    main loop re-sends 'I' every INFO_RETRY_S until the header completes.
+    `info_missing` names the header keys still absent ('' when complete)
+    so the UI can say exactly what is missing.
     """
-    first = meta_get(conn, 'fw_git_hash') is None
+    first  = meta_get(conn, 'fw_git_hash') is None
+    was_ok = meta_get(conn, 'info_ok')
     for src, dst in INFO_META_KEYS.items():
-        if src in info and meta_get(conn, dst) is None:
-            meta_set(conn, dst, info[src])
-    complete = all(meta_get(conn, dst) is not None
-                   for dst in INFO_META_KEYS.values())
+        val = info.get(src)
+        if val is None or val == '?':
+            continue                            # nothing to stamp
+        if meta_get(conn, dst) not in (None, '?'):
+            continue                            # first-wins: a real value is final
+        meta_set(conn, dst, val)
+    for src, dst in INFO_META_OPTIONAL.items():
+        val = info.get(src)
+        if val is not None and val != '?':
+            meta_set(conn, dst, val)                # last-wins: it is a state
+    missing = [dst for dst in INFO_META_KEYS.values()
+               if meta_get(conn, dst) in (None, '?')]
+    complete = not missing
     meta_set(conn, 'info_ok', '1' if complete else '0')
+    meta_set(conn, 'info_missing', ','.join(missing))
     meta_set(conn, 'info_at', f'{time.time():.1f}')
     if first:
         print(f'[daemon] study header stamped: fw={info.get("fw", "?")} '
               f'gps_id={info.get("gps_id", "?")} '
+              f'gps_cfg={info.get("gps_cfg", "-")} '
               f'coil_spacing_mm={info.get("coil_spacing_mm", "?")}'
-              + ('' if complete else '  (INCOMPLETE — awaiting next info line)'),
+              + ('' if complete else
+                 f'  (INCOMPLETE — missing {",".join(missing)}; re-asking)'),
               flush=True)
+    elif complete and was_ok != '1':
+        print(f'[daemon] study header complete: '
+              f'gps_ver={meta_get(conn, "gps_ver")} '
+              f'gps_id={meta_get(conn, "gps_id")} '
+              f'gps_cfg={meta_get(conn, "gps_cfg") or "-"}', flush=True)
     note_drift(conn, 'timing',   {k: info[k] for k in TIMING_KEYS   if k in info})
     note_drift(conn, 'geometry', {k: info[k] for k in GEOMETRY_KEYS if k in info})
 
@@ -734,9 +970,11 @@ def start_fifo_thread(ser_ref, lock):
                         # release between bytes lets it land mid-word —
                         # resetting the firmware's SAVE/CLEAR matcher, the
                         # exact silent no-op this pacing exists to prevent.
-                        # The read loop never takes this lock, so the hold
-                        # (<=128 ms for a 64-byte chunk) only delays
-                        # reconnect-time writers.
+                        # The read loop takes this lock only for its one-
+                        # byte header-retry 'I' (every --info-retry-s while
+                        # the header is incomplete), so the hold (<=128 ms
+                        # for a 64-byte chunk) stalls reading by at most
+                        # that — a few KB parked in the tty buffer at 500 Hz.
                         with lock:
                             s = ser_ref[0]
                             if s and s.is_open:
@@ -799,7 +1037,16 @@ def main():
                          'test/calibration, nothing is saved')
     ap.add_argument('--debug',       action='store_true',
                     help='Print each received line to stdout (useful for troubleshooting)')
+    ap.add_argument('--info-retry-s', type=float, default=INFO_RETRY_S,
+                    metavar='S',
+                    help='Re-send the I (info) request this often while the '
+                         'study header is incomplete, e.g. GPS identity '
+                         f'not yet reported (default {INFO_RETRY_S:g}, '
+                         'floor 0.5)')
     args = ap.parse_args()
+    # Floor: 0 or negative would re-ask on every read-loop iteration — an
+    # 'I' storm the firmware answers with a ~330-byte line each time.
+    args.info_retry_s = max(0.5, args.info_retry_s)
 
     db_path = os.path.expanduser(args.db)
     os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
@@ -845,6 +1092,7 @@ def main():
     # invalidate its state (an MCU reboot shows up as a tick regression,
     # which the recorder handles itself).
     recorder       = TrackRecorder(args.min_dist, args.no_gate)
+    link           = LinkStats()   # same lifetime, same reasoning
     last_motion_t  = 0.0    # last time motion meta was written
     last_live_t    = 0.0    # last time the live row was written
     last_data_t    = None   # wall time of last parsed data line
@@ -886,6 +1134,7 @@ def main():
             conn_t     = time.time()  # staleness grace starts at connect
             last_raw_t = None         # last time ANY bytes arrived
             rxbuf      = bytearray()  # partial line awaiting its newline
+            last_info_t = conn_t      # the handshake above just asked
 
             # ── Read loop ────────────────────────────────────────────────────
             while True:
@@ -910,7 +1159,32 @@ def main():
                     db_guard(live_write, conn, None, False,
                              'garbage' if flowing else 'no data',
                              last_data_t, last_vin, last_temp)
+                    db_guard(link_set, conn, link, now)   # rates decay to 0
                     last_live_t = now
+
+                # Header still incomplete → ask again, slowly and forever.
+                # The usual cause is GPS identity '?' (module powered up
+                # after the MCU's boot query, or switched off on the bench
+                # and on again later); firmware since 2026-09-20 re-asks the
+                # module on every 'I', so each retry can succeed where the
+                # last one couldn't. Also covers a device that never
+                # answered the connect-time handshake. Also while gps_cfg
+                # reads 'pending' or 'silent' — states the firmware can
+                # still move on from (see header_settled), so the header
+                # ends up carrying the settled one. Two meta reads per
+                # retry period, so the check itself is free.
+                if now - last_info_t >= args.info_retry_s:
+                    last_info_t = now
+                    try:
+                        header_ok = header_settled(conn)
+                    except sqlite3.Error:
+                        header_ok = True    # storage trouble: not the time
+                    if not header_ok:
+                        with lock:
+                            ser.write(b'I')
+                        if args.debug:
+                            print('[daemon] header incomplete or gps_cfg '
+                                  'unsettled — re-sent I', flush=True)
 
                 if not chunk:
                     continue
@@ -961,17 +1235,25 @@ def main():
                                    {'sample_rate_hz': m.group(1)})
                       m = RE_RASTER.search(line)
                       if m:
-                          db_guard(note_drift, conn, 'timing',
-                                   {'detector_mode': m.group(1),
-                                    'slot_us': m.group(2),
-                                    'bl8': m.group(4),
-                                    'rx8': m.group(5),
-                                    'tx8': m.group(6)})
+                          drift = {'detector_mode': m.group(1),
+                                   'slot_us': m.group(2),
+                                   'bl8': m.group(5),
+                                   'rx8': m.group(6),
+                                   'tx8': m.group(7)}
+                          # pulse_us is optional (pre-pulse-control firmware
+                          # omits it); absent means "leave the stamped value
+                          # alone", not "changed to nothing".
+                          if m.group(3) is not None:
+                              drift['pulse_us'] = m.group(3)
+                          db_guard(note_drift, conn, 'timing', drift)
                           # ch= is the console's raster channel selection —
                           # live UI state for raw.html's chips, never part of
                           # the stamped header (so plain meta, not note_drift).
-                          if m.group(3) is not None:
-                              db_guard(meta_set, conn, 'raster_sel', m.group(3))
+                          if m.group(4) is not None:
+                              db_guard(meta_set, conn, 'raster_sel', m.group(4))
+                      m = RE_PACE.match(line)
+                      if m:
+                          db_guard(pace_set, conn, m.group(1))
                       continue
 
                   point = parse_data_line(line)
@@ -986,6 +1268,7 @@ def main():
 
                   if point['kind'] == 'sample':
                       recorder.on_sample(point)
+                      link.on_sample(point['tick'])
                       last_adc = point['adc']
                       sample_tail.append((point['tick'], point['adc']))
                       if len(sample_tail) > 2 * SAMPLES_KEEP:
@@ -994,6 +1277,7 @@ def main():
                           del sample_tail[:len(sample_tail) - SAMPLES_KEEP]
                   else:
                       last_anchor_t = now
+                      link.on_anchor(point['tick'], now)
                       # The anchor closes a segment: interpolate its samples
                       # into positions and bin them; rows come back only when
                       # both anchors passed the gate and a bin crossed
@@ -1039,6 +1323,7 @@ def main():
                       db_guard(live_write, conn, merged,
                                reason == '' and not args.raw, reason,
                                last_data_t, last_vin, last_temp)
+                      db_guard(link_set, conn, link, now)
                       last_live_t = now
 
         # OSError too: unsupported-ioctl and unplug-mid-read failures arrive
@@ -1062,6 +1347,11 @@ def main():
                 ser_ref[0] = None
             db_guard(live_write, conn, None, False, 'no port',
                      last_data_t, last_vin, last_temp)
+            # Keep the link snapshot moving too: otherwise the raw view's
+            # Link row would sit green at its last live rates under a
+            # 'no port' banner. (time.time(): `now` is unbound when the
+            # very first open failed.)
+            db_guard(link_set, conn, link, time.time())
             time.sleep(2)
 
         except Exception as e:

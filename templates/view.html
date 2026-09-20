@@ -103,7 +103,7 @@
     /* the fixed-height toolbar clips silently — a wrapped stat line would
        push the Points row and NAV chip out of view */
     #envStats div { white-space:nowrap; }
-    #fq-text  { font-weight:bold; }
+    #fq-text  { font-weight:bold; white-space:nowrap; }
     /* fix type above the exit button — colored by MM.fixColor */
     #fixBadge { font-size:11px; font-weight:bold; text-align:center;
                 background:rgba(255,255,255,0.08); border-radius:4px;
@@ -146,7 +146,7 @@
   <div style="display:flex; flex-direction:column; gap:4px;">
     {# fix type rides above the exit button — the leftmost column is the
        only part of this toolbar guaranteed visible at 800px #}
-    <div id="fixBadge">—</div>
+    <div id="fixBadge" title="Heading GPS (dual antenna, gates recording) — corrections via jlw_rover_rtk">—</div>
     <form method="post" action="/stop_daemon">
       {# nowrap: the <br> is the ONLY break — min-content squeeze must not
          shatter the words further #}
@@ -266,12 +266,13 @@
 
   <div class="info-col">
     <div>Points: <span id="ptCount">0</span></div>
-    <div id="fq-text">—</div>
+    <div id="fq-text" title="Heading GPS (dual antenna, gates recording) — corrections via jlw_rover_rtk">—</div>
     <div id="envStats" style="display:none;"></div>
     <div id="motion-row" style="display:none;">
       Motion: <span id="motionVal" style="font-family:monospace;">—</span>
     </div>
-    <div id="navLine" class="nav-chip nav-down">NAV ○</div>
+    <div id="navLine" class="nav-chip nav-down"
+         title="Nav GPS — corrections via jlw_rover_rtk_nav">NAV ○</div>
   </div>
 
   <!-- Detector timing controls live on the raw data screen only; the map
@@ -686,6 +687,16 @@ function updateChanReadout(adc) {
 }
 
 // ── Meta panel: acquisition provenance stamped by the daemon ─────────────────
+// gps_cfg (firmware >= 2026-09-20): whether the GPS module took its boot
+// configuration burst. Mirrors gps_config_state() in gps.c.
+const GPS_CFG_LABELS = {
+  boot:    'taken at boot',
+  resent:  'taken after re-send (module came up late)',
+  pending: 'module heard, re-sends under way (when stamped)',
+  noreply: 'NOT ACKNOWLEDGED — module may run stale settings',
+  silent:  'nothing heard from the module (off, unplugged, or not emitting NMEA)',
+};
+
 // Curated view of the study's meta table. [meta key, label, formatter?].
 // Timing/geometry/fire keys are drift-aware: if the daemon recorded a
 // <key>_current diverging from the stamped header, both values show.
@@ -709,6 +720,7 @@ const META_GROUPS = [
   ['GPS', [
     ['gps_id',  'id'],
     ['gps_ver', 'version'],
+    ['gps_cfg', 'boot config', v => GPS_CFG_LABELS[v] || v],
   ]],
   ['Timing (µs)', [
     ['blanking_us',  'blanking'],
@@ -735,7 +747,10 @@ function escMeta(s) {
 }
 
 function renderMetaPanel() {
-  const seen = new Set(META_DRIFT_FLAGS.concat(['info_ok']));
+  // link / pace_*: the daemon's live link-health snapshot and last '# pace'
+  // report (raw view row 2) — session telemetry, not provenance, so they
+  // don't belong under Other as raw JSON.
+  const seen = new Set(META_DRIFT_FLAGS.concat(['info_ok', 'info_missing', 'link', 'pace_last', 'pace_at']));
   let html = '<div style="display:flex;justify-content:space-between;' +
              'align-items:center;gap:16px;">' +
              '<b style="color:#fff;">Study metadata</b>' +
@@ -744,9 +759,30 @@ function renderMetaPanel() {
              '</div>';
 
   // Header health first: these mean the provenance below needs a second look.
+  // Mirrors derive_status: identity pending is the common, benign case (the
+  // GPS module powers up after the MCU; the daemon keeps re-asking).
   if (meta.info_ok === '0') {
-    html += '<div class="meta-row meta-warn">⚠ header incomplete — the ' +
-            'detector info line was never fully received</div>';
+    const identMissing = meta.gps_id == null || meta.gps_ver == null;
+    const other = meta.info_missing == null ? null
+      : meta.info_missing.split(',').filter(k => k && k !== 'gps_id' && k !== 'gps_ver');
+    if (meta.fw_git_hash == null) {
+      html += '<div class="meta-row meta-warn">⚠ detector never answered the ' +
+              'info request</div>';
+    } else {
+      if (identMissing) {
+        html += '<div class="meta-row meta-warn">⚠ GPS identity not yet reported ' +
+                '— position data unaffected</div>';
+      }
+      if (other === null ? !identMissing : other.length) {
+        html += '<div class="meta-row meta-warn">⚠ header incomplete' +
+                (other && other.length ? ` (missing ${other.join(', ')})` : '') +
+                ' — info line truncated or firmware older than this host</div>';
+      }
+    }
+  }
+  if (meta.gps_cfg === 'noreply') {
+    html += '<div class="meta-row meta-warn">⚠ GPS module did not acknowledge ' +
+            'its configuration — it may be running stale settings</div>';
   }
   for (const flag of META_DRIFT_FLAGS) {
     if (meta[flag] == null) continue;
@@ -863,12 +899,14 @@ function updateStatus(st) {
     // overwrite the numbers, else every SSE tick undoes a bias adjustment.
     if (st.state !== 'stopped' && st.state !== 'wedged')
       updateChanReadout(st.live.adc);
+    // 'HDG' = the heading GPS whose fix gates recording; the nav GPS has
+    // its own labeled chip (updateNav). Two systems, two labeled fixes.
     const fq = document.getElementById('fq-text');
-    fq.textContent = MM.fixLabel(st.live.fix);
+    fq.textContent = 'HDG ' + (st.live.fix > 0 ? '● ' : '○ ') + MM.fixLabel(st.live.fix);
     fq.style.color = MM.fixColor(st.live.fix);
     const fb = document.getElementById('fixBadge');
     if (fb) {
-      fb.textContent = MM.fixLabel(st.live.fix);
+      fb.textContent = 'HDG ' + MM.fixLabel(st.live.fix);
       fb.style.color = MM.fixColor(st.live.fix);
     }
     if (st.live.vin != null)

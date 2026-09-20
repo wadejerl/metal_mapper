@@ -36,10 +36,12 @@ volatile uint8_t gps_heading_valid = 0;
 volatile uint32_t last_ths_timestamp = 0;
 
 // Module identity, captured from the replies to the $PQTMVERNO and
-// $PQTMUNIQID queries sent during gps_send_config. Raw payload (after
-// the sentence name, checksum stripped); empty string until the module
-// answers. Written from the USART2 IRQ during boot, read by the 'I'
-// info report long after — no concurrent access in practice.
+// $PQTMUNIQID queries — sent during gps_send_config at boot and again by
+// gps_query_identity when the 'I' key finds them still unanswered. Raw
+// payload (after the sentence name, checksum stripped); empty string
+// until the module answers. Written from the USART2 IRQ; the 'I' info
+// report (task) snapshots both with that IRQ masked, because its deadline
+// path prints while a late reply may still be landing (see md_print_info).
 char gps_version_str[64] = "";
 char gps_uniqid_str[64] = "";
 
@@ -153,26 +155,39 @@ static void gps_send_nmea(const char *body)
   int len = snprintf(msg, sizeof(msg), "$%s*%02X\r\n", body, checksum);
   if (len > 0 && len < (int)sizeof(msg))
   {
-    HAL_UART_Transmit(&huart2, (uint8_t *)msg, (uint16_t)len, HAL_MAX_DELAY);
+    // Bounded, not HAL_MAX_DELAY: since the 'I' re-query this also runs at
+    // steady state, when the ISR's DMA-stuck watchdog may DeInit/Init
+    // huart2 underneath a transmit in flight. ~30 bytes take 0.7 ms at
+    // 460800; 20 ms is generous and a miss is reported, not hung on.
+    HAL_StatusTypeDef st = HAL_UART_Transmit(&huart2, (uint8_t *)msg,
+                                             (uint16_t)len, 20U);
     printf("# > %s", msg);  // msg already ends in \r\n; "# > " marks TX vs RX echo
+    if (st != HAL_OK)
+      printf("# > (gps tx failed, status %d)\r\n", (int)st);
   }
 }
 
 /**
- * @brief Configure the GPS module output (Quectel $PQTM commands)
+ * The module's boot configuration (Quectel $PQTM commands)
  *
  * The module does not output data on this UART by default: enable NMEA
- * protocol, 50 ms (20 Hz) fix rate, GGA/GSV on and GSA/VTG/GLL/RMC off,
+ * protocol, 50 ms (20 Hz) fix rate, GGA on and GSV/GSA/VTG/GLL/RMC off,
  * then save parameters and restart the module. Each command is acked
  * with an OK sentence, visible via the startup echo.
+ *
+ * GSV is OFF (2026-09-20): the firmware parsed and discarded it, and on
+ * this module it arrives as a once-per-second block of 25-43 sentences
+ * (1.6-2.8 kB, 34-61 ms of UART time at 460800) — the one thing in the
+ * stream able to shift a GGA by tens of ms. With the pacer now free-
+ * running that can no longer touch the coils, but it still costs ISR time
+ * and displaces the anchor by v*delay once a second. Fields 3-4 of
+ * PQTMCFGMSGRATE are PortType 1 (UART) and PortID 3 (this port).
  */
-void gps_send_config(void)
-{
-  static const char *cmds[] = {
+static const char *const gps_cfg_cmds[] = {
 	"PQTMCFGPROT,W,1,3,7,7",
 	"PQTMCFGFIXRATE,W,50",
     "PQTMCFGMSGRATE,W,1,3,GGA,1",
-    "PQTMCFGMSGRATE,W,1,3,GSV,1",
+    "PQTMCFGMSGRATE,W,1,3,GSV,0",
     "PQTMCFGMSGRATE,W,1,3,GSA,0",
     "PQTMCFGMSGRATE,W,1,3,VTG,0",
     "PQTMCFGMSGRATE,W,1,3,GLL,0",
@@ -181,13 +196,227 @@ void gps_send_config(void)
 	"PQTMUNIQID",    /* unique chip ID — ignored by modules that lack it     */
 	"PQTMSAVEPAR",
 	"PQTMSRR",
-  };
+};
+#define GPS_CFG_CMD_COUNT  ((uint32_t)(sizeof gps_cfg_cmds / sizeof gps_cfg_cmds[0]))
+#define GPS_CFG_CMD_GAP_MS 10U    /* the module needs a moment per command */
 
-  for (uint32_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++)
+// ---- Did the burst reach the module? (2026-09-20) --------------------------
+// The GPS shares the rig's supply but comes up slightly AFTER the MCU, so
+// the boot burst (StartDefaultTask, a fixed 3 s after start) can go out to a
+// module that is not listening yet — or that starts listening PART-way
+// through the ~130 ms burst. It then runs whatever it PQTMSAVEPAR'd on some
+// earlier boot (a partial burst even saves a stale-head/new-tail mix) —
+// harmless until the list above changes (GSV off, a rate...), when the
+// field unit silently keeps the old behaviour and the difference gets
+// chased as an analog problem.
+//
+// Protocol facts (Quectel LG290P/LGx80P GNSS Protocol Specification): every
+// Set command is answered with its own name — $PQTMCFGPROT,OK / ,ERROR,<n>,
+// $PQTMCFGMSGRATE,OK ..., $PQTMSAVEPAR,OK; PQTMSRR has no reply; the module
+// prints a $PQTMVER banner first thing on every startup, and its command
+// parser is ready some unspecified time after that.
+//
+// So: the USART2 ISR counts $PQTMCFG* replies (OK or ERROR — either proves
+// that command was heard) and notes the first checksum-valid sentence
+// (module heard). A burst counts as DELIVERED only when every PQTMCFG
+// command in the table was answered — one ack proves one command, not the
+// burst. gps_config_poll (task loop) re-sends an undelivered burst once
+// the module has been heard: GPS_CFG_SETTLE_MS after it was first heard,
+// then, still not fully answered, again after growing gaps (parser not
+// ready yet) — GPS_CFG_MAX_RESENDS attempts in all. Nothing ever waits for
+// the module: a bench boot with the GPS off costs no extra time, and a
+// module switched on minutes later still gets the current config (and a
+// restart — expect a short GGA gap). Re-sends are stepped one command per
+// poll (~0.7 ms of blocking TX each) rather than the boot burst's HAL_Delay
+// loop, which at steady state would overrun the frame ring. Before PQTMSRR
+// both paths give the PQTMSAVEPAR NVM write time to finish: its ack, or
+// GPS_CFG_SAVE_WAIT_MS. A module that never says anything (off, unplugged,
+// or factory-fresh with NMEA output disabled and up late) is never probed —
+// reset the MCU with the module powered to provision one.
+//
+// ISR-written / task-read counters; the task never writes the ISR's. A
+// byte flag and an aligned uint32 are each atomic on the M4, and the ISR
+// runs to completion before the task resumes, so no masking is needed.
+static volatile uint8_t  gps_heard       = 0;   /* ISR: a valid sentence arrived      */
+static volatile uint32_t gps_heard_tick  = 0;   /* ISR: HAL tick of the first one     */
+static volatile uint32_t gps_cfg_replies = 0;   /* ISR: $PQTMCFG* replies, running    */
+static volatile uint32_t gps_cfg_saves   = 0;   /* ISR: $PQTMSAVEPAR replies, running */
+static uint8_t  gps_cfg_attempts   = 0;         /* task: bursts sent — 1 boot, +1 per re-send */
+static uint32_t gps_cfg_base       = 0;         /* task: gps_cfg_replies when the latest burst began */
+static uint32_t gps_cfg_saves_base = 0;         /* task: gps_cfg_saves when its SAVEPAR went out */
+static uint32_t gps_cfg_next       = GPS_CFG_CMD_COUNT; /* task: re-send cursor; == COUNT idle */
+static uint32_t gps_cfg_due_tick   = 0;         /* task: next command due / reply window end */
+static uint8_t  gps_cfg_reported   = 0;         /* task: outcome printed once */
+#define GPS_CFG_MAX_RESENDS   3U
+#define GPS_CFG_SETTLE_MS     500U   /* module first heard -> re-send 1           */
+#define GPS_CFG_REPLY_WAIT_MS 1000U  /* last command of a burst -> it is judged   */
+#define GPS_CFG_SAVE_WAIT_MS  200U   /* PQTMSAVEPAR -> PQTMSRR unless acked first */
+/* extra wait before re-send k (1-based) once the previous reply window closed.
+ * A stepped burst takes ~300 ms (10 x 10 ms + the 200 ms save gap) and is
+ * judged 1 s after its last command, so with no acks at all the re-sends
+ * start ~0.5 s, ~2.8 s and ~8.1 s after the module was first heard and the
+ * verdict is in by ~9.4 s. */
+static const uint32_t gps_cfg_retry_gap_ms[GPS_CFG_MAX_RESENDS] = { 0U, 1000U, 4000U };
+
+static int gps_cfg_is_savepar(uint32_t i)
+{
+  return strcmp(gps_cfg_cmds[i], "PQTMSAVEPAR") == 0;
+}
+
+/* Number of PQTMCFG commands in the table = replies a delivered burst draws */
+static uint32_t gps_cfg_needed(void)
+{
+  static uint32_t needed = 0U;
+  if (needed == 0U)
+    for (uint32_t i = 0; i < GPS_CFG_CMD_COUNT; i++)
+      if (strncmp(gps_cfg_cmds[i], "PQTMCFG", 7) == 0)
+        needed++;
+  return needed;
+}
+
+/* Latest burst answered in full? */
+static int gps_cfg_delivered(void)
+{
+  return gps_cfg_attempts > 0U &&
+         (gps_cfg_replies - gps_cfg_base) >= gps_cfg_needed();
+}
+
+/**
+ * @brief Send the configuration burst (boot; blocking, ~130 ms + save wait)
+ */
+void gps_send_config(void)
+{
+  gps_cfg_attempts++;
+  gps_cfg_base = gps_cfg_replies;
+  for (uint32_t i = 0; i < GPS_CFG_CMD_COUNT; i++)
   {
-    gps_send_nmea(cmds[i]);
-    HAL_Delay(10);  // give the module time to process each command
+    uint32_t saves = gps_cfg_saves;
+    gps_send_nmea(gps_cfg_cmds[i]);
+    if (gps_cfg_is_savepar(i))
+    {
+      uint32_t t0 = HAL_GetTick();      /* NVM write: wait for the ack or the cap */
+      while (gps_cfg_saves == saves && (HAL_GetTick() - t0) < GPS_CFG_SAVE_WAIT_MS)
+        HAL_Delay(1);
+    }
+    HAL_Delay(GPS_CFG_CMD_GAP_MS);
   }
+}
+
+/**
+ * @brief Re-send an undelivered burst once the module is heard (task loop, ~1 ms)
+ */
+void gps_config_poll(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  if (gps_cfg_next < GPS_CFG_CMD_COUNT)             /* a re-send is in flight */
+  {
+    /* The PQTMSAVEPAR -> PQTMSRR gap ends early once the save is acked */
+    int save_gap = (gps_cfg_next > 0U) && gps_cfg_is_savepar(gps_cfg_next - 1U);
+    if ((int32_t)(now - gps_cfg_due_tick) < 0 &&
+        !(save_gap && gps_cfg_saves != gps_cfg_saves_base))
+      return;
+    if (gps_cfg_is_savepar(gps_cfg_next))
+      gps_cfg_saves_base = gps_cfg_saves;
+    gps_send_nmea(gps_cfg_cmds[gps_cfg_next]);
+    uint32_t gap = gps_cfg_is_savepar(gps_cfg_next) ? GPS_CFG_SAVE_WAIT_MS
+                                                    : GPS_CFG_CMD_GAP_MS;
+    gps_cfg_next++;
+    gps_cfg_due_tick = now + ((gps_cfg_next < GPS_CFG_CMD_COUNT)
+                              ? gap : GPS_CFG_REPLY_WAIT_MS);
+    return;
+  }
+  if (gps_cfg_attempts == 0U)                       /* boot burst not out yet */
+    return;
+  if (gps_cfg_delivered())                          /* configured — done */
+  {
+    if (gps_cfg_attempts >= 2U && !gps_cfg_reported)
+    {
+      gps_cfg_reported = 1U;
+      printf("# GPS config re-send %u acknowledged in full (gps_cfg=resent)\r\n",
+             (unsigned)(gps_cfg_attempts - 1U));
+    }
+    return;
+  }
+  if (!gps_heard)                                   /* off / unplugged / mute: nothing to wait for */
+    return;
+  if (gps_cfg_attempts > GPS_CFG_MAX_RESENDS)       /* every re-send spent */
+  {
+    if (!gps_cfg_reported && (int32_t)(now - gps_cfg_due_tick) >= 0)
+    {
+      gps_cfg_reported = 1U;
+      printf("# GPS config: %lu of %lu commands acknowledged after %u re-sends "
+             "(gps_cfg=noreply) - module may be running stale settings\r\n",
+             (unsigned long)(gps_cfg_replies - gps_cfg_base),
+             (unsigned long)gps_cfg_needed(), (unsigned)GPS_CFG_MAX_RESENDS);
+    }
+    return;
+  }
+  /* Next attempt: the first GPS_CFG_SETTLE_MS after the module was first
+   * heard, later ones a growing gap after the previous reply window closed
+   * (the module talks before its command parser is ready). */
+  uint32_t k   = gps_cfg_attempts - 1U;             /* 0-based re-send index */
+  uint32_t due = (k == 0U) ? gps_heard_tick + GPS_CFG_SETTLE_MS
+                           : gps_cfg_due_tick + gps_cfg_retry_gap_ms[k];
+  if ((int32_t)(now - due) < 0)
+    return;
+  printf("# GPS config re-send %lu/%u (%lu of %lu commands acknowledged so far; "
+         "%s) - expect a short GGA gap while the module restarts\r\n",
+         (unsigned long)(k + 1U), (unsigned)GPS_CFG_MAX_RESENDS,
+         (unsigned long)(gps_cfg_replies - gps_cfg_base),
+         (unsigned long)gps_cfg_needed(),
+         (k == 0U) ? "module came up after the boot burst"
+                   : "module not accepting commands yet");
+  gps_cfg_attempts++;
+  gps_cfg_base = gps_cfg_replies;
+  gps_cfg_next = 0U;
+  gps_cfg_due_tick = now;
+}
+
+/**
+ * @brief Delivery state of the config burst, for the 'I' info line
+ */
+const char *gps_config_state(void)
+{
+  if (gps_cfg_delivered())
+    return (gps_cfg_attempts >= 2U) ? "resent" : "boot";
+  if (!gps_heard)
+    return "silent";
+  /* Latched by gps_config_poll the moment the last reply window closes
+   * (not re-derived from the tick: a signed tick delta against a frozen
+   * deadline turns negative again after 2^31 ms = 24.8 days of uptime).
+   * The 'resent' branch also sets the flag, but only once delivered — and
+   * delivered is monotonic, so that case returned above. */
+  if (gps_cfg_attempts > GPS_CFG_MAX_RESENDS && gps_cfg_reported)
+    return "noreply";
+  return "pending";
+}
+
+/**
+ * @brief Re-ask the module for its version and unique ID
+ *
+ * The GPS shares the rig's supply but comes up slightly AFTER the MCU, so
+ * the boot-time queries above can go out before the module is listening:
+ * GGA still flows (the module boots into its PQTMSAVEPAR'd config) but
+ * gps_version_str / gps_uniqid_str stay empty and every study header
+ * would carry gps_ver=? gps_id=? for the MCU's lifetime (2026-09-20).
+ * The 'I' key calls this when either is still empty — by the time the
+ * Pi's daemon connects and asks, the module has long been up. Two short
+ * sentences, ~0.7 ms of blocking TX at 460800; the replies land in the
+ * USART2 ISR like any other sentence (gps_process_dma_buffer).
+ */
+void gps_query_identity(void)
+{
+  gps_send_nmea("PQTMVERNO");
+  gps_send_nmea("PQTMUNIQID");
+}
+
+/**
+ * @brief 1 once both identity replies have been captured
+ */
+int gps_identity_known(void)
+{
+  return (gps_version_str[0] != '\0' && gps_uniqid_str[0] != '\0') ? 1 : 0;
 }
 
 // ============================================================================
@@ -276,6 +505,34 @@ void gps_process_dma_buffer(void)
       gps_echo_enqueue(sentence);
     }
 
+    // Config-burst delivery tracking (see gps_config_poll): the first
+    // checksum-valid sentence means the module is up and talking; each
+    // $PQTMCFG* reply (OK or ERROR) is one config command heard; the
+    // $PQTMSAVEPAR reply releases the wait before PQTMSRR. Checksum-gated
+    // so line noise from a powered-down module never counts as "heard".
+    // Replies to our own commands — and the module's $PQTMVER boot banner,
+    // i.e. "I (re)started" — are queued as # lines once the startup echo
+    // is off, so a steady-state re-send (or an 'I' identity re-query) is
+    // as visible on the console as the boot burst.
+    if (minmea_check(sentence, true))
+    {
+      if (!gps_heard)
+      {
+        gps_heard_tick = now;
+        gps_heard = 1;
+      }
+      if (strncmp(sentence, "$PQTMCFG", 8) == 0)
+        gps_cfg_replies++;
+      else if (strncmp(sentence, "$PQTMSAVEPAR", 12) == 0)
+        gps_cfg_saves++;
+      if (!gps_echo_enabled &&
+          (strncmp(sentence, "$PQTMCFG", 8) == 0 ||
+           strncmp(sentence, "$PQTMSAVEPAR", 12) == 0 ||
+           strncmp(sentence, "$PQTMVER", 8) == 0 ||     /* banner and $PQTMVERNO */
+           strncmp(sentence, "$PQTMUNIQID", 11) == 0))
+        gps_echo_enqueue(sentence);
+    }
+
     // Parse GGA sentences (PRIORITY - checked first)
     if (strncmp(sentence, "$GPGGA", 6) == 0 || strncmp(sentence, "$GNGGA", 6) == 0)
     {
@@ -309,7 +566,10 @@ void gps_process_dma_buffer(void)
         // RMC parsed successfully - data available in frame if needed later
       }
     }
-    // Parse GSV sentences (Satellites in View)
+    // Parse GSV sentences (Satellites in View). GSV is disabled in
+    // gps_send_config (2026-09-20); this branch stays only so a stray
+    // sentence (config not yet applied) is consumed quietly — the
+    // satellite count on the info line comes from GGA, not from here.
     else if (strncmp(sentence, "$GPGSV", 6) == 0 || strncmp(sentence, "$GNGSV", 6) == 0 ||
              strncmp(sentence, "$GLGSV", 6) == 0 || strncmp(sentence, "$GAGSV", 6) == 0)
     {
@@ -489,10 +749,12 @@ void gps_parse_gga_sentence(const char *sentence)
     latest_gps_position.fix_quality = frame.fix_quality;
     latest_gps_position.satellites = frame.satellites_tracked;
     latest_gps_position.timestamp = frame.time.seconds + frame.time.microseconds / 1000000.0;
-    /* Anchor tick: the newest COMPLETED frame — by pacing it fired
-     * MD_SAMPLE_LEAD_MS before this fix and its ADC data is already in
-     * the frame ring, so the anchor line always follows its sample line
-     * on the wire. One atomic uint32 read; ADC IRQs outrank this one. */
+    /* Anchor tick: the newest COMPLETED frame. The pacer free-runs, so
+     * that frame completed somewhere within the last sample interval
+     * before this GGA parsed; its ADC data is already in the frame ring,
+     * so the anchor line always follows its sample line on the wire, and
+     * the host's tick-space interpolation tolerates the sub-interval
+     * phase. One atomic uint32 read; ADC IRQs outrank this one. */
     latest_gps_position.tick = md_tick_completed;
 
     // Check if position is valid (not NaN and has fix)
@@ -502,7 +764,7 @@ void gps_parse_gga_sentence(const char *sentence)
     {
       latest_gps_position.valid = 1;
       new_gga_available = 1;  // Signal new data available
-      md_pace_on_fix();       // Re-sync detector sampling to this fix
+      md_pace_note_fix();     // Diagnostics only — a fix never moves the pacer
     }
     else
     {

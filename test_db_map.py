@@ -269,12 +269,131 @@ p_warn = make_study('warn1', meta={
     'sample_rate_hz': '500', 'sample_rate_hz_current': '100',
     'detector_mode': 'all', 'detector_mode_current': 'raster',
     'slot_us': '200',
+    'pulse_us': '200', 'pulse_us_current': '4200',
     'bl8': '16,16,16,16,16,16,16,16', 'bl8_current': '16,16,16,16,16,16,16,18',
     'rx8': '3,3,3,3,3,3,3,3', 'tx8': '120,120,120,120,120,120,120,120',
     'raster_sel': '3',
 })
 st = db_map.derive_status(p_warn)
 check('identity warning', any('identity' in w for w in st['warnings']), repr(st['warnings']))
+check('identity warning says position is fine',
+      any('identity' in w and 'position data is unaffected' in w for w in st['warnings']),
+      repr(st['warnings']))
+# A saved study (no daemon attached) must not promise that anything re-asks.
+check('stopped study: no re-asking promise',
+      not any('re-asking' in w for w in st['warnings']), repr(st['warnings']))
+check("old-daemon '?' alone: no header-incomplete warning",
+      not any('header incomplete' in w for w in st['warnings']), repr(st['warnings']))
+# The daemon (2026-09-20) no longer stamps '?': identity is simply absent
+# with info_ok=0 — same warning.
+p_noid = make_study('warn_noid', meta={'info_ok': '0', 'fw_git_hash': 'abc1234',
+                                        'gps_ver': 'LG580P03'})
+st_noid = db_map.derive_status(p_noid)
+check('absent gps_id + info_ok=0 → identity warning',
+      any('identity' in w for w in st_noid['warnings']), repr(st_noid['warnings']))
+# ...and with a live daemon attached the warning says it keeps asking.
+Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(p_noid)}')
+st_noid_live = db_map.derive_status(p_noid)
+os.unlink(db_map.PID_FILE)
+check('live study: identity warning says the daemon keeps re-asking',
+      any('identity' in w and 're-asking' in w for w in st_noid_live['warnings']),
+      repr(st_noid_live['warnings']))
+# Old daemon, glitched VERNO reply only: gps_ver '?' with info_ok=1 must
+# still surface (the old outer gate looked at gps_id alone).
+p_verq = make_study('warn_verq', meta={'info_ok': '1', 'fw_git_hash': 'abc1234',
+                                        'gps_ver': '?', 'gps_id': 'OK,16,AB'})
+check("gps_ver '?' alone → identity warning",
+      any('identity' in w for w in db_map.derive_status(p_verq)['warnings']))
+# Identity present but the header still incomplete = a different problem
+# (truncated line / old firmware) and must not be blamed on the GPS.
+p_trunc = make_study('warn_trunc', meta={'info_ok': '0', 'fw_git_hash': 'abc1234',
+                                          'gps_ver': 'LG580P03', 'gps_id': 'OK,16,AB'})
+st_trunc = db_map.derive_status(p_trunc)
+check('incomplete header with identity → header warning, not GPS',
+      any('header incomplete' in w for w in st_trunc['warnings'])
+      and not any('identity' in w for w in st_trunc['warnings']),
+      repr(st_trunc['warnings']))
+# info_missing (daemon >= 2026-09-20) makes it precise: both problems at
+# once → both warnings, the header one naming the non-identity keys.
+p_miss = make_study('warn_miss', meta={'info_ok': '0', 'fw_git_hash': 'abc1234',
+                                        'gps_ver': 'LG580P03',
+                                        'info_missing': 'gps_id,bl8,tx8'})
+st_miss = db_map.derive_status(p_miss)
+check('info_missing: identity AND header warnings',
+      any('identity' in w for w in st_miss['warnings'])
+      and any('header incomplete (missing bl8, tx8)' in w for w in st_miss['warnings']),
+      repr(st_miss['warnings']))
+p_missid = make_study('warn_missid', meta={'info_ok': '0', 'fw_git_hash': 'abc1234',
+                                            'gps_ver': 'LG580P03', 'info_missing': 'gps_id'})
+st_missid = db_map.derive_status(p_missid)
+check('info_missing = identity only → no header warning',
+      any('identity' in w for w in st_missid['warnings'])
+      and not any('header incomplete' in w for w in st_missid['warnings']),
+      repr(st_missid['warnings']))
+# Nothing answered the connect-time 'I' at all: not a GPS problem.
+p_noans = make_study('warn_noans', meta={'info_ok': '0'})
+st_noans = db_map.derive_status(p_noans)
+check('no info reply at all → never-answered warning, not GPS',
+      any('never answered' in w for w in st_noans['warnings'])
+      and not any('identity' in w for w in st_noans['warnings']),
+      repr(st_noans['warnings']))
+p_ok = make_study('warn_none', meta={'info_ok': '1', 'gps_id': 'OK,16,AB', 'gps_ver': 'X',
+                                      'info_missing': ''})
+check('complete header → no header warning',
+      not any('identity' in w or 'header' in w or 'answered' in w
+              for w in db_map.derive_status(p_ok)['warnings']))
+# Firmware gives up on a module without a unique ID: gps_id=none is a value.
+p_none = make_study('warn_idnone', meta={'info_ok': '1', 'gps_id': 'none', 'gps_ver': 'X',
+                                          'fw_git_hash': 'abc1234', 'info_missing': ''})
+check('gps_id=none (module has no unique ID) → no warning',
+      not any('identity' in w or 'header' in w
+              for w in db_map.derive_status(p_none)['warnings']))
+# gps_cfg (firmware >= 2026-09-20): did the GPS module take its boot config.
+# Only 'noreply' earns a warning — 'silent' is the GPS being off (already
+# visible as no fix), 'pending' settles within seconds, boot/resent are fine.
+for val in ('boot', 'resent', 'pending', 'silent'):
+    p_cfg = make_study(f'warn_cfg_{val}',
+                       meta={'info_ok': '1', 'gps_id': 'OK,16,AB', 'gps_ver': 'X',
+                             'fw_git_hash': 'abc1234', 'info_missing': '', 'gps_cfg': val})
+    st_cfg = db_map.derive_status(p_cfg)
+    check(f'gps_cfg={val} → no configuration warning',
+          not any('configuration' in w for w in st_cfg['warnings']), repr(st_cfg['warnings']))
+p_cfgno = make_study('warn_cfg_noreply',
+                     meta={'info_ok': '1', 'gps_id': 'OK,16,AB', 'gps_ver': 'X',
+                           'fw_git_hash': 'abc1234', 'info_missing': '', 'gps_cfg': 'noreply'})
+st_cfgno = db_map.derive_status(p_cfgno)
+check('gps_cfg=noreply → stale-settings warning, no identity/header warning',
+      any('configuration' in w and 'stale' in w for w in st_cfgno['warnings'])
+      and not any('identity' in w or 'header' in w for w in st_cfgno['warnings']),
+      repr(st_cfgno['warnings']))
+# noreply alongside a missing identity: both warnings, independently.
+p_cfgboth = make_study('warn_cfg_both', meta={'info_ok': '0', 'fw_git_hash': 'abc1234',
+                                               'info_missing': 'gps_ver,gps_id',
+                                               'gps_cfg': 'noreply'})
+st_cfgboth = db_map.derive_status(p_cfgboth)
+check('gps_cfg=noreply + identity missing → both warnings',
+      any('identity' in w for w in st_cfgboth['warnings'])
+      and any('configuration' in w for w in st_cfgboth['warnings']),
+      repr(st_cfgboth['warnings']))
+# Live study: the config warning never promises re-asking (the firmware's
+# re-sends are spent), and pending/silent stay quiet there too.
+for val, want in (('noreply', True), ('pending', False), ('silent', False)):
+    p_cfglive = make_study(f'warn_cfg_live_{val}',
+                           meta={'info_ok': '1', 'gps_id': 'OK,16,AB', 'gps_ver': 'X',
+                                 'fw_git_hash': 'abc1234', 'info_missing': '', 'gps_cfg': val})
+    Path(db_map.PID_FILE).write_text(f'{os.getpid()}:{os.path.abspath(p_cfglive)}')
+    st_cfglive = db_map.derive_status(p_cfglive)
+    os.unlink(db_map.PID_FILE)
+    cfgw = [w for w in st_cfglive['warnings'] if 'configuration' in w]
+    check(f'live gps_cfg={val} → configuration warning '
+          f'{"present, no re-asking" if want else "absent"}',
+          bool(cfgw) == want and not any('re-asking' in w for w in cfgw),
+          repr(st_cfglive['warnings']))
+# A fresh db before any handshake (no info_ok yet) says nothing.
+p_fresh = make_study('warn_fresh', meta={'study_name': 'x'})
+check('no handshake yet → no header warnings',
+      not any('identity' in w or 'header' in w or 'answered' in w
+              for w in db_map.derive_status(p_fresh)['warnings']))
 check('timing drift warning', any('tx_pulse_us 120->80' in w for w in st['warnings']))
 check('geometry drift warning', any('coil_spacing_mm' in w for w in st['warnings']))
 check('timing prefers _current', st['timing']['blanking_us'] == '18'
@@ -290,10 +409,46 @@ check('timing carries sample_rate_hz (prefers _current)',
 check('timing carries raster keys (prefers _current)',
       st['timing']['detector_mode'] == 'raster'
       and st['timing']['slot_us'] == '200'
+      and st['timing']['pulse_us'] == '4200'
       and st['timing']['bl8'] == '16,16,16,16,16,16,16,18'
       and st['timing']['rx8'] == '3,3,3,3,3,3,3,3'
       and st['timing']['tx8'] == '120,120,120,120,120,120,120,120'
       and st['timing']['raster_sel'] == '3', repr(st['timing']))
+
+# Link health + pacer report (raw view row 2) ride the status too. The
+# daemon writes `link` as JSON and the '# pace' payload verbatim; a saved
+# study from an older daemon has neither, and a torn value must degrade to
+# None rather than take the SSE tick down.
+check('old study: no link/pace', st['link'] is None and st['pace'] is None)
+_lk = {'samples': 4808, 'anchors': 481, 'samples_s': 200.1, 'anchors_s': 20.0,
+       'spa_min': 9, 'spa_max': 11, 'tick_gaps': 0, 'frames_lost': 0,
+       'reboots': 0, 'eq_ticks': 0}
+p_link = make_study('link1', meta={
+    'link': json.dumps(_lk),
+    'pace_last': 'det=all ivl_us=5000 fires=1000 skips=0 jit_max_us=3',
+    'pace_at': f'{time.time() - 5:.1f}'})
+st = db_map.derive_status(p_link)
+check('link parsed from meta', st['link'] == _lk, repr(st['link']))
+check('pace text + age from the server clock',
+      st['pace']['text'].startswith('det=all ivl_us=5000')
+      and st['pace']['at'] is not None and 4.0 <= st['pace']['age_s'] <= 8.0,
+      repr(st['pace']))
+p_torn = make_study('link2', meta={'link': '{"samples": 1', 'pace_last': 'det=x',
+                                   'pace_at': 'soon'})
+st = db_map.derive_status(p_torn)
+check('torn link JSON degrades to None', st['link'] is None)
+check('pace with unparsable stamp keeps its text',
+      st['pace'] == {'text': 'det=x', 'at': None, 'age_s': None}, repr(st['pace']))
+p_list = make_study('link3', meta={'link': '[1,2]'})
+check('non-object link degrades to None', db_map.derive_status(p_list)['link'] is None)
+# float('nan') / float('inf') parse fine but serialise as NaN/Infinity,
+# which the browser's JSON.parse rejects — the whole SSE tick would die.
+p_nan = make_study('link4', meta={'pace_last': 'det=x', 'pace_at': 'nan'})
+st = db_map.derive_status(p_nan)
+check('non-finite pace_at degrades to None', st['pace']['at'] is None
+      and st['pace']['age_s'] is None, repr(st['pace']))
+check('status serialises as strict JSON',
+      'NaN' not in json.dumps(st) and 'Infinity' not in json.dumps(st))
 
 # ── Flask routes ──────────────────────────────────────────────────────────────
 
@@ -1168,6 +1323,23 @@ check('service_states: units mapped to states in argument order',
       _st is not None and list(_st) == _units and _st[_units[0]] == 'failed'
       and all(_st[u] == 'active' for u in _units[1:]), repr(_st))
 
+# The RTK units hold in 'activating' (ExecStartPre reachability gate)
+# whenever no base station is on the network — the panel must show that as
+# a steady amber 'wait' dot, distinct from green (feeding) / grey (off) /
+# red (failed), in BOTH the Jinja render and the SSE updater.
+_real_svc_fn, _real_ip_fn = db_map.service_states, db_map.local_ipv4s
+db_map.service_states = lambda: {'jlw_rover_rtk.service': 'activating',
+                                 'jlw_metalmap.service': 'active'}
+db_map.local_ipv4s = lambda: ['wlan0 192.168.4.1']
+try:
+    r = client.get('/')
+finally:
+    db_map.service_states, db_map.local_ipv4s = _real_svc_fn, _real_ip_fn
+check("index: 'activating' unit renders the amber wait dot",
+      b'class="dot wait"' in r.data and b'class="dot on"' in r.data)
+check("index: SSE dot updater knows the 'activating' state",
+      b"state === 'activating' ? ' wait'" in r.data)
+
 # local_ipv4s(): parse `ip -j -4 addr` JSON — loopback and inet6 excluded,
 # iface name rides along. Same forced-binary + cache-reset dance.
 _ip_json = json.dumps([
@@ -1258,6 +1430,13 @@ check('view strip chart pins zero-overlay mode',
 check('live view: fix badge + vin/temp row in the visible zone',
       b'id="fixBadge"' in r.data and b'id="vinLiveRow"' in r.data
       and b'id="vinVal"' in r.data and b'id="tempVal"' in r.data)
+# Two GPS systems, two labeled fixes: the heading GPS readouts (fq-text +
+# fixBadge, both tooltipped with jlw_rover_rtk) carry the HDG prefix in JS,
+# and the nav chip's tooltip names jlw_rover_rtk_nav. 'RTK Fixed x2' must
+# be attributable at a glance.
+check('live view: both GPS fixes labeled (HDG prefix + service tooltips)',
+      r.data.count(b"'HDG '") == 2 and r.data.count(b'jlw_rover_rtk"') == 2
+      and b'jlw_rover_rtk_nav"' in r.data)
 os.unlink(db_map.PID_FILE)
 r = client.get('/view/saved1')
 check('saved view keeps plain Studies exit',
@@ -1300,6 +1479,14 @@ check('raw ships raster mode toggle + chips wiring',
       b"sendCmd('r')" in r.data and b'buildChips' in r.data
       and b'id="chipRow"' in r.data and b'tableVal' in r.data
       and b'raster_sel' in r.data)
+# Pulse-spacing row (raster only): +/- buttons drive the fw h/n keys, the
+# value renders st.timing.pulse_us; the rate slider pre-clamps its walk to
+# the sweep-fit (8 slots per interval) via the slotUsNow tracker.
+check('raw ships pulse-spacing wiring',
+      b'id="pulseRow"' in r.data and b'id="pulseVal"' in r.data
+      and b"pulseCmd('h')" in r.data and b"pulseCmd('n')" in r.data
+      and b'pulse_us' in r.data and b'slotUsNow' in r.data
+      and b'PULSE_STEPS' in r.data)
 # Channel legend: per-channel show/hide checkboxes + σ readout. The rows
 # are client-built (buildVals), so assert the wiring ships, not the DOM.
 check('raw ships channel-visibility + σ wiring',

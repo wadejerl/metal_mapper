@@ -153,6 +153,35 @@ static volatile uint8_t md_ch_bl_us[8];         /*   mode only; seeded by      *
 static volatile uint8_t md_ch_rx_us[8];         /*   MD_Load_Settings          */
 static volatile uint8_t md_slot_ticks = MD_SLOT_TICKS_MIN;   /* slot period   */
 
+/* Requested pulse spacing (raster slot-period floor), 0.1 ms ticks. The
+ * effective slot period is max(this, the worst channel's timeline) — the
+ * h/n console keys step it through the list below. MIN (200 µs) means "as
+ * fast as the timings allow", the original raster behavior. Slower spacing
+ * exists because sensitivity drops when the channels are scanned too fast
+ * (the previous slot's eddy tail bleeds into the next read); the field
+ * wants ~160/240 Hz spacing, so the list carries the closest periods the
+ * 0.1 ms pacer tick can express (6.2 ms = 161 Hz, 4.2 ms = 238 Hz). */
+static volatile uint8_t md_pulse_ticks = MD_SLOT_TICKS_MIN;
+static uint8_t md_slot_want = MD_SLOT_TICKS_MIN;  /* last slot-period candidate
+    computed by md_raster_apply — kept on refusal too, so the raster-limit
+    warn can print the number that actually failed the fit (task ctx only) */
+static const uint8_t md_pulse_steps[] = {   /* ticks (rate): */
+    2U,     /* 200 µs  5000 Hz — as fast as the timings allow (default) */
+    5U,     /* 500 µs  2000 Hz */
+    10U,    /*   1 ms  1000 Hz */
+    20U,    /*   2 ms   500 Hz */
+    42U,    /* 4.2 ms   238 Hz — "240" */
+    50U,    /*   5 ms   200 Hz */
+    62U,    /* 6.2 ms   161 Hz — "160"; 8 slots = 49.6 ms, fits 20 Hz  */
+    100U,   /*  10 ms   100 Hz */
+    125U,   /*12.5 ms    80 Hz */
+    200U,   /*  20 ms    50 Hz */
+    250U,   /*  25 ms    40 Hz — uint8 tick ceiling                    */
+};
+#define MD_PULSE_STEPS (sizeof(md_pulse_steps) / sizeof(md_pulse_steps[0]))
+
+#define MD_CYC_PER_US 170U   /* DWT CYCCNT runs at HCLK = 170 MHz */
+
 static inline uint32_t dwt_cyccnt(void)
 {
     if (!(CoreDebug->DEMCR & CoreDebug_DEMCR_TRCENA_Msk))
@@ -160,6 +189,12 @@ static inline uint32_t dwt_cyccnt(void)
     if (!(DWT->CTRL & DWT_CTRL_CYCCNTENA_Msk))
         DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
     return DWT->CYCCNT;
+}
+
+/* Cycles -> whole microseconds, rounded (spans well under the 25 s DWT wrap) */
+static inline uint32_t md_cyc_to_us(uint32_t cyc)
+{
+    return (cyc + MD_CYC_PER_US / 2U) / MD_CYC_PER_US;
 }
 
 /* ---------------------------------------------------------------------------
@@ -223,7 +258,7 @@ static volatile uint32_t md_sample_tick   = 0U;
 static volatile uint32_t md_tick_inflight = 0U;
 volatile uint32_t md_tick_completed       = 0U;
 
-/* Raster sweep state — written by the TIM7 pacer ISR (priority 6), read
+/* Raster sweep state — written by the TIM7 pacer ISR (priority 4), read
  * by the aux-UIE (2) and JEOS (3) ISRs. Every field settles microseconds
  * before the hardware event that reads it (a slot's UIE can't fire until
  * tx+bl+rx after the pacer armed it), so no locking is needed — the same
@@ -237,12 +272,41 @@ static volatile uint8_t md_slot_ch     = 0U;  /* channel converting now     */
  * toggle mid-cycle can't misroute a cycle already in the hardware. */
 static volatile uint8_t md_cycle_raster = 0U; /* latched at CEN write       */
 static volatile uint8_t md_kick_raster  = 0U; /* latched at JADSTART        */
-/* GPS fix that lands mid-sweep: the resync is deferred to the sweep
- * boundary (re-arming TIM7 mid-sweep would cut the slot cadence). The
- * boundary arm subtracts the slots that fired since the fix — ±1 slot
- * period of phase error once, corrected by the next fix. */
-static volatile uint32_t md_fix_defer_ticks = 0U;
-static volatile uint8_t  md_fix_defer_slot  = 0U;
+/* Pacer diagnostics — the 'P' console key prints them as one '# pace'
+ * line and resets the window. The pacer ISR (priority 4) writes the fire
+ * side; the GPS fix path (USART2 ISR, priority 6) writes the fix side
+ * and only READS the fire stamp. A fire that preempts a fix read tears
+ * one diagnostic sample, never the cadence — these numbers steer nothing.
+ * DWT cycle counts (MD_CYC_PER_US per µs); 0 = "no stamp yet". */
+static volatile uint32_t md_pd_fire_cyc  = 0U;  /* last cycle/sweep CEN stamp */
+static volatile uint32_t md_pd_prev_ivl  = 0U;  /* previous fire-to-fire, µs  */
+static volatile uint32_t md_pd_fires     = 0U;  /* cycles/sweeps started      */
+static volatile uint32_t md_pd_skips     = 0U;  /* starts refused (overlap)   */
+static volatile uint32_t md_pd_dev_max   = 0U;  /* max |interval - nominal| µs*/
+static volatile uint32_t md_pd_jit_max   = 0U;  /* max |interval - previous|  */
+static volatile uint32_t md_pd_fix_cyc   = 0U;  /* last valid GGA parse stamp */
+static volatile uint32_t md_pd_fix_ms    = 0U;  /* ...and its HAL ms tick: the
+                                                   dropout guard (>1 s) runs on
+                                                   this so the 25 s DWT wrap
+                                                   can't fake a short span  */
+static volatile uint32_t md_pd_fix_n     = 0U;  /* valid GGAs seen            */
+static volatile uint32_t md_pd_fix_span_min = 0xFFFFFFFFU; /* GGA-to-GGA µs */
+static volatile uint32_t md_pd_fix_span_max = 0U;
+static volatile uint32_t md_pd_fix_ph    = 0U;  /* last GGA: µs after a fire  */
+static volatile uint32_t md_pd_gps_isr_max = 0U; /* longest NMEA parse, µs   */
+
+/* Task context (console, save, the raster brackets, boot). A fire landing
+ * mid-reset loses one interval of statistics — nothing else. */
+static void md_pace_diag_reset(void)
+{
+    md_pd_fire_cyc = 0U;   md_pd_prev_ivl = 0U;
+    md_pd_fires    = 0U;   md_pd_skips    = 0U;
+    md_pd_dev_max  = 0U;   md_pd_jit_max  = 0U;
+    md_pd_fix_cyc  = 0U;   md_pd_fix_ms   = 0U;   md_pd_fix_n = 0U;
+    md_pd_fix_span_min = 0xFFFFFFFFU;
+    md_pd_fix_span_max = 0U;
+    md_pd_fix_ph   = 0U;   md_pd_gps_isr_max = 0U;
+}
 
 /* Completed-frame ring: last-JEOS ISR writes (the ADC IRQs share priority
  * 3, so writes never nest), app task reads. Free-running indices, same
@@ -295,8 +359,9 @@ static uint32_t md_interval_ticks(void)
 /* Recompute the raster slot period from the worst channel's timeline and
  * check the sweep fits the sample interval. Applies (md_slot_ticks) and
  * returns 1, or changes nothing and returns 0. The slot period stretches
- * past the 200 µs floor only when a channel's tx+bl+rx grows too long for
- * it — always reported (info line / rastercfg echo), never truncated. */
+ * past the 200 µs floor when a channel's tx+bl+rx grows too long for it
+ * OR when the requested pulse spacing (md_pulse_ticks) is slower — always
+ * reported (info line / rastercfg echo), never truncated. */
 static uint8_t md_raster_apply(void)
 {
     uint32_t worst = 0U;
@@ -307,6 +372,13 @@ static uint8_t md_raster_apply(void)
     uint32_t ticks = (worst + MD_SLOT_ADC_US + MD_SLOT_MARGIN_US + 99U) / 100U;
     if (ticks < MD_SLOT_TICKS_MIN)
         ticks = MD_SLOT_TICKS_MIN;
+    if (ticks < md_pulse_ticks)
+        ticks = md_pulse_ticks;
+    md_slot_want = (uint8_t)ticks;   /* remembered even when refused: the
+                                        raster-limit warn prints the value
+                                        that failed the fit, not the one
+                                        still applied (self-contradictory
+                                        numbers otherwise) */
     if (8U * ticks > md_interval_ticks())
         return 0U;
     md_slot_ticks = (uint8_t)ticks;
@@ -397,7 +469,7 @@ static void md_adc_init(void)
          * SUM of 16 conversions — max 16*4095 = 65520, so the values
          * still fit uint16_t end-to-end (md_adc[], CSV, daemon). ~2 more
          * effective bits for a ~16x longer sequence (~45 us/pair), which
-         * the GPS-paced cadence has to spare. Full-register write also
+         * the 2 ms-and-up sample cadence has to spare. Full-register write also
          * evicts anything a debugger poke left behind (JADSTART is 0). */
         p->adc->CFGR2 = ADC_CFGR2_JOVSE | (3U << ADC_CFGR2_OVSR_Pos);
 
@@ -577,7 +649,10 @@ typedef struct __attribute__((aligned(8))) {
     uint8_t  ch_bl_us[8];          /* raster per-channel table             */
     uint8_t  ch_rx_us[8];
     uint8_t  ch_tx_us[8];
-    uint32_t reserved[2];          /* written erased (0xFFFFFFFF): a future
+    uint32_t pulse_ticks;          /* requested raster pulse spacing, 0.1 ms
+                                      ticks (2..255); pre-pulse records read
+                                      erased 0xFFFFFFFF -> default          */
+    uint32_t reserved;             /* written erased (0xFFFFFFFF): a future
                                       field reads "not present" in old
                                       records for free, MDT3-style         */
     uint32_t check;                /* ~(XOR of the 15 words above)         */
@@ -746,9 +821,17 @@ void MD_Load_Settings(void)
                                  ? last4->ch_tx_us[k] : (uint8_t)MD_TX_PULSE_US;
             }
             md_raster = (((last4->blanking_us >> 24) & 0xFFU) == 1U) ? 1U : 0U;
+            /* Requested pulse spacing: erased 0xFFFFFFFF in pre-pulse
+             * records (and anything out of range) falls back to "as fast
+             * as the timings allow". */
+            md_pulse_ticks = (last4->pulse_ticks >= MD_SLOT_TICKS_MIN &&
+                              last4->pulse_ticks <= 255U)
+                             ? (uint8_t)last4->pulse_ticks
+                             : (uint8_t)MD_SLOT_TICKS_MIN;
         } else {
             md_table_seed();                 /* legacy record: table = globals */
             md_raster = 0U;
+            md_pulse_ticks = MD_SLOT_TICKS_MIN;
         }
         if (md_raster && !md_raster_apply()) {
             /* Foreign/stale combo: sweep doesn't fit the sample interval.
@@ -833,6 +916,7 @@ void MD_Save_Settings(void)
         rec.ch_rx_us[k] = md_ch_rx_us[k];
         rec.ch_tx_us[k] = md_ch_tx_us[k];
     }
+    rec.pulse_ticks          = md_pulse_ticks;
     rec.check                = md_settings_check4(&rec);
 
     HAL_FLASH_Unlock();
@@ -876,6 +960,8 @@ void MD_Save_Settings(void)
 
     HAL_FLASH_Lock();
     HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
+    md_pace_diag_reset();   /* the ~22 ms hold above is a known, user-made
+                               outlier — keep it out of the 'P' statistics */
 
     const md_settings_rec4_t *r = (const md_settings_rec4_t *)md_settings_slot(slot);
     if (st == HAL_OK && r->magic == MD_SETTINGS_MAGIC4
@@ -892,32 +978,97 @@ void MD_Save_Settings(void)
  * 'I' info line: everything the daemon stamps into a study header. One
  * space-separated key=value line, parse-friendly; "?" marks a value the
  * GPS module never reported. Task context only (printf).
+ *
+ * The identity strings are written by the USART2 ISR (gps_capture_id) and
+ * the deferred 'I' path prints on a deadline — i.e. possibly while a late
+ * reply is landing — so they are snapshotted with that ISR masked (sub-µs
+ * for 128 bytes; a pended char-match is serviced right after, DMA keeps
+ * filling). The ISR runs to completion before the task resumes, so the
+ * task can never see a half-written string; the mask only makes the
+ * snapshot deterministic (a reply landing mid-copy would otherwise read
+ * as "?" for that one print). Cheap insurance, not a bug fix.
+ *
+ * gps_id "none": the module answered $PQTMVERNO but not $PQTMUNIQID on
+ * MD_UNIQID_GIVEUP consecutive deferred 'I' replies — it has no unique ID
+ * (the boot config already treats the query as optional). Reported as a
+ * value so the daemon's header completes and its retry stops; "?" stays
+ * the marker for "not heard yet".
  * ------------------------------------------------------------------------- */
+#define MD_UNIQID_GIVEUP 2U
+static uint8_t md_uniqid_misses = 0U;   /* deferred replies with ver, no id */
+
 void md_print_info(void)
 {
-    printf("# info fw=%s gps_ver=%s gps_id=%s"
+    char ver[sizeof gps_version_str];
+    char uid[sizeof gps_uniqid_str];
+    HAL_NVIC_DisableIRQ(USART2_IRQn);
+    memcpy(ver, gps_version_str, sizeof ver);
+    memcpy(uid, gps_uniqid_str, sizeof uid);
+    HAL_NVIC_EnableIRQ(USART2_IRQn);
+    ver[sizeof ver - 1U] = '\0';
+    uid[sizeof uid - 1U] = '\0';
+
+    printf("# info fw=%s gps_ver=%s gps_id=%s gps_cfg=%s"
            " blanking_us=%lu rx_window_us=%lu tx_pulse_us=%lu"
            " coil_spacing_mm=%lu coil_offset_fore_mm=%ld coil_offset_right_mm=%ld"
            " sample_rate_hz=%lu adc_oversample=16 adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14"
-           " detector_mode=%s slot_us=%u"
+           " detector_mode=%s slot_us=%u pulse_us=%u"
            " bl8=%u,%u,%u,%u,%u,%u,%u,%u"
            " rx8=%u,%u,%u,%u,%u,%u,%u,%u"
            " tx8=%u,%u,%u,%u,%u,%u,%u,%u\r\n",
            FW_GIT_HASH,
-           gps_version_str[0] ? gps_version_str : "?",
-           gps_uniqid_str[0]  ? gps_uniqid_str  : "?",
+           ver[0] ? ver : "?",
+           uid[0] ? uid : (md_uniqid_misses >= MD_UNIQID_GIVEUP ? "none" : "?"),
+           gps_config_state(),   /* boot|resent|pending|noreply|silent — did the
+                                    module take its config burst (gps.c) */
            md_blanking_us, md_rx_window_us, md_tx_pulse_us,
            md_coil_spacing_mm,
            (long)md_coil_offset_fore_mm, (long)md_coil_offset_right_mm,
            md_sample_rate_hz(),
            md_raster ? "raster" : "all",
            (unsigned)md_slot_ticks * 100U,
+           (unsigned)md_pulse_ticks * 100U,
            md_ch_bl_us[0], md_ch_bl_us[1], md_ch_bl_us[2], md_ch_bl_us[3],
            md_ch_bl_us[4], md_ch_bl_us[5], md_ch_bl_us[6], md_ch_bl_us[7],
            md_ch_rx_us[0], md_ch_rx_us[1], md_ch_rx_us[2], md_ch_rx_us[3],
            md_ch_rx_us[4], md_ch_rx_us[5], md_ch_rx_us[6], md_ch_rx_us[7],
            md_ch_tx_us[0], md_ch_tx_us[1], md_ch_tx_us[2], md_ch_tx_us[3],
            md_ch_tx_us[4], md_ch_tx_us[5], md_ch_tx_us[6], md_ch_tx_us[7]);
+}
+
+/* 'P' pacer diagnostics — one '# pace ...' line, then the window resets.
+ * ivl_us: the configured sample interval (sweep-to-sweep in raster).
+ * fires / skips: cycles (sweeps) started / starts refused by the overlap
+ * guard — per slot in raster, so skips can exceed fires there.
+ * dev_max_us / jit_max_us: worst |measured - ivl_us| and worst change
+ * between consecutive intervals, stamped at the cycle's CEN write — what
+ * the coils actually saw. dev_max_us carries a constant floor: the re-arm
+ * resets TIM7's counter AFTER the cycle start, so every interval is
+ * nominal plus the ISR's own entry-to-arm time (a few µs at -O0 in all
+ * mode; ~8x that in raster, one per slot re-arm); it is a true
+ * measurement, not jitter. jit_max_us cancels that constant and is the
+ * jitter figure. fix_span_us=min/max: valid-GGA-to-GGA spacing
+ * at parse end, i.e. the GPS module's own arrival jitter (the pre-2026-09
+ * firmware applied exactly this to the pacer as interval stretches).
+ * fix_ph_us: where the last GGA fell after a fire (sweeps 0..ivl_us as
+ * the free-running pacer and the GPS clock slide past each other; only a
+ * refused start leaves it stale enough to read past ivl_us).
+ * gps_isr_max_us: longest NMEA parse inside the USART2 ISR. Token names
+ * deliberately match none of the daemon's echo patterns (blanking=,
+ * tx_pulse=, coil_spacing=, sample_rate=, detector_mode=). */
+static void md_print_pace(void)
+{
+    uint32_t span_min = md_pd_fix_span_min;
+    if (span_min == 0xFFFFFFFFU)
+        span_min = 0U;
+    printf("# pace det=%s ivl_us=%lu fires=%lu skips=%lu dev_max_us=%lu jit_max_us=%lu"
+           " fix_n=%lu fix_span_us=%lu/%lu fix_ph_us=%lu gps_isr_max_us=%lu\r\n",
+           md_raster ? "raster" : "all",
+           md_interval_ticks() * 100U,
+           md_pd_fires, md_pd_skips, md_pd_dev_max, md_pd_jit_max,
+           md_pd_fix_n, span_min, md_pd_fix_span_max, md_pd_fix_ph,
+           md_pd_gps_isr_max);
+    md_pace_diag_reset();
 }
 
 /* Raster-state echo — printed on any mode/selection/table change. Same
@@ -933,12 +1084,13 @@ static void md_print_rastercfg(void)
         sel[0] = (char)('0' + md_sel_ch);
         sel[1] = '\0';
     }
-    printf("# rastercfg detector_mode=%s slot_us=%u ch=%s"
+    printf("# rastercfg detector_mode=%s slot_us=%u pulse_us=%u ch=%s"
            " bl8=%u,%u,%u,%u,%u,%u,%u,%u"
            " rx8=%u,%u,%u,%u,%u,%u,%u,%u"
            " tx8=%u,%u,%u,%u,%u,%u,%u,%u\r\n",
            md_raster ? "raster" : "all",
-           (unsigned)md_slot_ticks * 100U, sel,
+           (unsigned)md_slot_ticks * 100U,
+           (unsigned)md_pulse_ticks * 100U, sel,
            md_ch_bl_us[0], md_ch_bl_us[1], md_ch_bl_us[2], md_ch_bl_us[3],
            md_ch_bl_us[4], md_ch_bl_us[5], md_ch_bl_us[6], md_ch_bl_us[7],
            md_ch_rx_us[0], md_ch_rx_us[1], md_ch_rx_us[2], md_ch_rx_us[3],
@@ -957,8 +1109,9 @@ void md_print_keys(void)
            "# keys: g/b sample rate up/down (20/40/100/200/500 Hz)\r\n"
            "# keys: r raster/all mode   0-7 select channel, 8 selects all\r\n"
            "# keys: (raster: a/z s/x f/v edit the selected channel's slot timing)\r\n"
+           "# keys: h/n raster pulse spacing faster/slower (200us..25ms list)\r\n"
            "# keys: SAVE+enter save settings   CLEAR+enter restore defaults+save\r\n"
-           "# keys: I info   G gps passthrough\r\n");
+           "# keys: I info   G gps passthrough   P pacer diagnostics (resets window)\r\n");
 }
 
 /* Force-restore compile-time defaults and persist them (the word-gated
@@ -982,6 +1135,7 @@ static void md_restore_defaults(void)
     md_coil_offset_fore_mm  = 0;
     md_coil_offset_right_mm = MD_COIL_OFFSET_RIGHT_MM_DEFAULT;
     md_samples_per_period   = MD_SAMPLES_PER_GPS_PERIOD;
+    md_pulse_ticks          = MD_SLOT_TICKS_MIN;
     md_table_seed();
     (void)md_raster_apply();
     printf("# defaults restored\r\n");
@@ -1008,6 +1162,60 @@ static int md_word_step(const char *word, uint32_t len, uint32_t *pos,
 }
 
 /* ---------------------------------------------------------------------------
+ * 'I' with the GPS identity still unknown: re-ask the module first, print
+ * once both replies have landed or MD_INFO_WAIT_MS has passed. The GPS
+ * powers up slightly after the MCU, so the boot-time query in
+ * gps_send_config can go unanswered while GGA flows fine; the daemon's 'I'
+ * at connect arrives long after the module is up, so asking again there
+ * fills the header (2026-09-20). Deferred, never blocking: the frame ring
+ * holds MD_FRAME_RING = 32 frames — 64 ms at 500 Hz — so a wait inside the
+ * key handler would drop frames. md_info_poll runs from every console
+ * poll (task loop, ~1 ms period). A second 'I' while one is pending is
+ * folded into it: one answer per outstanding request, within the daemon's
+ * 2 s handshake wait either way. Identity known: prints at once, as before.
+ * Settled = known, or the module has proven it has no unique ID (version
+ * answered, ID not, MD_UNIQID_GIVEUP deferred replies in a row) — then 'I'
+ * stops re-asking and reports gps_id=none (see md_print_info).
+ * ------------------------------------------------------------------------- */
+#define MD_INFO_WAIT_MS 500U
+static uint8_t  md_info_pending  = 0U;
+static uint32_t md_info_deadline = 0U;
+
+static int md_identity_settled(void)
+{
+    return gps_identity_known() ||
+           (gps_version_str[0] != '\0' && md_uniqid_misses >= MD_UNIQID_GIVEUP);
+}
+
+static void md_info_request(void)
+{
+    if (md_identity_settled()) {
+        md_print_info();
+        return;
+    }
+    if (!md_info_pending) {
+        gps_query_identity();
+        md_info_deadline = HAL_GetTick() + MD_INFO_WAIT_MS;
+        md_info_pending  = 1U;
+    }
+}
+
+static void md_info_poll(void)
+{
+    if (!md_info_pending)
+        return;
+    if (gps_identity_known()) {
+        md_info_pending = 0U;
+        md_print_info();
+    } else if ((int32_t)(HAL_GetTick() - md_info_deadline) >= 0) {
+        md_info_pending = 0U;
+        if (gps_version_str[0] != '\0' && md_uniqid_misses < MD_UNIQID_GIVEUP)
+            md_uniqid_misses++;     /* version came, ID did not: strike */
+        md_print_info();            /* "?" for whatever the module still owes */
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Console: poll USART1 RX from the task loop (detector2 pattern — direct
  * register access, no HAL receive state machine to wedge, no ISR). Drain
  * everything each poll so held keys adjust smoothly; print once.
@@ -1025,6 +1233,14 @@ void md_console_poll(void)
     int rate_changed = 0;
     int ras_changed = 0;
     int ras_warn = 0;
+    /* The warn's operands, SNAPSHOT at the refusal that set ras_warn: a
+     * later key in the same drain (a successful apply, a rate change)
+     * moves md_slot_want / md_interval_ticks(), and a drain-end print
+     * reading them live can pair numbers from two different events —
+     * even numbers that satisfy the constraint the warn reports. */
+    uint32_t ras_warn_slot = 0U;  /* slot-period operand (ticks)          */
+    uint32_t ras_warn_ivl  = 0U;  /* interval operand (ticks) — the
+                                     REQUESTED one on a rate refusal      */
     /* Flash writes are word-gated: SAVE+Enter saves, CLEAR+Enter restores
      * defaults and saves. A single stray byte (RX crosstalk from the host's
      * other data line lands as valid-looking key bytes) can never commit to
@@ -1078,14 +1294,37 @@ void md_console_poll(void)
                 }
                 uint8_t snap[8];
                 md_table_copy(snap, tab);
+                /* Same bracket + sweep-drop as the h/n path: a 1 µs edit
+                 * that crosses a 100 µs tick boundary changes
+                 * md_slot_ticks under the pacer's per-slot re-arms —
+                 * mixed spacing in one published frame otherwise. Most
+                 * edits DON'T move the ticks, so gate the drop on an
+                 * actual change (no frame tax per keypress). The adj runs
+                 * INSIDE the bracket too: md_start_slot reads the live
+                 * table per slot, so a pacer expiry racing the write
+                 * could otherwise fire one slot with a refused,
+                 * about-to-be-reverted timing that no echo ever reports. */
+                HAL_NVIC_DisableIRQ(TIM7_DAC_IRQn);
                 if (md_table_adj(tab, up ? 1 : -1, lo, hi)) {
+                    uint8_t old_ticks = md_slot_ticks;
                     if (md_raster_apply()) {
+                        if (md_slot_ticks != old_ticks && md_slot != 0U) {
+                            md_sweep_ok = 0U;
+                            /* The slots still to fire re-arm at the new
+                             * spacing, so this one sweep interval is off
+                             * by (slots fired)*(old-new) — user-made, so
+                             * keep it out of the 'P' window like g/b do. */
+                            md_pace_diag_reset();
+                        }
                         ras_changed = 1;
                     } else {
                         md_table_restore(tab, snap);
                         ras_warn = 1;
+                        ras_warn_slot = md_slot_want;
+                        ras_warn_ivl  = md_interval_ticks();
                     }
                 }
+                HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
             }
             else if (ch == 'a') { if (md_blanking_us < MD_BLANKING_MAX_US) md_blanking_us += 1U;         changed = 1; }
             else if (ch == 'z') { md_blanking_us  = (md_blanking_us  > 1U) ? md_blanking_us - 1U : 0U;   changed = 1; }
@@ -1098,8 +1337,9 @@ void md_console_poll(void)
         else if (ch == 'c') { if (md_coil_spacing_mm > MD_COIL_SPACING_MM_MIN) md_coil_spacing_mm -= 10U; geom_changed = 1; }
         else if (ch == 'g' || ch == 'b') {
             /* Step through the divisor list — the pacer picks the new
-             * interval up at its next arm; the next fix re-syncs fully.
-             * In raster mode a step whose interval can't hold the sweep is
+             * interval up at its next arm (one transitional interval; the
+             * 'P' window is reset so it doesn't read as jitter). In
+             * raster mode a step whose interval can't hold the sweep is
              * refused (the echo still confirms the unchanged rate). */
             uint32_t i = 0U;
             while (i < MD_RATE_STEPS - 1U && md_rate_steps[i] != md_samples_per_period)
@@ -1107,11 +1347,71 @@ void md_console_poll(void)
             uint32_t ni = i;
             if (ch == 'g' && i < MD_RATE_STEPS - 1U) ni = i + 1U;
             else if (ch == 'b' && i > 0U) ni = i - 1U;
-            if (ni != i && !md_raster_rate_ok(md_rate_steps[ni]))
+            if (ni != i && !md_raster_rate_ok(md_rate_steps[ni])) {
+                /* The failing pair here is (current slot, REQUESTED
+                 * interval) — no apply runs. */
+                ras_warn_slot = md_slot_ticks;
+                ras_warn_ivl  = MD_GPS_PERIOD_MS * MD_PACE_TICKS_PER_MS
+                                / md_rate_steps[ni];
                 ras_warn = 1;
-            else
+            } else {
                 md_samples_per_period = md_rate_steps[ni];
+                md_pace_diag_reset();
+            }
             rate_changed = 1;
+        }
+        else if (ch == 'h' || ch == 'n') {
+            /* Step the requested pulse spacing: 'h' faster (shorter
+             * period), 'n' slower. Nearest-in-direction walk so an
+             * off-list value from a foreign record still steps sanely.
+             * Live in both modes (no lockout): in all mode the apply is
+             * a best-effort slot preview — 'r' re-checks the fit anyway. */
+            uint8_t cur = md_pulse_ticks, nv = cur;
+            if (ch == 'h') {
+                for (uint32_t i = MD_PULSE_STEPS; i-- > 0U;)
+                    if (md_pulse_steps[i] < cur) { nv = md_pulse_steps[i]; break; }
+            } else {
+                for (uint32_t i = 0U; i < MD_PULSE_STEPS; i++)
+                    if (md_pulse_steps[i] > cur) { nv = md_pulse_steps[i]; break; }
+            }
+            if (nv != cur) {
+                /* The pacer re-reads md_slot_ticks at every per-slot arm,
+                 * so an apply landing mid-sweep gives the remaining slots
+                 * a different spacing than the fired ones — the frame
+                 * would publish with lying skew (the hazard the save path
+                 * guards). The IRQ-off bracket makes apply + sweep-drop
+                 * atomic against the pacer: without it a sweep START can
+                 * slip between a md_slot==0 guard read and the ticks
+                 * write and still mix spacings. Sub-µs with IRQs off (a
+                 * pended expiry just runs after — 100 µs ticks dwarf it);
+                 * the save path holds the same bracket for milliseconds.
+                 * Drop only AFTER a successful apply: a refused step
+                 * changes nothing, so the in-flight sweep is still good.
+                 * The md_slot 0 guard (as in MD_Save_Settings) spares the
+                 * slot-7 conversion publishing across the wrap. */
+                HAL_NVIC_DisableIRQ(TIM7_DAC_IRQn);
+                md_pulse_ticks = nv;
+                uint8_t old_ticks = md_slot_ticks;
+                if (md_raster_apply()) {
+                    if (md_raster && md_slot != 0U) {
+                        md_sweep_ok = 0U;
+                        if (md_slot_ticks != old_ticks)
+                            md_pace_diag_reset();   /* one odd sweep
+                                                       interval, user-made */
+                    }
+                    ras_changed = 1;
+                } else if (md_raster) {
+                    md_pulse_ticks = cur;  /* sweep wouldn't fit the interval */
+                    ras_warn = 1;
+                    ras_warn_slot = md_slot_want;
+                    ras_warn_ivl  = md_interval_ticks();
+                } else {
+                    ras_changed = 1;    /* all mode: best-effort, echo anyway */
+                }
+                HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
+            } else {
+                ras_changed = 1;        /* list end: echo confirms the state */
+            }
         }
         else if (ch >= '0' && ch <= '8') {
             md_sel_ch = (uint8_t)(ch - '0');   /* '8' = all channels */
@@ -1124,20 +1424,23 @@ void md_console_poll(void)
                  * the pair JSQRs itself. A sweep in flight is abandoned (one
                  * tick gap). */
                 md_raster = 0U;
-                md_fix_defer_ticks = 0U;
+                md_pace_diag_reset();
                 ras_changed = 1;
             } else if (md_raster_apply()) {
                 md_slot     = 0U;   /* ordered before the mode flag: the pacer
                                        reads slot state only when raster is on */
                 md_sweep_ok = 0U;
-                md_fix_defer_ticks = 0U;
                 md_raster   = 1U;
+                md_pace_diag_reset();
                 ras_changed = 1;
             } else {
                 ras_warn = 1;       /* sweep wouldn't fit the sample interval */
+                ras_warn_slot = md_slot_want;
+                ras_warn_ivl  = md_interval_ticks();
             }
         }
-        else if (ch == 'I') { md_print_info(); }
+        else if (ch == 'I') { md_info_request(); }   /* may defer, see above */
+        else if (ch == 'P') { md_print_pace(); }
         else if (ch == 'G') {
             gps_passthrough_enabled = !gps_passthrough_enabled;
             printf("# gps passthrough %s\r\n",
@@ -1157,8 +1460,9 @@ void md_console_poll(void)
     if (ras_changed)
         md_print_rastercfg();
     if (ras_warn)
-        printf("# raster limit: 8 slots of %uus must fit the %luus sample interval -- lower rate or shrink timings\r\n",
-               (unsigned)md_slot_ticks * 100U, md_interval_ticks() * 100U);
+        printf("# raster limit: 8 slots of %luus need more than the %luus sample interval -- lower the rate, shrink timings, or speed up the pulse\r\n",
+               ras_warn_slot * 100U, ras_warn_ivl * 100U);
+    md_info_poll();     /* deferred 'I' reply, after this poll's key echoes */
 }
 
 /* Common one-pulse timebase setup: 170 MHz ticks, given end-of-timeline. */
@@ -1244,7 +1548,7 @@ void MD_Hardware_Init(void)
     /* ---------------- ADC5: 1 Hz status (PA8 / temp / VREFINT) -------- */
     md_status_init();
 
-    /* ---------------- TIM7: GPS-synchronised cycle pacing ------------- */
+    /* ---------------- TIM7: free-running cycle pacer ------------------- */
     md_pace_init();
 }
 
@@ -1371,33 +1675,48 @@ void md_tim8_uie_fired(void)
 
 /* ============================================================================
  * Cycle pacing (TIM7, basic timer, one-pulse @ 10 kHz timebase).
- * See metal_detector.h for the cadence contract. Both arm sites — the GPS
- * fix path (USART2 IRQ) and TIM7's own expiry — run at NVIC priority 6, so
- * they serialize and the state below needs no further locking. (The one
- * exception is md_pace_init's boot-time arm, task context: an early fix
- * can interleave, but every interleaving still leaves the timer armed —
- * worst case is one odd first interval, re-synced by the next fix.)
+ * See metal_detector.h for the cadence contract. The pacer FREE-RUNS: its
+ * own expiry ISR is the only place TIM7 is armed (plus md_pace_init's boot
+ * arm, before anything can pend), so nothing outside this ISR — not a GPS
+ * fix, not the NMEA parser, not the RTOS — can move a coil pulse.
+ *
+ * History (2026-09-20): until then every valid GGA re-armed TIM7 from the
+ * USART2 ISR so a frame completed 1 ms before each fix. That turned the
+ * GPS module's sentence-arrival jitter (and the once-per-second GSV block
+ * it used to emit) into pulse-interval jitter — post-fix interval anywhere
+ * in [I-1 ms, 2I-1 ms) — which the analog chain reads as common-mode
+ * noise on every channel (~2k counts per ms of interval change at 200 Hz,
+ * bench-measured). Noisy with a lock, quiet with the GPS UART unplugged.
+ * The host never needed the lead: it interpolates between anchor ticks,
+ * and an anchor's frame completes within one interval before its GGA at
+ * any phase. The fix path is now read-only (md_pace_note_fix).
+ *
+ * NVIC priority 4: above the USART2 GPS parser (6), the GPS DMA IRQ (5)
+ * and the FreeRTOS syscall ceiling (5), so none of them can delay an
+ * expiry — a delay would be baked into the interval, because the re-arm
+ * below resets the counter. Below the timeline ISRs (TIM1/TIM8 UIE at 2,
+ * ADC JEOS at 3), which are microseconds long. Consequence: this ISR and
+ * everything it calls must never use a FreeRTOS API.
  * ========================================================================== */
-/* An expiry that lands while the other arm site runs (equal priority, so
- * it can only pend, never preempt) is superseded by this re-arm: clearing
- * SR alone is not enough — the NVIC latches pending on the UIF edge and
- * only exception entry or an ICPR write releases it. The SR readback
- * orders the flag clear ahead of the pend clear so the still-asserted
- * line can't re-latch. */
 static void md_pace_arm_ticks(uint32_t ticks)
 {
     /* Floor 2, not 1: ARR gets ticks-1, and a basic timer's counter is
      * BLOCKED while ARR == 0 (RM0440) — a 1-tick arm would park TIM7 dead
-     * until the next GGA happens to re-arm it (forever on a GPS-less
-     * bench). No caller legitimately wants 1 tick: every path arms at
-     * least one slot period (>= 2 ticks) or >= 1 ms (10 ticks). */
+     * forever (nothing else ever re-arms it). No caller legitimately
+     * wants 1 tick: every path arms at least one slot period (>= 2). */
     if (ticks < 2U)
         ticks = 2U;
     TIM7->CR1 &= ~TIM_CR1_CEN;
     TIM7->ARR  = ticks - 1U;
     TIM7->EGR  = TIM_EGR_UG;   /* latch ARR, reset CNT (URS: no UIF)   */
-    TIM7->SR   = 0U;           /* drop a stale expiry UIF              */
-    (void)TIM7->SR;            /* drain the posted SR write            */
+    /* Belt and braces: OPM stopped the counter at the expiry we are
+     * servicing, so no fresh UIF can exist here; but a stale pend costs
+     * a doubled fire, so drop both flag and pend anyway. The SR readback
+     * orders the flag clear ahead of the pend clear so a still-asserted
+     * line can't re-latch (NVIC latches pending on the UIF edge; only
+     * exception entry or an ICPR write releases it). */
+    TIM7->SR   = 0U;
+    (void)TIM7->SR;
     HAL_NVIC_ClearPendingIRQ(TIM7_DAC_IRQn);
     TIM7->CR1 |= TIM_CR1_CEN;
 }
@@ -1409,6 +1728,10 @@ static void md_pace_arm(uint32_t ms)
 
 static void md_pace_init(void)
 {
+    (void)dwt_cyccnt();   /* start the cycle counter the diagnostics stamp */
+    md_pace_diag_reset(); /* boot-time GPS traffic (config acks, a saved
+                             20 Hz stream) has already stamped the fix
+                             side — the first 'P' window starts here */
     __HAL_RCC_TIM7_CLK_ENABLE();
     TIM7->PSC  = (170000U / MD_PACE_TICKS_PER_MS) - 1U;  /* 170 MHz -> 10 kHz */
     /* URS: md_pace_arm's UG reloads PSC/CNT without raising UIF — with
@@ -1416,31 +1739,87 @@ static void md_pace_init(void)
      * than the SR clear can catch it. Only a real expiry interrupts. */
     TIM7->CR1  = TIM_CR1_OPM | TIM_CR1_URS;
     TIM7->DIER = TIM_DIER_UIE;
-    HAL_NVIC_SetPriority(TIM7_DAC_IRQn, 6, 0);   /* == USART2 (GPS) priority */
+    /* 4: above USART2 (6), DMA1_Ch1 (5) and the RTOS ceiling (5); below
+     * TIM1/TIM8 UIE (2) and ADC (3). See the section comment. */
+    HAL_NVIC_SetPriority(TIM7_DAC_IRQn, 4, 0);
     HAL_NVIC_EnableIRQ(TIM7_DAC_IRQn);
-    md_pace_arm(1U);   /* first frame right away; idle cadence follows */
+    md_pace_arm(1U);   /* first frame right away; the fixed cadence follows */
 }
 
-void md_pace_on_fix(void)
+/* Pacer ISR: stamp a started cycle (all mode) or sweep (raster slot 0)
+ * and fold its interval into the 'P' statistics. `now` is md_ts_cen, the
+ * DWT count at the master timer's CEN write — the coil pulse itself. */
+static void md_pace_diag_fire(uint32_t now)
 {
-    uint32_t ticks = md_interval_ticks()
-                     - MD_SAMPLE_LEAD_MS * MD_PACE_TICKS_PER_MS;
-    if (md_raster && md_slot != 0U) {
-        /* Mid-sweep: re-arming now would cut the slot cadence (and the
-         * frame's promised skew). Defer to the sweep-boundary arm, which
-         * subtracts the slots that fired in between. */
-        md_fix_defer_slot  = md_slot;
-        md_fix_defer_ticks = ticks;
-        return;
+    uint32_t prev = md_pd_fire_cyc;
+    md_pd_fire_cyc = now;
+    md_pd_fires++;
+    if (prev == 0U)
+        return;                             /* window start: no interval */
+    uint32_t ivl = md_cyc_to_us(now - prev);
+    uint32_t nom = md_interval_ticks() * 100U;
+    uint32_t dev = (ivl > nom) ? ivl - nom : nom - ivl;
+    if (dev > md_pd_dev_max)
+        md_pd_dev_max = dev;
+    uint32_t pi = md_pd_prev_ivl;
+    if (pi != 0U) {
+        uint32_t jit = (ivl > pi) ? ivl - pi : pi - ivl;
+        if (jit > md_pd_jit_max)
+            md_pd_jit_max = jit;
     }
-    md_fix_defer_ticks = 0U;
-    md_pace_arm_ticks(ticks);
+    md_pd_prev_ivl = ivl;
+}
+
+/* USART2 IRQ context (priority 6). Diagnostics ONLY: reads the fire stamp,
+ * never touches TIM7 or any pacer state. A pacer fire preempting the two
+ * reads below can skew fix_ph_us for one sample — it steers nothing. */
+void md_pace_note_fix(void)
+{
+    uint32_t fire    = md_pd_fire_cyc;
+    uint32_t now     = dwt_cyccnt();
+    uint32_t now_ms  = HAL_GetTick();       /* plain volatile read, ISR-safe */
+    uint32_t last    = md_pd_fix_cyc;
+    uint32_t last_ms = md_pd_fix_ms;
+    md_pd_fix_cyc = now;
+    md_pd_fix_ms  = now_ms;
+    md_pd_fix_n++;
+    if (fire != 0U)
+        md_pd_fix_ph = md_cyc_to_us(now - fire);
+    if (last == 0U)
+        return;
+    /* > 1 s since the last valid GGA is a dropout, not arrival jitter.
+     * Judged on the ms tick, not the cycle count: CYCCNT wraps every
+     * 25.27 s, so a 25.5 s or 51 s outage would otherwise read as a
+     * sub-second span and pollute min/max. */
+    if (now_ms - last_ms > 1000U)
+        return;
+    uint32_t span = md_cyc_to_us(now - last);
+    if (span < md_pd_fix_span_min)
+        md_pd_fix_span_min = span;
+    if (span > md_pd_fix_span_max)
+        md_pd_fix_span_max = span;
+}
+
+/* USART2 IRQ context: NMEA parse duration since start_cyc (DWT). The
+ * _begin side goes through dwt_cyccnt() so the counter is switched on by
+ * the first sentence to arrive, even before md_pace_init — a raw
+ * DWT->CYCCNT read with TRCENA clear is architecturally undefined. */
+uint32_t md_pace_gps_isr_begin(void)
+{
+    return dwt_cyccnt();
+}
+
+void md_pace_note_gps_isr(uint32_t start_cyc)
+{
+    uint32_t us = md_cyc_to_us(dwt_cyccnt() - start_cyc);
+    if (us > md_pd_gps_isr_max)
+        md_pd_gps_isr_max = us;
 }
 
 void md_pace_fired(void)
 {
     if ((TIM7->SR & TIM_SR_UIF) == 0U)
-        return;                             /* superseded expiry (see arm) */
+        return;                     /* not ours (DAC shares the vector) */
     TIM7->SR = 0U;                          /* clear UIF */
 
     if (!md_raster) {
@@ -1452,14 +1831,17 @@ void md_pace_fired(void)
          * own tick. */
         uint32_t tick = md_sample_tick + 1U;
         md_sample_tick = tick;
-        if (md_start_cycle())
+        if (md_start_cycle()) {
             md_tick_inflight = tick;
-        /* Re-arm at the sample interval unconditionally. A valid fix
-         * re-syncs the phase (md_pace_on_fix, arming interval-minus-lead);
-         * without one the stream free-runs at the same interval — full
-         * rate for bench work with no GPS attached, and the front end
-         * keeps its field thermal duty cycle (see the cadence contract in
-         * metal_detector.h). */
+            md_pace_diag_fire(md_ts_cen);
+        } else {
+            md_pd_skips++;
+        }
+        /* Re-arm at the sample interval, unconditionally and from nowhere
+         * else: with or without a GPS fix the stream runs at the
+         * configured rate — full rate for bench work with no GPS attached,
+         * and the front end keeps its field thermal duty cycle (see the
+         * cadence contract in metal_detector.h). */
         md_pace_arm_ticks(md_interval_ticks());
         return;
     }
@@ -1475,15 +1857,21 @@ void md_pace_fired(void)
         uint32_t tick = md_sample_tick + 1U;
         md_sample_tick = tick;
         md_sweep_ok = md_start_slot(0U);
-        if (md_sweep_ok)
+        if (md_sweep_ok) {
             md_tick_inflight = tick;
+            md_pace_diag_fire(md_ts_cen);
+        } else {
+            md_pd_skips++;
+        }
         md_slot = 1U;
         md_pace_arm_ticks(md_slot_ticks);
         return;
     }
 
-    if (md_sweep_ok && !md_start_slot(md_slot))
+    if (md_sweep_ok && !md_start_slot(md_slot)) {
         md_sweep_ok = 0U;
+        md_pd_skips++;
+    }
     md_slot++;
     if (md_slot < 8U) {
         md_pace_arm_ticks(md_slot_ticks);
@@ -1492,30 +1880,10 @@ void md_pace_fired(void)
 
     /* Slot 7 just fired: arm the remainder of the sample interval (the
      * fit check guarantees interval >= 8 slots, so this never underflows
-     * below one slot), or apply a fix resync that landed mid-sweep. */
+     * below one slot). Sweep-to-sweep spacing is therefore exactly the
+     * sample interval, GPS or no GPS. */
     md_slot = 0U;
-    if (md_fix_defer_ticks != 0U) {
-        uint32_t elapsed = (8U - (uint32_t)md_fix_defer_slot)
-                           * (uint32_t)md_slot_ticks;
-        uint32_t arm = (md_fix_defer_ticks > elapsed)
-                       ? md_fix_defer_ticks - elapsed : 0U;
-        /* Floor at one slot period, not 1 tick. A fix that landed early in
-         * the sweep can leave elapsed >= the deferred delay (at 500 Hz the
-         * defer is 10 ticks and a fix in slots 1-3 gives elapsed >= 10) —
-         * and slot 7's cycle is still RUNNING for most of its slot, so an
-         * earlier arm would fire into md_start_slot's overlap guard, zero
-         * md_sweep_ok, and (the flag spanning the boundary) drop the sweep
-         * that just completed along with the new one. One slot period is
-         * exactly the spacing slot 7 needs; the residual phase error
-         * (< 1 slot) is healed by the next fix ~50 ms later. */
-        if (arm < (uint32_t)md_slot_ticks)
-            arm = (uint32_t)md_slot_ticks;
-        md_fix_defer_ticks = 0U;
-        md_pace_arm_ticks(arm);
-    } else {
-        md_pace_arm_ticks(md_interval_ticks()
-                          - 7U * (uint32_t)md_slot_ticks);
-    }
+    md_pace_arm_ticks(md_interval_ticks() - 7U * (uint32_t)md_slot_ticks);
 }
 
 /* ============================================================================

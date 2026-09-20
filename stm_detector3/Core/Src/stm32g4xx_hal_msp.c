@@ -744,10 +744,12 @@ void HAL_UART_MspInit(UART_HandleTypeDef* huart)
     HAL_NVIC_EnableIRQ(USART2_IRQn);
     /* USER CODE BEGIN USART2_MspInit 1 */
 
-    /* Override the generated priority above: USART2 must run at the TIM7
-     * pacer's priority so the two md_pace arm sites never nest (see
-     * metal_detector.c). MspInit re-runs on the GPS DMA-stuck recovery's
-     * DeInit/Init (gps.c), which would otherwise silently restore 5. */
+    /* Override the generated priority above: USART2 (GPS NMEA parsing)
+     * must stay BELOW the TIM7 pacer (priority 4, metal_detector.c) so a
+     * parse can never delay a coil pulse, and below the FreeRTOS syscall
+     * ceiling (5). MspInit re-runs on the GPS DMA-stuck recovery's
+     * DeInit/Init (gps.c), which would otherwise silently restore the
+     * generated value. Keep in step with MX_USART2_UART_Init (main.c). */
     HAL_NVIC_SetPriority(USART2_IRQn, 6, 0);
 
     /* USER CODE END USART2_MspInit 1 */

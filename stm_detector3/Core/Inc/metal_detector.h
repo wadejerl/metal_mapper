@@ -62,28 +62,36 @@ extern volatile uint32_t md_cycle_count;
 #define MD_ADC_COUNT 8U
 extern volatile uint16_t md_adc[MD_ADC_COUNT];
 
-/* GPS-synchronised cycle pacing (TIM7 one-shot, 0.1 ms ticks).
+/* Cycle pacing (TIM7 one-shot, 0.1 ms ticks) — FREE-RUNNING.
  *
- * The GPS fix interval is the master cadence: every valid GGA re-arms TIM7
- * so md_samples_per_period cycles spread evenly across the fix interval,
- * the first firing MD_SAMPLE_LEAD_MS before the interval's even grid —
- * the last frame of each interval then completes just before the next fix
- * arrives. Without a valid fix the timer re-arms itself at the same
- * sample interval, so the stream free-runs at the full configured rate:
- * bench tools see all 8 channels at rate with no GPS attached, and the
- * analog front end holds the same thermal duty cycle on the bench as in
- * the field (it runs warm — that IS the surveying operating point; an
- * idle rest would make bench baselines lie about field baselines).
+ * The pacer fires every sample interval (MD_GPS_PERIOD_MS divided by
+ * md_samples_per_period) and re-arms itself from its own ISR. Nothing
+ * else — no GPS fix, no NMEA parse, no RTOS activity — ever touches it,
+ * so a coil pulse can move only by the pacer ISR's own entry latency
+ * (microseconds; it runs above every non-timeline interrupt). The stream
+ * runs at the full configured rate with or without a fix: bench tools see
+ * all 8 channels at rate with no GPS attached, and the analog front end
+ * holds the same thermal duty cycle on the bench as in the field (it runs
+ * warm — that IS the surveying operating point; an idle rest would make
+ * bench baselines lie about field baselines).
+ *
+ * Until 2026-09-20 every valid GGA re-armed TIM7 so a frame completed
+ * 1 ms before each fix. That coupled the GPS module's sentence-arrival
+ * jitter into the pulse interval (post-fix interval anywhere in
+ * [I-1 ms, 2I-1 ms)) and showed up as common-mode noise on all channels
+ * whenever the unit had a lock — see the pacing section in
+ * metal_detector.c. The host never needed the lead.
  *
  * Every completed frame is queued (see md_frame_pop) and reported as its
  * own CSV sample line carrying a sample tick; GPS fixes are reported as
- * separate anchor lines carrying the tick of the last completed frame.
- * The host interpolates sample positions between anchor ticks, so the
- * rate is fixed per study — never speed-adaptive, which would turn speed
- * changes into coil duty-cycle (thermal, baseline) changes. */
+ * separate anchor lines carrying the tick of the last completed frame,
+ * which landed within one sample interval before the fix parsed (the
+ * anchor line always follows its sample line on the wire). The host
+ * interpolates sample positions between anchor ticks, so the rate is
+ * fixed per study — never speed-adaptive, which would turn speed changes
+ * into coil duty-cycle (thermal, baseline) changes. */
 #define MD_GPS_PERIOD_MS          50U   /* Quectel fix interval (20 Hz)    */
 #define MD_SAMPLES_PER_GPS_PERIOD 25U   /* default cycles per fix (500 Hz) */
-#define MD_SAMPLE_LEAD_MS         1U    /* cycle-to-fix lead time          */
 
 #if MD_SAMPLES_PER_GPS_PERIOD < 1U
 # error "MD_SAMPLES_PER_GPS_PERIOD must be >= 1"
@@ -91,22 +99,19 @@ extern volatile uint16_t md_adc[MD_ADC_COUNT];
 #if (MD_GPS_PERIOD_MS % MD_SAMPLES_PER_GPS_PERIOD) != 0U
 # error "MD_SAMPLES_PER_GPS_PERIOD must divide MD_GPS_PERIOD_MS (1, 2, 5, 10, 25)"
 #endif
-#if (MD_GPS_PERIOD_MS / MD_SAMPLES_PER_GPS_PERIOD) <= MD_SAMPLE_LEAD_MS
-# error "MD_SAMPLES_PER_GPS_PERIOD too high: first fire delay would be <= 0"
-#endif
 
 /* Runtime sample rate: cycles per GPS period, g/b console keys stepping
  * through {1, 2, 5, 10, 25} (20..500 Hz), persisted with the settings.
  * 50 (1000 Hz) is deliberately absent: sample lines would exceed the
- * 460800-baud console link (~46 kB/s), and the interval would equal
- * MD_SAMPLE_LEAD_MS, making the post-fix arm delay zero. */
+ * 460800-baud console link (~46 kB/s). */
 extern volatile uint8_t md_samples_per_period;
 
 /* Sample ticks: the pacer numbers every fire (skipped slots burn their
  * tick, so a gap in reported ticks is a real gap in time), and each
  * completed frame carries its fire's tick. Ticks are the protocol's only
- * time axis — frames are evenly spaced within a fix interval, so the
- * host interpolates positions linearly in tick space between anchors.
+ * time axis — frames are evenly spaced (the pacer free-runs), so the host
+ * interpolates positions linearly in tick space between anchors; an
+ * anchor's true instant is within one interval after its tick's frame.
  * md_tick_completed is the tick of the newest completed frame; the GGA
  * path stamps it into the fix anchor (one atomic uint32 read). */
 extern volatile uint32_t md_tick_completed;
@@ -125,12 +130,23 @@ typedef struct {
  * Task context only. */
 uint8_t md_frame_pop(md_frame_t *out);
 
-/* Re-sync the pacer to a just-received valid GGA fix. USART2 IRQ context;
- * TIM7 runs at the same NVIC priority so the two arm sites never nest. */
-void md_pace_on_fix(void);
+/* A valid GGA just parsed. USART2 IRQ context (priority 6). READ-ONLY with
+ * respect to the pacer: records where the fix fell on the sample timeline
+ * and the GGA-to-GGA spacing for the 'P' diagnostics line. Never arms
+ * TIM7 — the GPS must not be able to move a coil pulse. */
+void md_pace_note_fix(void);
+
+/* USART2 IRQ context: bracket an NMEA parse for the 'P' line's
+ * gps_isr_max_us. _begin returns a DWT stamp (and enables the counter if
+ * boot traffic gets here before md_pace_init — a raw DWT->CYCCNT read
+ * with the unit still off is architecturally undefined); _end records
+ * the duration since that stamp. */
+uint32_t md_pace_gps_isr_begin(void);
+void md_pace_note_gps_isr(uint32_t start_cyc);
 
 /* TIM7 expiry hook — called from TIM7_DAC_IRQHandler in stm32g4xx_it.c.
- * Starts the cycle and re-arms (fix-interval subdivision or idle rate). */
+ * Starts the cycle (or raster slot) and re-arms at the fixed cadence.
+ * NVIC priority 4, above the FreeRTOS syscall ceiling: no RTOS calls. */
 void md_pace_fired(void);
 
 /* One-time hardware setup; call after MX_ inits, before md_start_cycle.
@@ -158,10 +174,14 @@ uint32_t MD_Settings_ECC_NMI(void);
  *   a/z blanking +-1us (0..200)      s/x rx window +-1us (1..50)
  *   d/c coil spacing +-10mm (50..5000)  f/v tx pulse +-1us (10..120)
  *   g/b sample rate up/down (20/40/100/200/500 Hz)
+ *   h/n raster pulse spacing faster/slower (200us..25ms step list; the
+ *       slot period floor — sensitivity wants ~160/240 Hz in the field)
  *   0-7 select channel for raster tuning   8 select all channels
  *   r   toggle raster mode (per-channel slots) vs all-at-once
  *   SAVE+Enter save   CLEAR+Enter restore+save defaults   I info line
  *   G toggle GPS passthrough (# PQTMTXT/PQTMTAR/THS lines, default off)
+ *   P pacer diagnostics ('# pace ...' line: measured interval deviation,
+ *       GGA arrival jitter, NMEA parse time; resets the window)
  * In raster mode a/z, s/x, f/v edit the SELECTED channel's table entry
  * (or all 8 in lockstep when 'all' is selected); in all-at-once mode they
  * edit the shared globals exactly as before. */
@@ -170,7 +190,9 @@ void md_console_poll(void);
 /* Print the '# info ...' identity line (fw hash, GPS module version/ID,
  * timing, coil geometry, adc order, raster mode + per-channel table). The
  * daemon requests it with the 'I' key when it connects and stamps the
- * values into the study header. */
+ * values into the study header. Prints immediately; the 'I' key handler
+ * first re-queries the GPS when its identity is still unknown and defers
+ * this call until the replies land (see md_info_request in the .c). */
 void md_print_info(void);
 
 /* Print the console key map ('# keys:' lines) — boot reminder so a console

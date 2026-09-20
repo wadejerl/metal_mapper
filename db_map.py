@@ -646,7 +646,8 @@ TIMING_KEYS = ('blanking_us', 'rx_window_us', 'tx_pulse_us', 'sample_rate_hz',
                # come from the info line (stamped) or rastercfg echoes
                # (<key>_current); raster_sel is echo-only live UI state, so the
                # meta.get(k) fallback below just returns None until one arrives.
-               'detector_mode', 'slot_us', 'bl8', 'rx8', 'tx8', 'raster_sel')
+               'detector_mode', 'slot_us', 'pulse_us', 'bl8', 'rx8', 'tx8',
+               'raster_sel')
 
 
 def derive_status(db_path, meta=None):
@@ -675,9 +676,60 @@ def derive_status(db_path, meta=None):
 
     warnings = []
     if meta:
-        if meta.get('gps_id') == '?' or meta.get('info_ok') == '0':
-            warnings.append('GPS / unit-identity failure — info line incomplete '
-                            'or GPS module not answering')
+        # Header trouble comes in three flavours that used to share one
+        # "GPS / unit-identity failure" line. A LIVE daemon re-sends 'I'
+        # while info_ok is '0' (--info-retry-s), so only then can we
+        # promise it keeps asking; a saved study just is what it is.
+        info_ok = meta.get('info_ok')
+        again = ' The daemon keeps re-asking.' if (mine and info_ok == '0') else ''
+        gps_id, gps_ver = meta.get('gps_id'), meta.get('gps_ver')
+        ident_missing = gps_id in (None, '?') or gps_ver in (None, '?')
+        if (info_ok == '0' and meta.get('fw_git_hash') is None
+                and gps_id is None and gps_ver is None):
+            # Nothing at all came back to the connect-time 'I' (the daemon
+            # stamps fw from the very first reply; a '?' means one arrived).
+            warnings.append('Detector never answered the info request — port '
+                            'open but no detector3 firmware talking?' + again)
+        else:
+            if ident_missing and (info_ok == '0' or gps_id == '?' or gps_ver == '?'):
+                # The common, benign one: the GPS module powers up after the
+                # MCU and can miss the boot-time version/ID query while GGA
+                # flows fine. Worded as a state, not a verdict — it is also
+                # what an unplugged module looks like. ('?' stamped verbatim
+                # = pre-2026-09-20 daemon.)
+                warnings.append('GPS identity not reported — the module had '
+                                'not answered when asked (it powers up after '
+                                'the MCU, or is off); position data is '
+                                'unaffected.' + again)
+            if info_ok == '0':
+                # Anything ELSE missing = truncated info line or firmware
+                # older than this host. info_missing (daemon >= 2026-09-20)
+                # says which keys; without it, identity missing is assumed
+                # to be the whole story.
+                miss = meta.get('info_missing')
+                if miss is None:
+                    other = [] if ident_missing else ['?']
+                else:
+                    other = [k for k in miss.split(',')
+                             if k and k not in ('gps_id', 'gps_ver')]
+                if other:
+                    detail = '' if other == ['?'] else f' (missing {", ".join(other)})'
+                    warnings.append(f'Study header incomplete{detail} — info '
+                                    'line truncated or firmware older than '
+                                    'this host')
+        if meta.get('gps_cfg') == 'noreply':
+            # Firmware >= 2026-09-20 reports whether the GPS module answered
+            # its config burst (boot / resent / pending / noreply / silent).
+            # Only noreply is trouble: the module talks but answered neither
+            # the boot burst nor the re-sends in full, so it may be running
+            # whatever it saved on an earlier boot (GSV still on, another
+            # rate...). 'silent' is just the GPS off — already visible as no
+            # fix. No 'keeps re-asking' suffix: the firmware's re-sends are
+            # spent; the remedy is a reset with the module already powered.
+            warnings.append('GPS module did not acknowledge its configuration '
+                            '— it may be running stale settings (boot burst '
+                            'and re-sends unanswered; reset the MCU with the '
+                            'GPS already powered)')
         for kind in ('timing', 'geometry', 'fire'):
             v = meta.get(kind + '_changed')
             if v:
@@ -686,6 +738,30 @@ def derive_status(db_path, meta=None):
                                 f'data before/after does not line up')
 
     timing = {k: meta.get(k + '_current') or meta.get(k) for k in TIMING_KEYS}
+
+    # Link health (daemon's LinkStats, JSON) and the last '# pace' report —
+    # raw-view telemetry. Absent on pre-2026-09 daemons / saved studies;
+    # a torn or hand-edited value degrades to None, never a 500.
+    link = None
+    if meta.get('link'):
+        try:
+            link = json.loads(meta['link'])
+        except (TypeError, ValueError):
+            link = None
+        if not isinstance(link, dict):
+            link = None
+    pace = None
+    if meta.get('pace_last'):
+        try:
+            pace_at = float(meta.get('pace_at'))
+            if not math.isfinite(pace_at):
+                pace_at = None      # NaN/inf would leave the SSE JSON unparsable
+        except (TypeError, ValueError):
+            pace_at = None
+        # age from the server clock: daemon and Flask share the Pi's clock,
+        # the browser's may not agree with it
+        pace = {'text':  meta['pace_last'], 'at': pace_at,
+                'age_s': round(now - pace_at, 1) if pace_at is not None else None}
 
     return {
         'state':         state,
@@ -696,6 +772,8 @@ def derive_status(db_path, meta=None):
         'timing':        timing,
         'motion_mm':     meta.get('motion_mm'),
         'motion_paused': meta.get('motion_paused'),
+        'link':          link,
+        'pace':          pace,
     }
 
 

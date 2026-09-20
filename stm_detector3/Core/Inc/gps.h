@@ -39,7 +39,8 @@ typedef struct {
   uint8_t valid;
   float timestamp;
   uint32_t tick;     // md_tick_completed at GGA parse: the sample tick this
-                     // fix anchors (the frame paced to land just before it)
+                     // fix anchors (the newest completed frame at parse
+                     // time — within one sample interval before the fix)
 } gps_position_t;
 
 extern volatile gps_position_t latest_gps_position;
@@ -63,9 +64,11 @@ extern volatile uint8_t gps_echo_enabled;
 // Does not affect THS heading parsing, which always runs.
 extern volatile uint8_t gps_passthrough_enabled;
 
-// Module identity from the $PQTMVERNO / $PQTMUNIQID replies during boot
-// config (raw payload, checksum stripped; "" until answered). Reported
-// by the 'I' info line so the daemon can stamp studies with them.
+// Module identity from the $PQTMVERNO / $PQTMUNIQID replies (raw payload,
+// checksum stripped; "" until answered). Queried at boot config and again
+// by gps_query_identity when the 'I' key finds them empty — the module
+// powers up after the MCU and can miss the boot query. Reported by the
+// 'I' info line so the daemon can stamp studies with them.
 extern char gps_version_str[64];
 extern char gps_uniqid_str[64];
 
@@ -77,12 +80,49 @@ extern volatile uint32_t last_gga_timestamp;
 // ============================================================================
 
 /**
- * @brief Send the module configuration commands on USART2
- * Enables GGA/GSV output and disables GSA/VTG/GLL/RMC (Quectel
- * $PQTMCFGMSGRATE). Call once at startup, after the GPS has had
- * time to boot. Blocking transmit.
+ * @brief Send the module configuration burst on USART2 (boot; blocking)
+ * Enables GGA output and disables GSV/GSA/VTG/GLL/RMC (Quectel
+ * $PQTMCFGMSGRATE; GSV off since 2026-09-20 — see gps.c), saves and
+ * restarts the module. ~130 ms of HAL_Delay plus up to 200 ms waiting for
+ * the PQTMSAVEPAR ack before the restart (the full 200 ms when the GPS is
+ * off): before MD_Hardware_Init only.
  */
 void gps_send_config(void);
+
+/**
+ * @brief Re-send the configuration burst if the module missed it
+ * Task loop, once per iteration. The module powers up after the MCU and
+ * can miss the boot burst, or catch only its tail; a burst counts as
+ * delivered only when every PQTMCFG command in it was answered. Once the
+ * module has been heard, an undelivered burst goes out again — up to three
+ * attempts, ~0.5 s after first heard and then after growing gaps — at most
+ * one command per call, 10 ms apart, so nothing blocks beyond ~0.7 ms of
+ * TX. Never waits for a module that says nothing.
+ */
+void gps_config_poll(void);
+
+/**
+ * @brief Delivery state of the config burst, for the 'I' info line
+ * "boot" — every config command answered from the boot burst; "resent" —
+ * answered in full after a re-send (it came up late); "pending" — heard,
+ * re-sends under way (settles within ~10 s); "noreply" — heard, re-sends
+ * spent, still not fully answered (may run stale settings); "silent" —
+ * never heard (off, unplugged, or not emitting NMEA).
+ */
+const char *gps_config_state(void);
+
+/**
+ * @brief Re-send the $PQTMVERNO / $PQTMUNIQID identity queries
+ * For the 'I' key when the boot-time query went unanswered (module not yet
+ * up). Blocking transmit of two short sentences; replies are captured in
+ * the USART2 ISR, so the caller polls gps_identity_known() afterwards.
+ */
+void gps_query_identity(void);
+
+/**
+ * @brief 1 once both gps_version_str and gps_uniqid_str are filled
+ */
+int gps_identity_known(void);
 
 /**
  * @brief Process GPS data from DMA circular buffer (non-blocking)

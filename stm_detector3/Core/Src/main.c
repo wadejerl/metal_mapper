@@ -104,16 +104,20 @@ int _write(int file, char *ptr, int len)
 
 /* Heading CSV field: value only while the dual-antenna solution is good
  * (THS status 'A') and fresh (<1 s); otherwise the field is left empty.
- * The USART2 IRQ owns the three globals, so snapshot them with IRQs
- * briefly off; a stale latch is then cleared so a frozen timestamp can't
- * resurrect a weeks-old heading when the 32-bit tick wraps (~49.7 days). */
+ * The USART2 IRQ is the only writer of the three globals, so snapshot
+ * them with just THAT interrupt masked — not PRIMASK: a global mask would
+ * also hold off the TIM7 pacer (4), TIM1/TIM8 update (2) and ADC (3), the
+ * timeline this firmware promises no GPS-side activity can touch, once
+ * per fix while locked. Sub-µs either way; the CM flag simply pends. A
+ * stale latch is then cleared so a frozen timestamp can't resurrect a
+ * weeks-old heading when the 32-bit tick wraps (~49.7 days). */
 static void print_heading_field(void)
 {
-  __disable_irq();
+  HAL_NVIC_DisableIRQ(USART2_IRQn);
   uint8_t  valid = gps_heading_valid;
   float    deg   = gps_heading_deg;
   uint32_t ts    = last_ths_timestamp;
-  __enable_irq();
+  HAL_NVIC_EnableIRQ(USART2_IRQn);
 
   if (valid && HAL_GetTick() - ts < 1000U)
   {
@@ -1011,11 +1015,13 @@ static void MX_USART2_UART_Init(void)
   huart2.Instance->CR3 |= USART_CR3_DDRE;   // DMA disable on RX error
   huart2.Instance->CR1 |= USART_CR1_UE;     // Re-enable UART
 
-  // Set priorities and enable NVIC (same relationship as detector2:
-  // GPS char-match above the detector timer ISRs at priority 5)
-  /* Below the detector timer ISRs (prio 2): NMEA parsing in this ISR must
-   * never delay detector bookkeeping. All detector *edges* are hardware-
-   * timed and immune regardless. */
+  /* NVIC 6: below the TIM7 cycle pacer (4) and the detector timeline ISRs
+   * (TIM1/TIM8 UIE 2, ADC 3). NMEA parsing in this ISR must never delay a
+   * coil pulse or detector bookkeeping; the fix path is read-only with
+   * respect to the pacer (md_pace_note_fix). Also below the FreeRTOS
+   * syscall ceiling (5), so RTOS critical sections mask this ISR — never
+   * the pacer. All detector *edges* are hardware-timed and immune
+   * regardless. (stm32g4xx_hal_msp.c re-applies this after a re-init.) */
   HAL_NVIC_SetPriority(USART2_IRQn, 6, 0);
   HAL_NVIC_EnableIRQ(USART2_IRQn);
 
@@ -1086,7 +1092,11 @@ void StartDefaultTask(void *argument)
   // Let the GPS module boot (shared supply with the MCU), then enable
   // its NMEA output — it is silent on this UART by default. Everything
   // the GPS sends is echoed #-prefixed while gps_echo_enabled is set,
-  // so the config OK acks are visible on the console.
+  // so the config OK acks are visible on the console. The module comes
+  // up slightly AFTER the MCU and can miss this burst (or catch only its
+  // tail); nothing here waits for it — gps_config_poll (main loop) re-sends
+  // the burst, up to three attempts, once the module is heard, if it did
+  // not answer every config command.
   osDelay(3000);
   gps_send_config();
   printf("# GPS config sent, echoing GPS output for 1s...\r\n");
@@ -1102,12 +1112,11 @@ void StartDefaultTask(void *argument)
   last_gga_timestamp = HAL_GetTick();
   printf("# GPS synchronized at DMA position %lu\r\n", gps_buffer_read_pos);
 
-  // Metal detector: shared hardware timeline, cycles paced by TIM7 in
-  // sync with the GPS (md_samples_per_period frames spread evenly across
-  // each 20 Hz fix interval — 500 Hz default; without a fix the pacer
-  // free-runs at the same rate so bench work sees the full stream and
-  // the field thermal duty cycle; see md_pace_* in metal_detector.c).
-  // Defaults: TX 120us, blanking 16us,
+  // Metal detector: shared hardware timeline, cycles paced by a
+  // FREE-RUNNING TIM7 at MD_GPS_PERIOD_MS / md_samples_per_period (500 Hz
+  // default). The GPS never touches the pacer — fix or no fix, bench or
+  // field, the cadence is the same; see the Pacer section in
+  // metal_detector.c. Defaults: TX 120us, blanking 16us,
   // rx 3us — all runtime-tunable (saved settings applied in
   // MD_Hardware_Init). Both coil sets fire every cycle; all 8 ADC inputs
   // are converted every cycle.
@@ -1119,7 +1128,10 @@ void StartDefaultTask(void *argument)
   printf("# csv sample lines (%u/fix): adc+tick, gps fields empty; anchor lines (20 Hz): gps+heading+tick, adc empty\r\n",
          md_samples_per_period);
   printf("# no fix: sample lines continue at full rate, no anchor lines\r\n");
-  md_print_info();   /* also available on demand via the 'I' key */
+  md_print_info();   /* boot banner: gps_ver/gps_id read "?" when the module
+                        came up after the config burst — the 'I' key re-asks
+                        it, and the daemon's connect-time 'I' is what the
+                        study header is built from, not this line */
   md_print_keys();   /* key map reminder for console users */
 
   md_frame_t frame;
@@ -1136,13 +1148,18 @@ void StartDefaultTask(void *argument)
     // printed here so they land between CSV lines, never inside one.
     gps_echo_drain();
 
+    // Config-burst re-send for a module that came up after the boot burst
+    // (one command per call; its # lines land between CSV lines too).
+    gps_config_poll();
+
     // Cycles start in the TIM7 pacer IRQ (md_pace_fired), not here; every
     // completed frame lands in the frame ring with its sample tick.
     //
     // Sample lines — one per frame, oldest first. The GPS fields are
     // empty on purpose: position is the daemon's job, interpolated
-    // between anchors in tick space (frames are evenly spaced within a
-    // fix interval). Drained BEFORE the anchor check so an anchor always
+    // between anchors in tick space (the pacer runs at a fixed interval,
+    // so ticks are evenly spaced in time). Drained BEFORE the anchor
+    // check so an anchor always
     // follows the sample line its tick refers to — the anchored frame
     // completed (and was queued) before the fix's GGA finished parsing.
     while (md_frame_pop(&frame))
@@ -1157,8 +1174,9 @@ void StartDefaultTask(void *argument)
 
     // Anchor lines — one per valid GGA fix (~20 Hz), pure position: the
     // ADC fields are empty and the tick names the frame this fix belongs
-    // with (paced to complete just before it). heading is empty unless
-    // the dual-antenna THS solution is good.
+    // with (the newest frame completed when the GGA parsed — within one
+    // sample interval before it). heading is empty unless the
+    // dual-antenna THS solution is good.
     if (new_gga_available && latest_gps_position.valid)
     {
       printf("%.9f,%.9f,%d,,,,,,,,,%.6f",

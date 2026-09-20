@@ -8,6 +8,7 @@ Run before deploying:  python3 test_serial_daemon.py
 NOTE: uses the real /tmp/metal_detector_daemon.pid and command FIFO — do
 not run while a real study is being recorded (it aborts if one is live).
 """
+import json
 import math
 import os
 import sqlite3
@@ -152,28 +153,35 @@ check('no bare-number match', sd.RE_RATE.search('# sample_rate=500') is None)
 
 # ── raster config echo regex ──────────────────────────────────────────────────
 print('RE_RASTER:')
-RC = ('# rastercfg detector_mode=raster slot_us=200 ch=3 '
+RC = ('# rastercfg detector_mode=raster slot_us=200 pulse_us=4200 ch=3 '
       'bl8=16,16,16,16,20,16,16,16 rx8=3,3,3,3,3,3,3,3 '
       'tx8=120,120,120,120,120,120,120,120')
 m = sd.RE_RASTER.search(RC)
 check('rastercfg echo', m is not None and m.group(1) == 'raster'
-      and m.group(2) == '200' and m.group(3) == '3'
-      and m.group(4) == '16,16,16,16,20,16,16,16'
-      and m.group(5) == '3,3,3,3,3,3,3,3'
-      and m.group(6) == '120,120,120,120,120,120,120,120')
+      and m.group(2) == '200' and m.group(3) == '4200' and m.group(4) == '3'
+      and m.group(5) == '16,16,16,16,20,16,16,16'
+      and m.group(6) == '3,3,3,3,3,3,3,3'
+      and m.group(7) == '120,120,120,120,120,120,120,120')
+# Pre-pulse-control firmware omits pulse_us entirely — group None, the rest
+# unshifted (the daemon fills pulse_us into the drift dict only when present)
+m = sd.RE_RASTER.search(RC.replace('pulse_us=4200 ', ''))
+check('no-pulse form matches, pulse group None',
+      m is not None and m.group(3) is None and m.group(4) == '3'
+      and m.group(5) == '16,16,16,16,20,16,16,16')
 m = sd.RE_RASTER.search(RC.replace('ch=3', 'ch=all'))
-check('ch=all echo', m is not None and m.group(3) == 'all')
-m = sd.RE_RASTER.search('# rastercfg detector_mode=all slot_us=200 ch=all '
+check('ch=all echo', m is not None and m.group(4) == 'all')
+m = sd.RE_RASTER.search('# rastercfg detector_mode=all slot_us=200 '
+                        'pulse_us=200 ch=all '
                         'bl8=16,16,16,16,16,16,16,16 rx8=3,3,3,3,3,3,3,3 '
                         'tx8=120,120,120,120,120,120,120,120')
 check('mode=all echo', m is not None and m.group(1) == 'all')
 # The info-line tail carries the same keys with no ch= — the regex must not
 # require it (dispatch consumes info lines first, but keep the grammar honest)
-m = sd.RE_RASTER.search('detector_mode=raster slot_us=300 '
+m = sd.RE_RASTER.search('detector_mode=raster slot_us=300 pulse_us=6200 '
                         'bl8=1,1,1,1,1,1,1,1 rx8=2,2,2,2,2,2,2,2 '
                         'tx8=99,99,99,99,99,99,99,99')
-check('no-ch form matches, ch group None', m is not None and m.group(3) is None
-      and m.group(2) == '300')
+check('no-ch form matches, ch group None', m is not None and m.group(4) is None
+      and m.group(2) == '300' and m.group(3) == '6200')
 # Token isolation both ways: bl8=/rx8=/tx8= were chosen so a per-channel edit
 # echo can never fake a global blanking=/rx_window=/tx_pulse= drift — and the
 # legacy echoes must not half-match the raster grammar either.
@@ -182,9 +190,118 @@ check('rastercfg trips no legacy tx', sd.RE_TXPULSE.search(RC) is None)
 check('legacy echo no raster match',
       sd.RE_RASTER.search('# blanking=16us  rx_window=3us') is None)
 check('raster warn line no match',
-      sd.RE_RASTER.search('# raster limit: 8 slots of 200us must fit the '
-                          '2000us sample interval -- lower rate or shrink '
-                          'timings') is None)
+      sd.RE_RASTER.search('# raster limit: 8 slots of 500us need more than '
+                          'the 2000us sample interval -- lower the rate, '
+                          'shrink timings, or speed up the pulse') is None)
+# The firmware's 'P' pacer-diagnostics line (free-running pacer, 2026-09):
+# pure console telemetry, must fall through every echo/info pattern so it
+# can never stamp drift or header meta.
+PACE = ('# pace det=all ivl_us=5000 fires=1000 skips=0 dev_max_us=3 '
+        'jit_max_us=3 fix_n=100 fix_span_us=49870/50130 fix_ph_us=2310 '
+        'gps_isr_max_us=180')
+check('pace line is not an info line', sd.parse_info_line(PACE) is None)
+check('pace line trips no timing echo', sd.RE_TIMING.search(PACE) is None)
+check('pace line trips no tx echo', sd.RE_TXPULSE.search(PACE) is None)
+check('pace line trips no coil echo', sd.RE_COIL.search(PACE) is None)
+check('pace line trips no rate echo', sd.RE_RATE.search(PACE) is None)
+check('pace line trips no raster echo', sd.RE_RASTER.search(PACE) is None)
+check('pace line is not data', sd.parse_data_line(PACE) is None)
+# ...but it IS captured verbatim (payload after "# pace ") for the raw view.
+_m = sd.RE_PACE.match(PACE)
+check('RE_PACE captures the payload', _m is not None
+      and _m.group(1) == PACE.split(None, 2)[2], repr(_m and _m.group(1)))
+check('RE_PACE tolerates "#pace"', sd.RE_PACE.match('#pace det=raster ivl_us=50000') is not None)
+check('RE_PACE needs the det= payload', sd.RE_PACE.match('# pace') is None
+      and sd.RE_PACE.match('# pace ') is None
+      and sd.RE_PACE.match('# pace skips=0') is None)
+check('RE_PACE ignores a mention mid-line',
+      sd.RE_PACE.match('# raster: pace det=all ivl_us=1') is None)
+check('RE_PACE ignores data lines', sd.RE_PACE.match(',,,1,2,3,4,5,6,7,8,,,9') is None)
+
+# ── LinkStats ─────────────────────────────────────────────────────────────────
+# Stream health from tick arithmetic: gaps (frames lost), regressions
+# (reboots), frames per fix, equal-tick fixes, windowed rates.
+print('LinkStats:')
+lk = sd.LinkStats()
+for t in range(1, 5):
+    lk.on_sample(t)
+lk.on_anchor(4)
+for t in range(5, 15):
+    lk.on_sample(t)
+lk.on_anchor(14)
+check('clean stream: no faults', lk.tick_gaps == 0 and lk.frames_lost == 0
+      and lk.reboots == 0 and lk.eq_ticks == 0)
+check('frames per fix recorded', list(lk._spa) == [10], repr(list(lk._spa)))
+lk.on_sample(20)                       # 15..19 never arrived
+check('tick gap counted once, 5 frames lost',
+      lk.tick_gaps == 1 and lk.frames_lost == 5, (lk.tick_gaps, lk.frames_lost))
+lk.on_anchor(20)
+lk.on_anchor(20)                       # 20 Hz: same completed frame twice
+check('equal-tick fix counted, not a fault', lk.eq_ticks == 1 and lk.reboots == 0
+      and lk.tick_gaps == 1)
+snap = lk.snapshot(100.0)
+check('spread spans 0..10', snap['spa_min'] == 0 and snap['spa_max'] == 10, repr(snap))
+check('first snapshot has no rates', snap['samples_s'] is None and snap['anchors_s'] is None)
+check('snapshot totals', snap['samples'] == 15 and snap['anchors'] == 4
+      and snap['frames_lost'] == 5 and snap['eq_ticks'] == 1, repr(snap))
+for t in range(21, 25):
+    lk.on_sample(t)
+snap = lk.snapshot(102.0)
+check('rates over the window', snap['samples_s'] == 2.0 and snap['anchors_s'] == 0.0, repr(snap))
+snap = lk.snapshot(200.0)              # long silence: nothing recent to rate against
+check('rate window is time-bounded, stale history dropped',
+      snap['samples_s'] is None and snap['anchors_s'] is None, repr(snap))
+snap = lk.snapshot(200.5)
+check('rates resume over the fresh half second', snap['samples_s'] == 0.0
+      and snap['anchors_s'] == 0.0, repr(snap))
+lk.on_sample(3)                        # ticks restart: MCU reboot...
+check('regression is held until the next sample rules', lk.reboots == 0
+      and lk.bad_ticks == 0 and lk.tick_gaps == 1, (lk.reboots, lk.bad_ticks, lk.tick_gaps))
+lk.on_anchor(3)                        # ...the new epoch's anchor: no spacing across
+check('spread cleared by the anchor regression', len(lk._spa) == 0, repr(list(lk._spa)))
+lk.on_sample(4)                        # continues from 3: reboot confirmed
+check('regression + continuation = reboot, not a gap', lk.reboots == 1
+      and lk.tick_gaps == 1 and lk.frames_lost == 5 and lk.bad_ticks == 0,
+      (lk.reboots, lk.tick_gaps, lk.frames_lost, lk.bad_ticks))
+lk.on_anchor(4)
+check('spread resumes from the new epoch', list(lk._spa) == [1], repr(list(lk._spa)))
+# A lone line whose tick was mangled in flight is NOT a reboot: nothing
+# continues from it — the true successor of the tick before it is >= 3
+# above anything that reads lower, so the +2 continuation window separates
+# the cases. The mangled frame itself shows up as the one-frame gap it left.
+lk.on_sample(5)
+lk.on_sample(2)                        # "6" arriving as "2"
+lk.on_sample(7)
+check('mangled tick: no reboot, one bad tick, one-frame gap', lk.reboots == 1
+      and lk.bad_ticks == 1 and lk.tick_gaps == 2 and lk.frames_lost == 6,
+      (lk.reboots, lk.bad_ticks, lk.tick_gaps, lk.frames_lost))
+lk.on_sample(8)
+lk.on_sample(1)                        # reboot, with the 2nd post-boot line lost
+lk.on_sample(3)
+check('reboot still seen with one line lost right after it', lk.reboots == 2
+      and lk.bad_ticks == 1 and lk.tick_gaps == 3 and lk.frames_lost == 7,
+      (lk.reboots, lk.bad_ticks, lk.tick_gaps, lk.frames_lost))
+lk2 = sd.LinkStats()
+lk2.on_anchor(30)
+lk2.on_anchor(50)                      # spread [20]...
+lk2.on_anchor(40)                      # ...anchor sees the reboot before a sample does
+check('anchor-side regression: spread reset, no negative entry, no double count',
+      list(lk2._spa) == [] and lk2.reboots == 0 and lk2.eq_ticks == 0, repr(list(lk2._spa)))
+lk2.on_anchor(45)
+check('anchor-side spread resumes', list(lk2._spa) == [5])
+# Fix dropout: > ANCHOR_GAP_S of wall time without an anchor (the firmware
+# sends anchors only with a fix) — those frames are not pacer spacing.
+lk3 = sd.LinkStats()
+lk3.on_anchor(100, 10.0)
+lk3.on_anchor(110, 10.05)
+lk3.on_anchor(1110, 15.05)             # 5 s without a fix
+lk3.on_anchor(1120, 15.10)
+check('fix dropout kept out of the spread', list(lk3._spa) == [10, 10], repr(list(lk3._spa)))
+check('snapshot round-trips JSON',
+      json.loads(json.dumps(lk.snapshot(300.0)))['reboots'] == 2)
+_snap = sd.LinkStats().snapshot(0.0)
+check('empty snapshot is all zero/None', _snap['samples'] == 0 and _snap['spa_min'] is None
+      and _snap['samples_s'] is None, repr(_snap))
 
 # ── gate_reason ───────────────────────────────────────────────────────────────
 print('gate_reason:')
@@ -359,6 +476,18 @@ rec.on_sample(sample(51, 100))
 rows = rec.on_anchor(anchor(52, 800.10, mm_n=40.0))
 check('reboot: recording resumes', len(rows) == 1, repr(rows))
 
+# Equal ticks are NOT a reboot: at 20 Hz (one frame per fix) the free-running
+# pacer can hand two consecutive fixes the same completed frame. The empty
+# segment must fall through without clearing pending or flushing the bin.
+rec = sd.TrackRecorder(20.0, False)
+rec.on_anchor(anchor(10, 850.00))
+rec.on_sample(sample(11, 100))          # belongs to the segment after tick 10
+rows = rec.on_anchor(anchor(10, 850.05))
+check('equal-tick anchor: no rows, pending kept',
+      rows == [] and rec.pending == [(11, [100] * 8)], repr((rows, rec.pending)))
+rows = rec.on_anchor(anchor(12, 850.10, mm_n=40.0))
+check('equal-tick anchor: next segment still records', len(rows) == 1, repr(rows))
+
 # A sample can outrun its anchor: held for the next segment, not misplaced
 rec = sd.TrackRecorder(20.0, False)
 rec.on_anchor(anchor(10, 900.00))
@@ -389,7 +518,7 @@ full = sd.parse_info_line(
     'tx_pulse_us=120 coil_spacing_mm=500 coil_offset_fore_mm=0 '
     'coil_offset_right_mm=0 sample_rate_hz=500 adc_oversample=16 '
     'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14 '
-    'detector_mode=all slot_us=200 bl8=16,16,16,16,16,16,16,16 '
+    'detector_mode=all slot_us=200 pulse_us=200 bl8=16,16,16,16,16,16,16,16 '
     'rx8=3,3,3,3,3,3,3,3 tx8=120,120,120,120,120,120,120,120')
 sd.stamp_info(mc, full)
 check('later info fills gaps', sd.meta_get(mc, 'coil_spacing_mm') == '500'
@@ -398,12 +527,89 @@ check('later info fills gaps', sd.meta_get(mc, 'coil_spacing_mm') == '500'
       and sd.meta_get(mc, 'sample_rate_hz') == '500')
 check('raster keys stamped', sd.meta_get(mc, 'detector_mode') == 'all'
       and sd.meta_get(mc, 'slot_us') == '200'
+      and sd.meta_get(mc, 'pulse_us') == '200'
       and sd.meta_get(mc, 'bl8') == '16,16,16,16,16,16,16,16'
       and sd.meta_get(mc, 'rx8') == '3,3,3,3,3,3,3,3'
       and sd.meta_get(mc, 'tx8') == '120,120,120,120,120,120,120,120')
 check('info_ok now 1', sd.meta_get(mc, 'info_ok') == '1')
 check('no false drift flags', sd.meta_get(mc, 'timing_changed') is None
       and sd.meta_get(mc, 'geometry_changed') is None)
+# GPS identity '?' = the module never answered the firmware (it powers up
+# after the MCU and can miss the boot query). Must count as ABSENT: never
+# stamped, header stays incomplete, a later real value fills it in.
+mq = sd.db_open(':memory:')
+full_line = (
+    '# info fw=abc1234 gps_ver=? gps_id=? blanking_us=16 rx_window_us=3 '
+    'tx_pulse_us=120 coil_spacing_mm=500 coil_offset_fore_mm=0 '
+    'coil_offset_right_mm=0 sample_rate_hz=500 adc_oversample=16 '
+    'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14 '
+    'detector_mode=all slot_us=200 pulse_us=200 bl8=16,16,16,16,16,16,16,16 '
+    'rx8=3,3,3,3,3,3,3,3 tx8=120,120,120,120,120,120,120,120')
+unknown = sd.parse_info_line(full_line)
+sd.stamp_info(mq, unknown)
+check("'?' identity not stamped", sd.meta_get(mq, 'gps_id') is None
+      and sd.meta_get(mq, 'gps_ver') is None, (sd.meta_get(mq, 'gps_id'), sd.meta_get(mq, 'gps_ver')))
+check("'?' identity: other keys stamped", sd.meta_get(mq, 'fw_git_hash') == 'abc1234'
+      and sd.meta_get(mq, 'tx8') == '120,120,120,120,120,120,120,120')
+check("'?' identity: header incomplete", sd.meta_get(mq, 'info_ok') == '0')
+check("'?' identity: info_missing names both", sd.meta_get(mq, 'info_missing') == 'gps_ver,gps_id',
+      sd.meta_get(mq, 'info_missing'))
+sd.stamp_info(mq, unknown)          # a retry that still says '?' changes nothing
+check("repeat '?' still not stamped", sd.meta_get(mq, 'gps_id') is None
+      and sd.meta_get(mq, 'info_ok') == '0')
+sd.stamp_info(mq, sd.parse_info_line(
+    full_line.replace('gps_ver=? gps_id=?', 'gps_ver=LG580P03,2025/01/01 gps_id=OK,16,ABCDEF')))
+check('late identity fills the header', sd.meta_get(mq, 'gps_id') == 'OK,16,ABCDEF'
+      and sd.meta_get(mq, 'gps_ver') == 'LG580P03,2025/01/01')
+check('late identity completes it', sd.meta_get(mq, 'info_ok') == '1'
+      and sd.meta_get(mq, 'info_missing') == '')
+check("late identity: no drift flags", sd.meta_get(mq, 'timing_changed') is None
+      and sd.meta_get(mq, 'geometry_changed') is None)
+# A real value is final: a later line with a different id does not replace it.
+sd.stamp_info(mq, sd.parse_info_line(
+    full_line.replace('gps_ver=? gps_id=?', 'gps_ver=OTHER gps_id=OTHER')))
+check('real identity is first-wins', sd.meta_get(mq, 'gps_id') == 'OK,16,ABCDEF')
+# gps_cfg (firmware >= 2026-09-20): optional — never required for info_ok,
+# so firmware without it still completes the header; last-wins because it
+# is a state ('pending' settles to resent/noreply within seconds).
+check('gps_cfg absent: header complete, key unset',
+      sd.meta_get(mq, 'info_ok') == '1' and sd.meta_get(mq, 'gps_cfg') is None)
+sd.stamp_info(mq, sd.parse_info_line(full_line + ' gps_cfg=pending'))
+check('gps_cfg stamped when present', sd.meta_get(mq, 'gps_cfg') == 'pending')
+sd.stamp_info(mq, sd.parse_info_line(full_line + ' gps_cfg=resent'))
+check('gps_cfg is last-wins (a state, not provenance)',
+      sd.meta_get(mq, 'gps_cfg') == 'resent', sd.meta_get(mq, 'gps_cfg'))
+check('gps_cfg never counted in info_missing',
+      sd.meta_get(mq, 'info_missing') == '' and sd.meta_get(mq, 'info_ok') == '1')
+mq.close()
+# header_settled(): the read loop's "stop re-sending I" predicate. None =
+# firmware without gps_cfg and MUST count as settled, or every old board
+# would get an 'I' each retry period forever. pending/silent are the states
+# the firmware can still move on from.
+for cfg, ok, want in ((None, '1', True), ('boot', '1', True), ('resent', '1', True),
+                      ('noreply', '1', True), ('pending', '1', False),
+                      ('silent', '1', False), (None, '0', False),
+                      ('boot', '0', False), ('boot', None, False)):
+    hs = sd.db_open(':memory:')
+    if ok is not None:
+        sd.meta_set(hs, 'info_ok', ok)
+    if cfg is not None:
+        sd.meta_set(hs, 'gps_cfg', cfg)
+    check(f'header_settled(info_ok={ok}, gps_cfg={cfg}) is {want}',
+          sd.header_settled(hs) is want, sd.header_settled(hs))
+    hs.close()
+# A '?' stamped verbatim by a pre-2026-09-20 daemon (info_ok '1' with it)
+# must yield to the real value when this daemon is restarted on that db.
+mo2 = sd.db_open(':memory:')
+sd.meta_set(mo2, 'fw_git_hash', 'abc1234')
+sd.meta_set(mo2, 'gps_ver', '?')
+sd.meta_set(mo2, 'gps_id', '?')
+sd.meta_set(mo2, 'info_ok', '1')
+sd.stamp_info(mo2, full)
+check("stored '?' yields to a real value", sd.meta_get(mo2, 'gps_id') == 'UID9'
+      and sd.meta_get(mo2, 'gps_ver') == 'LC29H' and sd.meta_get(mo2, 'info_ok') == '1',
+      (sd.meta_get(mo2, 'gps_id'), sd.meta_get(mo2, 'gps_ver')))
+mo2.close()
 # Old firmware still emits the retired fire_mode token in its info line —
 # it must be ignored (never stamped into meta). With the raster keys in the
 # whitelist an old-FW info line can no longer complete the header: info_ok
@@ -448,6 +654,12 @@ check('unchanged slot_us not flagged',
       'slot_us' not in (sd.meta_get(mc, 'timing_changed') or ''))
 check('header mode untouched', sd.meta_get(mc, 'detector_mode') == 'all')
 check('current mode tracked', sd.meta_get(mc, 'detector_mode_current') == 'raster')
+# Pulse-spacing drift (h/n retune): same contract as the other timing keys
+sd.note_drift(mc, 'timing', {'pulse_us': '4200'})
+check('pulse drift flagged',
+      'pulse_us 200->4200' in (sd.meta_get(mc, 'timing_changed') or ''))
+check('header pulse untouched', sd.meta_get(mc, 'pulse_us') == '200')
+check('current pulse tracked', sd.meta_get(mc, 'pulse_us_current') == '4200')
 check('synchronous=NORMAL', mc.execute('PRAGMA synchronous').fetchone()[0] == 1)
 mc.close()
 
@@ -529,7 +741,8 @@ slave_name = os.ttyname(slave)
 proc = subprocess.Popen(
     [sys.executable, os.path.join(REPO, 'serial_daemon.py'),
      '--port', slave_name, '--db', DB, '--study-name', 'itest',
-     '--min-dist', '20', '--baud', '115200', '--debug'],
+     '--min-dist', '20', '--baud', '115200', '--debug',
+     '--info-retry-s', '1'],      # fast header retry for the test below
     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
 INFO = (b'# info fw=a5c5006 gps_ver=LC29H,2023/10/26 gps_id=UID123 '
@@ -537,8 +750,18 @@ INFO = (b'# info fw=a5c5006 gps_ver=LC29H,2023/10/26 gps_id=UID123 '
         b'coil_offset_fore_mm=0 coil_offset_right_mm=0 '
         b'sample_rate_hz=500 adc_oversample=16 '
         b'adc=PA0,PA1,PA6,PA7,PB1,PB13,PB12,PB14 '
-        b'detector_mode=all slot_us=200 bl8=16,16,16,16,16,16,16,16 '
+        b'detector_mode=all slot_us=200 pulse_us=500 '
+        b'bl8=16,16,16,16,16,16,16,16 '
         b'rx8=3,3,3,3,3,3,3,3 tx8=120,120,120,120,120,120,120,120\r\n')
+# What the firmware says when the GPS module missed the boot-time identity
+# query (it powers up after the MCU): everything present, identity '?'.
+INFO_NOID = INFO.replace(b'gps_ver=LC29H,2023/10/26 gps_id=UID123',
+                         b'gps_ver=? gps_id=?')
+# Firmware >= 2026-09-20 also reports whether the module took its config
+# burst; 'pending' = the re-send is under way and the daemon should ask
+# again so the header carries the settled state.
+INFO_PENDING = INFO.replace(b'gps_id=UID123 ', b'gps_id=UID123 gps_cfg=pending ')
+INFO_RESENT  = INFO.replace(b'gps_id=UID123 ', b'gps_id=UID123 gps_cfg=resent ')
 
 def read_master():
     try:
@@ -546,19 +769,55 @@ def read_master():
     except BlockingIOError:
         return b''
 
-# Wait for the daemon's 'I' handshake, answer it.
-deadline = time.time() + 8
-got_I = False
-while time.time() < deadline:
-    d = read_master()
-    if b'I' in d:
-        got_I = True
-        os.write(master, INFO)
-        break
-    time.sleep(0.05)
-check('daemon sent I handshake', got_I)
+def wait_for_I(timeout_s):
+    """True once the daemon writes an 'I' (the info request)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if b'I' in read_master():
+            return True
+        time.sleep(0.02)
+    return False
 
+# Wait for the daemon's 'I' handshake; answer with the identity still
+# unknown — the header must stamp everything else, stay incomplete, and
+# NOT lock '?' in.
+got_I = wait_for_I(8)
+check('daemon sent I handshake', got_I)
+os.write(master, INFO_NOID)
 time.sleep(0.4)
+_c0 = sqlite3.connect(DB)
+check("pty: '?' identity left unstamped",
+      sd.meta_get(_c0, 'gps_id') is None and sd.meta_get(_c0, 'gps_ver') is None
+      and sd.meta_get(_c0, 'fw_git_hash') == 'a5c5006',
+      (sd.meta_get(_c0, 'gps_id'), sd.meta_get(_c0, 'gps_ver')))
+check("pty: header incomplete while identity unknown",
+      sd.meta_get(_c0, 'info_ok') == '0'
+      and sd.meta_get(_c0, 'info_missing') == 'gps_ver,gps_id',
+      (sd.meta_get(_c0, 'info_ok'), sd.meta_get(_c0, 'info_missing')))
+# The daemon re-asks on --info-retry-s while incomplete (1 s here); the
+# firmware, module now up, answers with the real identity.
+check('pty: daemon re-sent I while header incomplete', wait_for_I(3.0))
+os.write(master, INFO_PENDING)
+time.sleep(0.4)
+check('pty: late identity stamped',
+      sd.meta_get(_c0, 'gps_id') == 'UID123'
+      and sd.meta_get(_c0, 'gps_ver') == 'LC29H,2023/10/26',
+      (sd.meta_get(_c0, 'gps_id'), sd.meta_get(_c0, 'gps_ver')))
+check('pty: header complete after retry', sd.meta_get(_c0, 'info_ok') == '1'
+      and sd.meta_get(_c0, 'info_missing') == '',
+      (sd.meta_get(_c0, 'info_ok'), sd.meta_get(_c0, 'info_missing')))
+check('pty: gps_cfg=pending stamped', sd.meta_get(_c0, 'gps_cfg') == 'pending',
+      sd.meta_get(_c0, 'gps_cfg'))
+# Header complete but gps_cfg still 'pending' → the daemon asks once more;
+# the firmware's re-send has settled by then.
+check('pty: daemon re-sent I while gps_cfg pending', wait_for_I(3.0))
+os.write(master, INFO_RESENT)
+time.sleep(0.4)
+check('pty: gps_cfg settled to resent (last-wins)',
+      sd.meta_get(_c0, 'gps_cfg') == 'resent', sd.meta_get(_c0, 'gps_cfg'))
+# Complete header, settled state → the retry stops. Nothing for > 2 periods.
+check('pty: no I once header complete and gps_cfg settled', not wait_for_I(2.2))
+_c0.close()
 
 def send(line):
     os.write(master, line.encode() + b'\n')
@@ -604,10 +863,13 @@ send('# sample_rate=200Hz (10 per fix)')
 #     serial_daemon main() is only reachable through this pty path, and
 #     identical-looking CSVs let a rotated mapping (bl8 ← group 5, ...)
 #     pass the whole suite — proven by mutation during review.
-send('# rastercfg detector_mode=raster slot_us=300 ch=3 '
+send('# rastercfg detector_mode=raster slot_us=300 pulse_us=6200 ch=3 '
      'bl8=17,16,16,16,16,16,16,16 rx8=3,3,3,3,3,3,3,3 '
      'tx8=110,120,120,120,120,120,120,120')
-# 5f) noise-corrupted sample — the high-bit byte must poison the field
+# 5f) pacer report ('P' key) → kept verbatim for the raw view, stamps
+#     nothing else (the echo-pattern checks above cover the drift keys)
+send(PACE)
+# 5g) noise-corrupted sample — the high-bit byte must poison the field
 #     (errors='replace'), not splice it into a valid-looking value
 os.write(master, b',,,1,2,3,4,5,\xb26,7,8,,,1005\n')
 time.sleep(0.6)
@@ -651,11 +913,14 @@ check('header detector_mode NOT overwritten', meta.get('detector_mode') == 'all'
 check('raster selection tracked', meta.get('raster_sel') == '3',
       repr(meta.get('raster_sel')))
 check('meta slot_us stamped', meta.get('slot_us') == '200')
+check('meta pulse_us stamped', meta.get('pulse_us') == '500')
 check('meta bl8 stamped', meta.get('bl8') == '16,16,16,16,16,16,16,16')
 # Exact _current values, one per regex group — a swapped group→key binding
 # in the dispatcher fails here even though every downstream shape matches.
 check('slot_us_current exact', meta.get('slot_us_current') == '300',
       repr(meta.get('slot_us_current')))
+check('pulse_us_current exact', meta.get('pulse_us_current') == '6200',
+      repr(meta.get('pulse_us_current')))
 check('bl8_current exact',
       meta.get('bl8_current') == '17,16,16,16,16,16,16,16',
       repr(meta.get('bl8_current')))
@@ -667,6 +932,8 @@ check('tx8_current exact',
       repr(meta.get('tx8_current')))
 check('slot_us drift flagged',
       'slot_us 200->300' in meta.get('timing_changed', ''))
+check('pulse_us drift flagged',
+      'pulse_us 500->6200' in meta.get('timing_changed', ''))
 check('bl8 drift flagged (pty)',
       'bl8 16,16,16,16,16,16,16,16->17,16,16,16,16,16,16,16'
       in meta.get('timing_changed', ''))
@@ -687,6 +954,12 @@ check('live_samples ring populated', ring[0] > 0, repr(ring))
 check('ring spans the sample stream', ring[0] <= sd.SAMPLES_KEEP
       and ring[2] >= 1004, repr(ring))
 check('raw_mode not stamped in normal mode', 'raw_mode' not in meta)
+check('pace report kept verbatim', meta.get('pace_last') == PACE.split(None, 2)[2],
+      repr(meta.get('pace_last')))
+check('pace report stamped with arrival time',
+      abs(float(meta.get('pace_at', 'nan')) - time.time()) < 30, repr(meta.get('pace_at')))
+check('pace report is not a timing change', 'pace' not in meta.get('timing_changed', '')
+      and 'ivl_us' not in meta and 'skips' not in meta)
 
 # 6) stop feeding → 'no data' after 2s
 time.sleep(3.5)
@@ -712,6 +985,27 @@ live = conn.execute('SELECT recording,reason FROM live').fetchone()
 check('recovers after garbage', live == (1, ''), repr(live))
 pts = conn.execute('SELECT adc0 FROM points ORDER BY id').fetchall()
 check('post-garbage segment recorded rows', len(pts) > 2, repr(pts))
+# Link health over everything fed so far: sample ticks 1..7 then 1001..1004,
+# 1005..1013 (the poisoned 1005 line never parsed) = 20 samples, one gap of
+# 993 frames (7 -> 1001), no regression; anchors 900,902,950,1000,1004,1006
+# = 6, spacings 2/48/50/4/2, none equal. The snapshot is rewritten on the
+# live-row cadence, so force one: after >= LIVE_PERIOD_S of silence the
+# next sample runs the live block, and the snapshot it writes includes
+# that sample (link.on_sample precedes the live block in the loop).
+time.sleep(sd.LIVE_PERIOD_S + 0.1)
+send(f',,,700,700,700,700,700,700,700,700,,,1013')
+time.sleep(0.25)
+_raw_lk = dict(conn.execute('SELECT key,value FROM meta').fetchall()).get('link')
+check('link meta written', _raw_lk is not None)
+_lk = json.loads(_raw_lk) if _raw_lk else {}
+check('link: sample/anchor totals', _lk.get('samples') == 20 and _lk.get('anchors') == 6, repr(_lk))
+check('link: the 7->1001 jump is one gap of 993 frames',
+      _lk.get('tick_gaps') == 1 and _lk.get('frames_lost') == 993, repr(_lk))
+check('link: no reboot, no mangled tick, no equal-tick fix', _lk.get('reboots') == 0
+      and _lk.get('bad_ticks') == 0 and _lk.get('eq_ticks') == 0, repr(_lk))
+check('link: frames-per-fix spread 2..50', _lk.get('spa_min') == 2 and _lk.get('spa_max') == 50, repr(_lk))
+check('link: rates present', isinstance(_lk.get('samples_s'), (int, float))
+      and isinstance(_lk.get('anchors_s'), (int, float)), repr(_lk))
 
 # 9) second daemon while first is alive → refused, PID file untouched
 pid1 = open('/tmp/metal_detector_daemon.pid').read().split(':', 1)[0]
@@ -852,6 +1146,12 @@ check('lists available ports', 'available ports:' in out2)
 conn2 = sqlite3.connect(DB2)
 live2 = conn2.execute('SELECT recording,reason FROM live').fetchone()
 check('live row says no port', live2 == (0, 'no port'), repr(live2))
+# The no-port beat rewrites the link snapshot too — the raw view's Link
+# row must not sit at stale live rates under a 'no port' banner.
+_lk2 = json.loads(dict(conn2.execute('SELECT key,value FROM meta').fetchall())
+                  .get('link') or '{}')
+check('no-port path keeps the link snapshot current',
+      _lk2.get('samples') == 0 and _lk2.get('samples_s') in (None, 0.0), repr(_lk2))
 conn2.close()
 
 print()

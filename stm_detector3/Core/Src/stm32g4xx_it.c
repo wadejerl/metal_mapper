@@ -261,8 +261,15 @@ void USART2_IRQHandler(void)
 
     __HAL_UART_CLEAR_FLAG(&huart2, UART_FLAG_CMF);
 
-    // LF detected - complete sentence available, parse immediately
+    // LF detected - complete sentence available, parse immediately.
+    // DWT-stamped so the 'P' pacer line can report the longest parse
+    // (the _begin helper also switches the counter on if a boot-time
+    // sentence lands here before md_pace_init has). This ISR runs BELOW
+    // the TIM7 pacer (priority 6 vs 4), so the time spent here is
+    // diagnostic only — it can no longer delay a coil pulse.
+    uint32_t t0 = md_pace_gps_isr_begin();
     gps_process_dma_buffer();
+    md_pace_note_gps_isr(t0);
   }
 
   // Handle other UART interrupts (errors, etc.) to prevent blocking
@@ -311,9 +318,10 @@ void ADC4_IRQHandler(void)
   md_adc4_irq();
 }
 
-/* TIM7 cycle pacer (GPS-synchronised sampling). CubeMX does not generate
- * this either; NVIC setup lives in md_pace_init. DAC2/4 underrun shares
- * the vector but neither DAC is used. */
+/* TIM7 cycle pacer (free-running, priority 4 — above USART2/DMA/RTOS, so
+ * no GPS traffic can delay it; no RTOS calls inside). CubeMX does not
+ * generate this either; NVIC setup lives in md_pace_init. DAC2/4 underrun
+ * shares the vector but neither DAC is used. */
 void TIM7_DAC_IRQHandler(void)
 {
   md_pace_fired();

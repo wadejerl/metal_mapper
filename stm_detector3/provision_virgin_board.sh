@@ -114,6 +114,34 @@ fi
 if [ $DO_FLASH -eq 1 ]; then
   ELF=Debug/stm_detector3.elf
   if [ -f "$ELF" ]; then
+    # Staleness guard — this script does NOT build. The IDE/makefile
+    # pre-build writes Core/Inc/fw_version.h with the hash the LAST build
+    # baked in ("-dirty" = uncommitted changes under stm_detector3/ at build
+    # time, which the board then reports in every study header). Warn when
+    # that hash is not HEAD, was dirty, or any source is newer than the ELF.
+    BUILT=$(grep -o '"[^"]*"' Core/Inc/fw_version.h 2>/dev/null | tr -d '"')
+    HEAD_HASH=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
+    NEWER=$(find Core -newer "$ELF" \( -name '*.c' -o -name '*.h' \) ! -name fw_version.h 2>/dev/null | head -3 | tr '\n' ' ')
+    STALE=""
+    case "$BUILT" in
+      *-dirty) STALE="built from a dirty tree (fw=$BUILT)" ;;
+      "$HEAD_HASH") ;;
+      *) STALE="built as fw=${BUILT:-unknown} but HEAD is $HEAD_HASH" ;;
+    esac
+    [ -z "$NEWER" ] || STALE="${STALE:+$STALE; }sources newer than the ELF: $NEWER"
+    if [ -n "$STALE" ]; then
+      echo ""
+      echo "WARNING: $ELF may not match the source tree — $STALE."
+      echo "Rebuild the Debug configuration first (IDE, or: make -C Debug all)."
+      if [ $ASSUME_YES -ne 1 ]; then
+        printf 'Type yes to flash it anyway: '
+        read -r answer
+        [ "$answer" = "yes" ] || die "aborted by user."
+      fi
+    else
+      echo ""
+      echo "ELF is fw=$BUILT (= HEAD), no source newer than it."
+    fi
     echo ""
     echo "── Flashing $ELF (verify + reset) ───────────────────────────────"
     "$CLI" $CONNECT -w "$ELF" -v -rst || die "flash failed."

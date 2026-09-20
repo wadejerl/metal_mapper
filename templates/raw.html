@@ -22,6 +22,17 @@
                 letter-spacing:.04em; }
     .tv-val   { font-size:12px; font-family:monospace; color:#fff;
                 white-space:nowrap; }
+    /* second strip row: link health + the firmware's pacer report. One
+       deliberate extra row (~30px of chart at 800x480) — the readout that
+       says whether a wobble on the traces is the coils or the software.
+       Both values ellipsize (full text in the tooltip) rather than paint
+       past their box; below ~680px the pacer column wraps under the Link
+       readout instead of collapsing to nothing. */
+    .tv-row2  { flex-basis:100%; display:flex; gap:10px; align-items:baseline;
+                min-width:0; flex-wrap:wrap; }
+    .tv-row2 .tv-lbl { white-space:nowrap; }
+    .tv-row2 .tm-btn { align-self:center; padding:2px 8px; }
+    #linkVal, #paceVal { overflow:hidden; text-overflow:ellipsis; }
     /* toolbar: same controls family as the map view */
     #toolbar {
       position:absolute; left:0; right:0;
@@ -167,6 +178,11 @@ function dismissErr() {
 {% else %}
 <div id="banner">
   <div class="status-banner st-raw" id="statusBanner">● STREAMING</div>
+  <!-- Header warnings from derive_status (stale GPS config, identity not
+       reported, header incomplete): the bench screen is exactly where a
+       software cause would otherwise be chased as an analog one. -->
+  <div id="statusWarnings" style="display:none;color:#f7b955;font-size:12px;
+       padding:2px 10px;line-height:1.4;"></div>
   {# e.g. a second /start_raw racing an already-running daemon — must not
      vanish just because the page rendered in viewer mode. Info-blue, not
      .err red: the amber banner above owns live-fault severity, this is a
@@ -198,6 +214,23 @@ function dismissErr() {
     <span class="tv-val" id="fwVal">—</span></div>
   <div class="tv"><span class="tv-lbl">Port</span>
     <span class="tv-val" id="portVal" style="font-size:12px;">—</span></div>
+  {# Row 2. Link: the daemon's tick arithmetic over the stream — samples/s,
+     fixes/s, frames per fix (rate/20 ±1 as the free-running pacer slides
+     against the GPS clock), then the faults: tick gaps (frames that never
+     reached the db), frames they skipped, tick regressions (MCU reboots).
+     Pacer: the firmware's '# pace' line, requested with the P button —
+     pulse-timing proof from the coil side. Both stay '—' on a pre-2026-09
+     daemon (which drops the line and writes no link meta). #}
+  <div class="tv-row2">
+    <div class="tv" style="min-width:0;">
+      <span class="tv-lbl" title="stream integrity from the sample ticks: samples/s · fixes/s · frames per fix (min–max over ~2 s) · tick gaps · frames lost in them · MCU reboots (tick went backwards and the stream continued from there). Green = no gap, no reboot this session. Counts what the daemon parsed — a line garbled in flight is a one-frame gap; anything upstream of the firmware's tick counter is the P line's job.">Link</span>
+      <span class="tv-val" id="linkVal">—</span></div>
+    <button class="tm-btn" id="paceBtn" onclick="sendCmd('P')"
+            title="ask the firmware for its pacer diagnostics (P key): interval jitter, skipped starts, GGA spacing, NMEA parse time — then its window restarts">Pacer P</button>
+    <div class="tv" style="flex:1 1 220px; min-width:0;">
+      <span class="tv-lbl" id="paceLbl">Pacer report</span>
+      <span class="tv-val" id="paceVal">—</span></div>
+  </div>
 </div>
 
 <div id="toolbar">
@@ -257,6 +290,12 @@ function dismissErr() {
               title="toggle raster / all-at-once">⇄</button>
       <span class="tm-val" id="slotVal" style="min-width:0; color:#9ab;"
             title="raster slot period"></span>
+    </div>
+    <div class="tm-row" id="pulseRow" style="display:none;">
+      <span class="tm-lbl" title="Raster pulse spacing: time between adjacent channel firings — slower spacing lets each pulse's eddy tail die out before the next channel fires (firmware h/n keys). The slot period beside Mode stretches past the request when a channel's timings need more.">Pulse</span>
+      <span class="tm-val" id="pulseVal" style="min-width:44px;">—</span>
+      <button class="tm-btn" onclick="pulseCmd('h')" title="faster pulse spacing (shorter period)">+</button>
+      <button class="tm-btn" onclick="pulseCmd('n')" title="slower pulse spacing (longer period)">−</button>
     </div>
     <div class="tm-row" id="chipRow" style="display:none;"></div>
     <div class="tm-row">
@@ -490,6 +529,35 @@ let ratePending = null;  // {idx, t}: steps in flight, don't snap the slider
 let walkQueued = 0;      // g/b fetches queued but not yet resolved
 let rateMatches = 0;     // consecutive ticks agreeing with the pending target
 let rateHeld   = false;  // finger/pointer currently on the thumb
+let rasterNow  = false;  // last status tick: raster mode + effective slot,
+let slotUsNow  = null;   //   for the fit clamp below (set in updateStatus)
+
+// Firmware pulse step list (µs), mirrored for the optimistic bump below.
+const PULSE_STEPS = [200, 500, 1000, 2000, 4200, 5000, 6200,
+                     10000, 12500, 20000, 25000];
+let pulseHold = null;    // {us, t}: optimistic slot floor after a 'n' press
+function pulseCmd(key) {
+  // 'n' grows the slot period the moment the firmware takes it, but the
+  // echo needs ~200-400 ms to land in meta — SSE ticks built inside that
+  // window still carry the OLD slot_us, so a rate drag clamping against
+  // them walks into the firmware refusal + 5 s snap-back. Bump slotUsNow
+  // to the next step above it now AND hold that floor across stale ticks
+  // (updateStatus keeps max(tick, hold) until a tick confirms or 5 s pass
+  // — the same reason the rate path needs its two-tick confirm). At worst
+  // the hold OVER-estimates (a stretched or refused request), which only
+  // clamps harder: the user lands a stop low and the next real tick
+  // corrects it — never a refusal. 'h' shrinks the slot, so the stale
+  // larger value already errs on the safe side — no bump, and any live
+  // hold stays valid as a floor the firmware really had.
+  if (key === 'n' && rasterNow && slotUsNow) {
+    const next = PULSE_STEPS.find(p => p > slotUsNow);
+    if (next) {
+      slotUsNow = next;
+      pulseHold = {us: next, t: performance.now()};
+    }
+  }
+  sendCmd(key);
+}
 
 function setRateUI(idx) {
   document.getElementById('rateSl').value = idx;
@@ -502,13 +570,33 @@ function rateDrag() {  // live label while the thumb moves; nothing sent yet
 }
 
 function onRate() {    // thumb released: walk the firmware to the target
-  const target = parseInt(document.getElementById('rateSl').value, 10);
+  let target = parseInt(document.getElementById('rateSl').value, 10);
   // Steps are relative — with no confirmed starting point there is nothing
   // safe to send. Park the thumb back on '—' state and wait for the echo.
   const from = ratePending ? ratePending.idx : fwRateIdx;
   if (from == null) {
     document.getElementById('rateSlV').textContent = '—';
     return;
+  }
+  // In raster mode the sweep (8 slots) must fit the sample interval — the
+  // firmware refuses an unfit step ('# raster limit'), so pre-clamp the
+  // target to the highest rate that fits and land the thumb there instead
+  // of walking into a refusal and the 5 s timeout snap-back.
+  if (rasterNow && slotUsNow) {
+    const released = target;
+    while (target > 0 && 8 * slotUsNow * RATES[target] > 1e6) target--;
+    // The clamp may only cap a RAISE. slotUsNow can OVER-estimate (the
+    // pulseHold floor after a refused '−' never gets a confirming echo),
+    // so never let it drive the walk below the stop the user chose or
+    // the rate the firmware already runs — an over-clamped raise lands
+    // back on 'from' as a no-op instead of silently WALKING THE RATE
+    // DOWN, and a deliberate down-drag is honored exactly as released.
+    const floor = Math.min(released, from);
+    if (target < floor) target = floor;
+    // Land the thumb on the stop the walk actually goes to NOW — parked on
+    // the unfit stop it would read wrong until the two-tick SSE confirm
+    // (or forever, with the stream down).
+    if (target !== released) setRateUI(target);
   }
   if (target === from) { setRateUI(target); return; }
   ratePending = {idx: target, t: performance.now()};
@@ -621,6 +709,19 @@ function updateStatus(st) {
                      MM.reasonText(st.reason);
   }
 
+  // Header warnings (same list the study view shows), one line each.
+  const wb = document.getElementById('statusWarnings');
+  if (wb) {
+    const ws = Array.isArray(st.warnings) ? st.warnings : [];
+    wb.style.display = ws.length ? '' : 'none';
+    wb.textContent = '';
+    for (const w of ws) {
+      const line = document.createElement('div');
+      line.textContent = '⚠ ' + w;
+      wb.appendChild(line);
+    }
+  }
+
   // Timing panel. In raster mode the three values show the SELECTED
   // channel's table entry; in all-at-once mode the shared globals, exactly
   // as before. An old-firmware stream never sets detector_mode, so the
@@ -631,6 +732,33 @@ function updateStatus(st) {
   document.getElementById('slotVal').textContent =
       (raster && tm.slot_us != null) ? tm.slot_us + 'µs' : '';
   document.getElementById('chipRow').style.display = raster ? 'flex' : 'none';
+  // Pulse spacing (raster only). Shows the REQUESTED rate; the effective
+  // one is 1e6/slot_us — slot_us (beside Mode) stretches past the request
+  // when a channel's timeline needs more. Pre-pulse firmware never sends
+  // pulse_us, so the row degrades to '—'.
+  document.getElementById('pulseRow').style.display = raster ? 'flex' : 'none';
+  const pu = parseInt(tm.pulse_us, 10);
+  const pvEl = document.getElementById('pulseVal');
+  if (Number.isFinite(pu) && pu > 0) {
+    pvEl.textContent = Math.round(1e6 / pu) + ' Hz';
+    pvEl.title = 'requested spacing ' + pu + 'µs between channel pulses';
+  } else {
+    pvEl.textContent = '—';
+    pvEl.title = '';
+  }
+  // The rate-slider fit clamp reads these (8 slots must fit the interval).
+  rasterNow = raster;
+  const suNow = parseInt(tm.slot_us, 10);
+  let su = (Number.isFinite(suNow) && suNow > 0) ? suNow : null;
+  if (pulseHold) {
+    if ((su != null && su >= pulseHold.us)
+        || performance.now() - pulseHold.t > 5000) {
+      pulseHold = null;             // echo landed (or refused): stream rules
+    } else if (su != null) {
+      su = pulseHold.us;            // pre-echo tick: keep the optimistic floor
+    }
+  }
+  slotUsNow = su;
   if (selPending && (tm.raster_sel === selPending.val ||
                      performance.now() - selPending.t > 5000)) {
     selPending = null;
@@ -667,6 +795,48 @@ function updateStatus(st) {
     setVal('gpstsVal', Number.isFinite(ts) ? ts.toFixed(1) : '—');
     if (lv.vin  != null) setVal('vinVal',  lv.vin.toFixed(2) + ' V');
     if (lv.temp != null) setVal('tempVal', lv.temp.toFixed(1) + ' °C');
+  }
+
+  // Row 2: link health + pacer report. Null from an old daemon (never
+  // written) AND from a fresh raw session on a tab held open across Stop →
+  // Start Streaming (/start_raw recreates the db, the SSE never drops):
+  // both paint the '—' placeholders, so the previous session's report can
+  // never sit there with a frozen age. Faults are session totals: one lost
+  // frame stays orange until the session restarts, on purpose; a stopped
+  // daemon's final tally shows in grey.
+  const lk = st.link;
+  const lkEl = document.getElementById('linkVal');
+  if (lk) {
+    const num = (v, d) => (typeof v === 'number') ? v.toFixed(d) : '—';
+    const spa = lk.spa_min == null ? '—'
+              : lk.spa_min === lk.spa_max ? String(lk.spa_min)
+              : lk.spa_min + '–' + lk.spa_max;
+    const clean = !lk.tick_gaps && !lk.reboots;
+    const text = num(lk.samples_s, 0) + '/s · ' + num(lk.anchors_s, 1)
+        + ' fix/s · ' + spa + ' fr/fix · gaps ' + lk.tick_gaps + ' · lost '
+        + lk.frames_lost + ' · reboots ' + lk.reboots;
+    lkEl.textContent = text;
+    lkEl.style.color = st.state === 'stopped' ? '#888'
+                     : clean ? '#a5d6a7' : '#ffb74d';
+    lkEl.title = text + '\nsession: ' + lk.samples + ' samples, ' + lk.anchors
+        + ' fixes, ' + lk.eq_ticks + ' equal-tick fixes (normal at 20 Hz), '
+        + (lk.bad_ticks || 0) + ' mangled ticks';
+  } else {
+    lkEl.textContent = '—'; lkEl.title = ''; lkEl.style.color = '';
+  }
+  const pc = st.pace;
+  const pcEl = document.getElementById('paceVal');
+  const pcLbl = document.getElementById('paceLbl');
+  if (pc && pc.text) {
+    const age = (typeof pc.age_s === 'number') ? Math.round(pc.age_s) + ' s ago' : '';
+    pcEl.textContent = pc.text;
+    pcEl.title = pc.text + (age ? '   (' + age + ')' : '');
+    // a report older than a minute describes some earlier state: grey it
+    pcEl.style.color = (typeof pc.age_s === 'number' && pc.age_s > 60) ? '#888' : '#fff';
+    pcLbl.textContent = 'Pacer report' + (age ? ' · ' + age : '');
+  } else {
+    pcEl.textContent = '—'; pcEl.title = ''; pcEl.style.color = '';
+    pcLbl.textContent = 'Pacer report';
   }
   relayout();
 }

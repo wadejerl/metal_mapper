@@ -32,7 +32,8 @@ lat,lon,fix,adc0..adc7,gps_ts,heading,tick[,vin_V,temp_C]
 ```
 
 - **Sample lines** carry ADC + tick only; **anchor lines** carry one GPS fix +
-  the tick of the ADC frame paced to land just before it. The daemon
+  the tick of the newest ADC frame completed when the fix parsed (within one
+  sample interval before it — the pacer free-runs). The daemon
   interpolates each sample's position between consecutive anchors in tick
   space, then averages samples into one saved row per `--min-dist` mm of
   travel. No fix → anchors stop but samples keep streaming at full rate
@@ -256,6 +257,19 @@ No GPS needed — bench units stream with no antenna connected.
   map instead.
 - Data-flow faults (`no port` / `no data` / `garbage`) show as an amber
   STREAMING FAULT banner; missing GPS is normal here and stays quiet.
+- **Link** (second telemetry row): stream integrity from the sample ticks
+  — samples/s, fixes/s, frames per fix (rate/20 ±1 as the free-running
+  pacer slides against the GPS clock), tick gaps, frames lost in them,
+  MCU reboots (tick went backwards and the stream continued from there; a
+  lone mangled tick is counted separately, in the tooltip). Green means no
+  gap and no reboot since the session started. It counts what the daemon
+  parsed: a line garbled in flight is a one-frame gap, and anything
+  upstream of the firmware's tick counter is invisible here — that is what
+  the P line's `skips` covers. **Pacer P** asks the firmware for its
+  `# pace` diagnostics line (interval jitter, skipped starts, GGA spacing,
+  NMEA parse time — see `docs/detector3.md`, *Pacer*), shown verbatim
+  with its age. Together they separate a software artefact from an analog
+  one without a scope.
 - **■ Stop & Exit** is the only way out while streaming: stopping and
   returning to the studies page are one action (same rule as the live
   map). Starting takes no options — it attaches to the configured serial
@@ -332,6 +346,13 @@ UI; the `jlw_rover_*` units feed it GPS; `jlw_ui_mm.service` is the kiosk
 browser). They are symlinked into `/etc/systemd/system` by the install
 script, so they too update on `git pull` — run
 `sudo systemctl daemon-reload` after a pull that touches them.
+
+The two `jlw_rover_rtk*` units gate their start on the GPS tty existing
+and the base station's caster answering (steady amber dot on the home
+screen while waiting, instead of the old green/grey restart flapping).
+The wait is unbounded, so a plain foreground `systemctl start`/`restart`
+of them blocks until the gate passes — add `--no-block` when the base or
+GPS may be absent.
 
 ### Setup commands
 
