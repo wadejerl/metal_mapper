@@ -54,6 +54,8 @@
     .bigbtn.rec:hover { background: #c73652; }
     .bigbtn.raw { background: #4a148c; color: #e1bee7; }
     .bigbtn.raw:hover { background: #6a1b9a; }
+    .bigbtn.refresh { background: #1e4d5c; color: #c8ecf5; }
+    .bigbtn.refresh:hover { background: #26637a; }
     /* power-off: always in the same corner, big enough for a glove */
     .powerbtn { position: absolute; top: 18px; right: 20px; width: 54px;
                 height: 48px; font-size: 22px; background: #37474f;
@@ -194,6 +196,9 @@
       <a class="bigbtn raw" href="/raw">{{ ic.chart(20) }} Return to Raw View</a>
     {% endif %}
   {% endif %}
+  {# the list is rendered once per page load; studies the other unit
+     synced in since then only show after a reload #}
+  <a class="bigbtn refresh" href="/">{{ ic.refresh(20) }} Refresh List</a>
 </div>
 {% if not ds.running %}
 <div style="margin:-16px 0 22px 0; font-size:12px;">

@@ -110,12 +110,30 @@ Consequences worth knowing:
   number.
 - If the hub is unreachable (unit at home, base Pi off) the cycle is a
   quiet no-op — the timer keeps ticking, nothing turns red.
+- **Legacy pins don't travel.** Studies recorded before sidecars keep
+  their dig pins in the db's own `targets` table; the map still draws them
+  (keys `db:N`, bare-number labels), but a legacy db is write-once in the
+  sync, so the peer only ever sees the rows the seed carried, and a
+  `db:N` pin deleted here stays on the peer. (Pins flagged since the
+  sidecar change go to sidecars and sync like any other — this is about
+  the old rows only.)
+- **Hub misses are routine, and quiet on the Pis.** The own-sidecar
+  restore pass and pass 2 ask the hub for explicit file lists, and an
+  entry the hub lacks is normal: our sidecar for a study nobody ever
+  flagged or found-marked on from this unit (a peer's sidecar doesn't
+  count), a foreign file its owner hasn't pushed yet, a hub prune. GNU
+  rsync ≥ 3.1 (both Pis) is given `--ignore-missing-args` and skips them
+  silently, so a steady-state journal shows only the script's own lines.
+  openrsync (the Mac bench) lacks the flag; there the first miss aborts
+  that file-list pull with one `No such file` line and rsync exits 23,
+  which `run_rsync` tolerates (`cycle ok`) — so on the bench the restore
+  and pass-2 legs only do work when nothing in the list is missing.
 
 ## Setup
 
-**Head units** (both): **re-run `install_pi_system.sh` once** — the timer
-and the `/opt/metal_mapper/sync_studies.sh` symlink are new, so a unit
-deployed before this feature doesn't have them linked; a plain
+**Head units** (both): **re-run `install_pi_system.sh` once** — it renders
+and enables the new timer and links `/opt/metal_mapper/sync_studies.sh`,
+which a unit deployed before this feature doesn't have; a plain
 service-restart deploy never creates them. The installer enables but does
 not start units, so on an already-running unit also do:
 
@@ -159,6 +177,18 @@ it (safe to repeat; `--ignore-existing` means a re-seed can never clobber):
 ```bash
 /opt/metal_mapper/sync_studies.sh --seed
 ```
+
+Run it as the service user (the account `jlw_metalmap.service` runs as, not
+plain `sudo` — the config is read from `$HOME`) while the hub is up, and expect `seeding N file(s) to
+the hub` followed by `cycle ok`. `seed skipping 0-point` lines are empty
+or unreadable dbs that stay local on purpose. A legacy db whose `-wal` is
+non-empty (a pre-sync session that crashed or lost power) ships as a
+consistent snapshot with its wal folded in for later — look for `seeding
+snapshot of wal-hot`. If it says `another sync (pid N) is running —
+skipping`, a timer cycle held the lock: run it again. For a first seed of
+a big library over WiFi, stop `jlw_mm_sync.timer` for the duration — a
+cycle that steals the lock after an hour wipes the seed's staging files
+mid-transfer.
 
 ## Testing
 

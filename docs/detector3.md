@@ -266,8 +266,10 @@ rx 3 µs, TX pulse 120 µs (per-channel table seeded the same), spacing
 
 ## Host-side design
 
-### serial_daemon.py (IMPLEMENTED 2026-07-22; regression tests in
-### test_serial_daemon.py — run them before deploying, no hardware needed)
+### serial_daemon.py
+
+Regression tests: `test_serial_daemon.py` — run them before deploying, no
+hardware needed.
 
 - **Recording model** (500 Hz protocol): samples between two consecutive
   anchors form a *segment*. A segment records only when **both** anchors
@@ -356,22 +358,22 @@ rx 3 µs, TX pulse 120 µs (per-channel table seeded the same), spacing
   `vin`/`temp` (latest status pair at insert time). Per-coil positions
   are NOT stored — the visualizer computes them from lat/lon + heading +
   coil geometry.
-- **Robustness** (adversarially reviewed): port opened `exclusive=True`
+- **Robustness**: port opened `exclusive=True`
   (second reader fails loudly instead of splitting the byte stream); PID
   file refused if a live daemon owns it (double-Start race); sqlite
   errors never tear down the serial session (guarded writes, throttled
   logging that survives a full disk); WAL + `synchronous=NORMAL` (no
   per-commit fsync on the Pi SD card); `errors='replace'` decoding so a
   noise-corrupted byte can't splice a field into a valid-looking value.
-- No detector2 back-compat anywhere.
 
-### db_map.py (web UI — IMPLEMENTED: engineering view)
+### db_map.py (web UI)
 
-Rewritten for this schema (single Flask app; `test_db_map.py` is the
-regression battery, `bench/` the no-hardware test rig). Beyond the design
-below: a per-study **Rot°** heading offset (`sl_heading_offset_deg`, added
-to reported heading before all coil math — absorbs a GPS that reports
-heading along the antenna baseline instead of direction of travel);
+Single Flask app; `test_db_map.py` is the regression battery, `bench/` the
+no-hardware test rig. Beyond the design below: a heading offset
+(`heading_offset_deg` in `config.json`, default 270, added to the reported
+heading before all coil math — a property of the vehicle mounting, for a GPS
+that reports heading along the antenna baseline instead of the direction of
+travel; a study's own saved `sl_heading_offset_deg` takes precedence);
 heading-NULL points render as antenna dots + track instead of the coil
 carpet (no-gate / drift studies); Leaflet + tiles degrade offline with
 user geojson overlays still rendered. The SSE stream carries the daemon's
@@ -379,8 +381,8 @@ sample ring alongside new rows, so the strip chart scrolls at the full
 sample rate with no fix and no recording; **View Raw** (`/raw` +
 `/start_raw`, daemon `--raw`) is the map-less version of that: telemetry +
 timing controls + a large shared-scale chart (autoscale on one shared
-raw axis, Δ-from-zero overlay, or absolute 0–65535), nothing written. The operator (800x480) view is the remaining
-piece — to be designed separately.
+raw axis, Δ-from-zero overlay, or absolute 0–65535), nothing written. An
+operator-oriented 800×480 view is planned but not built.
 
 - 8 streams rendered per point: coil positions = antenna lat/lon + heading
   rotation + (spacing, fore/right offsets) from study meta.
@@ -410,7 +412,7 @@ piece — to be designed separately.
   - `timing_changed` / `geometry_changed` meta flags → loud warning on
     the study view (data before/after the change doesn't line up).
 
-## Hardware v2 change list (parked)
+## Hardware v2 wish list
 
 - Swap UARTs so the host lands on bootloader-capable pins: host → USART2
   PA2/PA3 (ROM bootloader listens there), GPS → USART1 PB6/PB7 (bootloader
@@ -419,4 +421,4 @@ piece — to be designed separately.
   ideally BOOT0 and NRST to Pi GPIOs for fully remote recovery.
 - Verify external pull-downs hold coil TX gates (PA5/PB4) and switch
   inputs safe while all MCU pins float in bootloader/reset.
-- Coil-width provisioning may move off console keys later (user note).
+- Coil-width provisioning may move off console keys later.

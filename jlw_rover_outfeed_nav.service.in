@@ -1,0 +1,14 @@
+# Template — install_pi_system.sh renders this to /etc/systemd/system/jlw_rover_outfeed_nav.service,
+# filling the @MM_*@ placeholders from the checkout and install.conf.
+[Unit]
+Description=Rover service to send the gps nav data
+After=multi-user.target
+
+[Service]
+ExecStart=@MM_HOME@/pygpsclient/bin/gnssserver -I /dev/ttyUSB0 --baudrate 460800 --outport 50010 --verbosity 1
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+

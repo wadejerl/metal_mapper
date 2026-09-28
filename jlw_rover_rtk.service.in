@@ -1,3 +1,5 @@
+# Template — install_pi_system.sh renders this to /etc/systemd/system/jlw_rover_rtk.service,
+# filling the @MM_*@ placeholders from the checkout and install.conf.
 [Unit]
 Description=Rover RTK corrections to heading GPS (ttyUSB3)
 After=multi-user.target
@@ -13,12 +15,12 @@ StartLimitIntervalSec=0
 # honest: no corrections flowing) until the GPS is plugged in AND the
 # caster answers, then starts the client (steady green). Pure bash /dev/tcp
 # probe — no nc dependency on the Pi.
-ExecStartPre=/bin/bash -c 'until [ -e /dev/ttyUSB3 ] && timeout 3 bash -c "</dev/tcp/northpole/2101" 2>/dev/null; do sleep 10; done'
+ExecStartPre=/bin/bash -c 'until [ -e /dev/ttyUSB3 ] && timeout 3 bash -c "</dev/tcp/@MM_BASE_HOST@/2101" 2>/dev/null; do sleep 10; done'
 # the wait above is unbounded by design — NB a foreground `systemctl
 # start/restart` of this unit therefore blocks until the gate passes; use
 # `systemctl restart --no-block` when the base/GPS may be absent
 TimeoutStartSec=infinity
-ExecStart=/home/pi/pygpsclient/bin/gnssntripclient --server northpole --port 2101 --mountpoint pygnssutils --clioutput 2 --output '/dev/ttyUSB3@460800' --verbosity 1  --retryinterval 1 --retries 3
+ExecStart=@MM_HOME@/pygpsclient/bin/gnssntripclient --server @MM_BASE_HOST@ --port 2101 --mountpoint pygnssutils --clioutput 2 --output '/dev/ttyUSB3@460800' --verbosity 1  --retryinterval 1 --retries 3
 Restart=always
 RestartSec=5
 

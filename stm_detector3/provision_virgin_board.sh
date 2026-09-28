@@ -5,8 +5,8 @@
 # WHY: the firmware and STM32G474CBTX_FLASH.ld assume SINGLE-BANK flash
 # (DBANK=0): 124K contiguous code + 4K settings page at 0x0801F000. Factory
 # G474s ship with DBANK=1 (dual-bank), where a 128K part maps only 64K at
-# 0x08000000 and bank 2 at 0x08040000 (RM0440 p.96 Table 7 — see
-# the manual is not in this repo — get RM0440 from st.com). Our ~85K image doesn't fit in 64K, so flashing a virgin
+# 0x08000000 and bank 2 at 0x08040000 (RM0440 p.96 Table 7; the manual is
+# not in this repo — get RM0440 from st.com). Our ~85K image doesn't fit in 64K, so flashing a virgin
 # board fails with "Operation exceeds memory limits" during erase.
 #
 # WHAT THIS DOES (in order, with checks between each step):
@@ -16,7 +16,7 @@
 #      after a DBANK change because the ECC word format differs (RM0440
 #      pp.119-120). Asks for confirmation first; a virgin board has nothing
 #      to lose. If DBANK is already 0 the switch AND the erase are skipped —
-#      an already-provisioned board (e.g. the old bench board) keeps its
+#      an already-provisioned board keeps its
 #      saved settings.
 #   3. Flashes Debug/stm_detector3.elf with verify + reset, if it exists
 #      (skip with --no-flash).

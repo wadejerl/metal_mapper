@@ -1300,7 +1300,7 @@ finally:
 
 # On the Pi: ONE `systemctl is-active a b c` call — one state per stdout
 # line in argument order; the nonzero exit (any unit inactive) is noise.
-_units = sorted(p.name for p in db_map._REPO_DIR.glob('*.service'))
+_units = sorted(p.name[:-3] for p in db_map._REPO_DIR.glob('*.service.in'))
 _lines = ['active'] * len(_units)
 _lines[0] = 'failed'
 _real_run = db_map.subprocess.run
@@ -1796,7 +1796,7 @@ db_map.CONFIG_FILE.write_text(json.dumps(
 db_map._cli_overrides.clear()
 cfg = db_map.load_config()
 check('config type fallback',
-      cfg['nav_port'] == 50012
+      cfg['nav_port'] == 50010
       and isinstance(cfg['studies_dir'], str) and cfg['nav_host'] == '127.0.0.1'
       and cfg['heading_offset_deg'] == 270,
       repr(cfg))

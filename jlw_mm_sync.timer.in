@@ -1,3 +1,5 @@
+# Template — install_pi_system.sh renders this to /etc/systemd/system/jlw_mm_sync.timer,
+# filling the @MM_*@ placeholders from the checkout and install.conf.
 [Unit]
 Description=Metal Mapper studies sync every 30 s
 

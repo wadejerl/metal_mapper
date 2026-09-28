@@ -20,7 +20,7 @@ baud is fixed in serial_daemon.py (custom system, one console rate);
 CLI flags override for bench runs, e.g. on a Mac with the hardware:
 
     python3 db_map.py --serial-port /dev/cu.usbmodem1103 \\
-                      --nav-host 192.168.1.50 --nav-port 50012
+                      --nav-host 192.168.1.50 --nav-port 50010
 
 Deployment (Pi): gunicorn 'db_map:app' — workers=1, gthread. Every open
 map view holds one SSE thread, and a client that vanishes without FIN
@@ -73,14 +73,14 @@ RAW_DB = os.path.join(tempfile.gettempdir(), 'metal_mapper_raw.db')
 DEFAULT_CONFIG = {
     'serial_port': '/dev/ttyACM0',
     'nav_host':    '127.0.0.1',
-    'nav_port':    50012,
+    'nav_port':    50010,
     'studies_dir': str(Path.home() / 'metal_mapper' / 'studies'),
     # Added to the GPS-reported heading before coil geometry — corrects a
     # heading aligned to the antenna baseline instead of direction of travel.
     # A property of the vehicle mounting, so it lives here, not per study.
     'heading_offset_deg': 270,
     # rsync destination for the studies hub (the RTK base Pi), e.g.
-    # 'rsync://northpole:8730/mm_studies'. Empty = sync disabled;
+    # 'rsync://<base-pi>:8730/mm_studies'. Empty = sync disabled;
     # sync_studies.sh (run by jlw_mm_sync.timer) reads it from here.
     'sync_hub': '',
 }
@@ -186,8 +186,8 @@ def ensure_leaflet():
 ensure_leaflet()
 
 # resolve(): on the Pi this file is a SYMLINK in /opt/metal_mapper pointing
-# into the git checkout — .parent of the link is /opt (no .git, no *.service
-# files), .parent of the resolved path is the repo.
+# into the git checkout — .parent of the link is /opt (no .git, no *.service.in
+# templates), .parent of the resolved path is the repo.
 _REPO_DIR = Path(__file__).resolve().parent
 
 _VERSION_FILE = _REPO_DIR / 'version.txt'
@@ -730,7 +730,7 @@ def derive_status(db_path, meta=None):
                             '— it may be running stale settings (boot burst '
                             'and re-sends unanswered; reset the MCU with the '
                             'GPS already powered)')
-        for kind in ('timing', 'geometry', 'fire'):
+        for kind in ('timing', 'geometry'):
             v = meta.get(kind + '_changed')
             if v:
                 diffs = v.split(':', 1)[1] if ':' in v else v
@@ -1056,7 +1056,8 @@ def _ttl_cached(cache, fetch):
 
 
 def service_states():
-    """State of every repo-root *.service unit as {unit_filename: state},
+    """State of every unit templated in the repo root (*.service.in, rendered
+    by install_pi_system.sh under the same name minus .in) as {unit: state},
     or None off the Pi (no systemctl) so callers hide the panel entirely.
 
     `systemctl is-active a b c` prints one state per line in argument
@@ -1067,7 +1068,7 @@ def service_states():
     """
     # _REPO_DIR, not .parent: on the Pi the units live in the checkout, not
     # in /opt/metal_mapper where this file is symlinked from.
-    units = sorted(p.name for p in _REPO_DIR.glob('*.service'))
+    units = sorted(p.name[:-3] for p in _REPO_DIR.glob('*.service.in'))
     if not units or not os.path.exists(SYSTEMCTL_BIN):
         return None
 

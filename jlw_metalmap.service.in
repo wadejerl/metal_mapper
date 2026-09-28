@@ -1,10 +1,12 @@
+# Template — install_pi_system.sh renders this to /etc/systemd/system/jlw_metalmap.service,
+# filling the @MM_*@ placeholders from the checkout and install.conf.
 [Unit]
 Description=Metal Mapper Web UI
 After=network.target
 
 [Service]
-User=pi
-Group=pi
+User=@MM_USER@
+Group=@MM_USER@
 WorkingDirectory=/opt/metal_mapper
 Environment="PATH=/opt/metal_mapper/venv/bin"
 ExecStart=/opt/metal_mapper/venv/bin/gunicorn \

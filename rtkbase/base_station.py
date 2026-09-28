@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Base Station Configuration Tool- Mostly written by Claude-code based on my base_stn.py
+Base Station Configuration Tool — mostly written by Claude Code from an earlier
+hand-written survey-in script (retired August 2026; it survives in the v0.1 tag).
 
 This script configures a GNSS receiver (Quectel) to operate as a base station
 with RTCM output and Survey-In mode.  
@@ -48,7 +49,7 @@ class BaseStation:
         Initialize the BaseStation controller.
 
         Args:
-            port (str): Serial port path (e.g., '/dev/cu.usbmodem59320022501')
+            port (str): Serial port path (e.g., '/dev/ttyACM0')
             baudrate (int): Baud rate for serial communication (default: 460800)
             timeout (int): Serial port timeout in seconds (default: 3)
             wait_for_svin (bool): Wait for survey-in to complete before exiting (default: False)
@@ -264,8 +265,8 @@ if __name__ == "__main__":
     parser.add_option(
         "-p", "--port",
         dest="port",
-        default="/dev/cu.usbmodem59320022501",
-        help="Serial port path (default: /dev/cu.usbmodem59320022501)",
+        default="/dev/ttyACM0",
+        help="Serial port path (default: /dev/ttyACM0)",
         metavar="PORT"
     )
 

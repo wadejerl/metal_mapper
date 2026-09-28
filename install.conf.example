@@ -1,0 +1,13 @@
+# install.conf — site overrides for install_pi_system.sh (copy to install.conf,
+# which is gitignored). Plain KEY=value lines; the installer sources it.
+# Every value has a default, so a stock head unit needs no install.conf at all.
+#
+# Hostname or IP of the RTK base station Pi (NTRIP caster on :2101). The
+# jlw_rover_rtk* units wait for it before starting their correction clients.
+#MM_BASE_HOST=northpole   # default: northpole (the base Pi — a fixed beacon)
+#
+# Normally derived, override only if the defaults are wrong for your box:
+#MM_USER=pi            # account the services run as (default: the sudo user /
+#                      #   owner of the checkout)
+#MM_HOME=/home/pi      # its home — the pygnssutils venv is expected at
+#                      #   $MM_HOME/pygpsclient (gnssserver, gnssntripclient)

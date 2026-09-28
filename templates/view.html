@@ -16,7 +16,31 @@
       background:rgba(0,0,0,0.88); color:#fff; padding:6px 14px;
       z-index:1000; display:flex; align-items:center; gap:14px; overflow:hidden;
     }
-    #map { position:absolute; left:0; right:0; bottom:0; }
+    /* #mapWrap is the viewport; #map inside it is an oversized square (side =
+       the viewport diagonal) rotated for heading-up / target-up, so its
+       corners always cover the viewport — see "Map orientation" in the JS */
+    /* overflow:clip, not hidden — hidden still makes this a scroll
+       container, and Leaflet focusing the map on a tap (keyboard handler)
+       scrolls the oversized square into view: the map jumps 250px up */
+    #mapWrap { position:absolute; left:0; right:0; bottom:0;
+               overflow:hidden; overflow:clip; --rot:0deg; --unrot:0deg; }
+    /* rotation is an inline transform driven per frame from JS — a CSS
+       transition on rotate(var(--rot)) never left 0° in Chromium 152 */
+    #map { position:absolute; transform-origin:50% 50%; }
+    /* orientation control: bottom-right, above the attribution line */
+    #rotCtl { position:absolute; right:8px; bottom:22px; z-index:1000;
+              display:flex; align-items:center; gap:4px; padding:4px;
+              background:rgba(0,0,0,0.65); border-radius:6px; }
+    .rot-btn { background:#333; color:#ccc; border:1px solid #666;
+               border-radius:4px; min-width:58px; height:40px; padding:0 6px;
+               font-size:13px; font-weight:bold; cursor:pointer; }
+    .rot-btn.on { background:#1976d2; color:#fff; border-color:#64b5f6; }
+    /* target-up with no target selected, heading-up with no course yet */
+    .rot-btn.on.dim { background:#1a3a5c; color:#8fb3d9; }
+    #northArrow { width:36px; height:40px; color:#fff; text-align:center;
+                  font:bold 11px/13px sans-serif; padding-top:5px;
+                  transform:rotate(var(--rot)); }
+    #northArrow div { font-size:16px; line-height:16px; color:#ff5252; }
     .toolbar-sep { width:1px; background:rgba(255,255,255,0.15);
                    align-self:stretch; margin:4px 0; }
     #title-block { display:flex; flex-direction:column; gap:4px; min-width:120px; }
@@ -37,6 +61,10 @@
     .tgt-pin { width:22px; height:22px; border-radius:50% 50% 50% 0;
                transform:rotate(-45deg); background:#ff9500;
                border:2px solid #000; box-shadow:0 0 3px #000; }
+    /* counter-rotation about the pin TIP (13,31 — see tgtIcon) keeps the
+       number upright while the map turns, with the tip fixed on the spot */
+    .tgt-rot { width:26px; height:26px; transform-origin:13px 31px;
+               transform:rotate(var(--unrot)); }
     .tgt-pin span { display:block; transform:rotate(45deg);
                     font:bold 12px/20px sans-serif; color:#000;
                     text-align:center; }
@@ -177,7 +205,12 @@
 
   <div style="display:flex; flex-direction:column; gap:5px;">
     <button class="btn btn-blue" onclick="recalibrate()">{{ ic.target(14) }} Re-zero</button>
-    <button id="pauseBtn" class="btn btn-green" onclick="togglePause()">{{ ic.pause(14, 'ic-pause') }}{{ ic.play(14, 'ic-play', true) }} <span id="pauseLbl">Pause</span></button>
+    {# Map auto-pan only. It was "Pause / Resume", which read as pausing the
+       recording next to the banner's motion-gate PAUSED state — a base
+       operator marking a live study from a laptop needs to turn THIS off
+       without fearing for the survey. Recording never depends on it. #}
+    <button id="followBtn" class="btn btn-green" onclick="toggleFollow()"
+            title="Follow: the map pans to the newest recorded point as it arrives. Turn OFF to pan/zoom/mark freely while the study keeps recording — this only affects your screen, never the recording.">{{ ic.follow(14) }} <span id="followLbl">Follow ON</span></button>
   </div>
 
   <div class="sliders-col">
@@ -281,7 +314,19 @@
 
 <div id="metaPanel"></div>
 
-<div id="map"></div>
+<div id="mapWrap">
+  <div id="map"></div>
+  {# Map orientation. Big targets: this is tapped from the driver's seat. #}
+  <div id="rotCtl">
+    <div id="northArrow" title="Where north is"><div>▲</div>N</div>
+    <button class="rot-btn" data-mode="north" onclick="setRotMode('north')"
+            title="North up">N ↑</button>
+    <button class="rot-btn" data-mode="heading" onclick="setRotMode('heading')"
+            title="Heading up: the nav GPS's direction of travel points up. Holds the last heading while parked.">HDG ↑</button>
+    <button class="rot-btn" data-mode="target" onclick="setRotMode('target')"
+            title="Target up: the selected dig target is straight up from the nav fix. North up until a target is selected.">TGT ↑</button>
+  </div>
+</div>
 
 {# Approach guidance: shown while a dig target is selected. Big arrow +
    distance — this is read from the driver's seat on the 800x480 kiosk. #}
@@ -329,7 +374,8 @@ const CH_COLORS = MM.CH_COLORS;     // one palette, shared with the raw view
 // ── State ─────────────────────────────────────────────────────────────────────
 const store    = MM.PointStore();   // columnar; no per-point JS objects
 let lastId     = 0;
-let isPaused   = false;
+let followMap  = true;         // toolbar Follow: auto-pan to the newest
+                               // recorded point; per browser, display only
 let meta       = {};
 let calib      = {zero8: null, bias8: [0, 0, 0, 0, 0, 0, 0, 0],
                   offset: -140, plusRange: 450, minusRange: 450};
@@ -346,12 +392,37 @@ let geom       = {spacing_mm: 330, fore_mm: 0, right_mm: 500, rot_deg: 270};
 let adcLabels  = [];
 
 // ── Layout: keep banner/toolbar/map stacked whatever the banner height ───────
+const mapWrap = document.getElementById('mapWrap');
+const mapEl   = document.getElementById('map');
+// Leaflet's keyboard handler focuses the container on every mousedown, and
+// a focus scrolls the nearest scroll container to reveal the element — with
+// overflow:hidden (a Chromium without overflow:clip) that is #mapWrap, and
+// the oversized square would jump ~250px. Focus without scrolling, and
+// undo any scroll that gets through anyway.
+mapEl.focus = function () { HTMLElement.prototype.focus.call(this, {preventScroll: true}); };
+mapWrap.addEventListener('scroll', () => { mapWrap.scrollTop = 0; mapWrap.scrollLeft = 0; });
 function relayout() {
   const bannerH  = document.getElementById('banner').offsetHeight;
   const toolbar  = document.getElementById('toolbar');
   toolbar.style.top = bannerH + 'px';
   const mapTop = bannerH + toolbar.offsetHeight;
-  document.getElementById('map').style.top = mapTop + 'px';
+  mapWrap.style.top = mapTop + 'px';
+  // the rotated square: side = viewport diagonal, centered on the viewport
+  const W = mapWrap.clientWidth, H = mapWrap.clientHeight;
+  const S = Math.ceil(Math.hypot(W, H));
+  mapEl.style.width = S + 'px';  mapEl.style.height = S + 'px';
+  mapEl.style.left = ((W - S) / 2) + 'px';  mapEl.style.top = ((H - S) / 2) + 'px';
+  // Leaflet's zoom/scale/attribution controls live inside the square; pin
+  // their box to the visible viewport and counter-rotate it so they stay
+  // put and upright. pointer-events:none on the box — the controls
+  // re-enable their own — or it would eat every pin tap under it.
+  const cc = mapEl.querySelector('.leaflet-control-container');
+  if (cc) {
+    cc.style.cssText = 'position:absolute; z-index:1000; pointer-events:none;' +
+      ' left:' + ((S - W) / 2) + 'px; top:' + ((S - H) / 2) + 'px;' +
+      ' width:' + W + 'px; height:' + H + 'px;' +
+      ' transform-origin:50% 50%; transform:rotate(var(--unrot));';
+  }
   document.getElementById('metaPanel').style.top = (mapTop + 8) + 'px';
   document.getElementById('tgtPanel').style.top = (mapTop + 10) + 'px';
   document.getElementById('biasPanel').style.top = (mapTop + 10) + 'px';
@@ -478,7 +549,7 @@ function tgtIcon(t) {
   // The -45° rotation swings the pin's sharp corner to (13, 13+13·√2):
   // anchor THERE so the visible tip sits exactly on the marked lat/lon.
   return L.divIcon({className: '', iconSize: [26, 26], iconAnchor: [13, 31],
-    html: `<div class="tgt-pin${cls}"><span>${t.id}</span></div>`});
+    html: `<div class="tgt-rot"><div class="tgt-pin${cls}"><span>${t.id}</span></div></div>`});
 }
 
 function renderTargets() {
@@ -498,6 +569,7 @@ function renderTargets() {
   });
   if (selTargetKey != null && !keys.has(selTargetKey)) selTargetKey = null;
   updateApproach();
+  updateRotation();
 }
 
 function setTargets(list) {
@@ -554,6 +626,7 @@ function selectTarget(key) {
   selTargetKey = key;
   targets.forEach(t => tgtMarkers[t.key] && tgtMarkers[t.key].setIcon(tgtIcon(t)));
   updateApproach();
+  updateRotation();
 }
 
 function updateApproach() {
@@ -644,6 +717,123 @@ function updateApproach() {
 // self-tick keeps the gate honest regardless of stream liveness.
 setInterval(() => { if (selTargetKey != null) updateApproach(); }, 1000);
 
+// ── Map orientation: north-up / heading-up / target-up ──────────────────────
+// Leaflet 1.9 has no rotation. The whole #map (an oversized square, see
+// relayout) is rotated with CSS inside #mapWrap, which clips it. Everything
+// Leaflet does internally — projections, panes, the canvas point layer,
+// pinch/wheel zoom math — stays in the container frame and needs no change;
+// only the screen↔container boundary has to be fixed:
+//   1. mouseEventToContainerPoint: every pointer event (click → target,
+//      hitTest, pinch, wheel) becomes a container point here — un-rotate
+//      the screen vector about the square's center.
+//   2. Draggable._updatePosition: the map drag moves the pane by RAW client
+//      pixel deltas (scaled by the parent's bounding box, which is the
+//      rotated square's AABB) — recompute the delta in the container frame.
+// Things that must read upright — pin numbers, popups, the zoom/scale
+// controls — counter-rotate by var(--unrot); the nav arrow does NOT, so in
+// heading-up it points up, as it should. Tooltips (hover only) turn with
+// the map. Angles are kept continuous (see arrowDeg): 359°→1° must be +2°,
+// not a wrong-way spin. The turn is tweened over 0.4 s in JS (rotShown
+// chases rotDeg) and written as an inline transform each frame; every
+// screen↔container conversion uses rotShown, the angle actually drawn.
+let rotMode  = localStorage.getItem('mapRot') || 'north';
+let rotDeg   = 0;               // target CSS angle of #map (= −"up" bearing)
+let rotShown = 0;               // angle on screen right now
+let rotFrom = 0, rotT0 = 0, rotRaf = 0;
+
+function currentRotRad() { return rotShown * RAD; }
+function applyRot(a) {
+  rotShown = a;
+  mapEl.style.transform = 'rotate(' + a + 'deg)';
+  mapWrap.style.setProperty('--rot', a + 'deg');
+  mapWrap.style.setProperty('--unrot', (-a) + 'deg');
+}
+function rotStep(now) {
+  const k = Math.min(1, (now - rotT0) / 400);
+  applyRot(rotFrom + (rotDeg - rotFrom) * k);
+  rotRaf = k < 1 ? requestAnimationFrame(rotStep) : 0;
+}
+function tweenRot() {           // (re)start from wherever the map is now
+  rotFrom = rotShown; rotT0 = performance.now();
+  if (!rotRaf) rotRaf = requestAnimationFrame(rotStep);
+}
+function unrotate(x, y) {       // screen-frame vector → container frame
+  const th = currentRotRad();
+  if (!th) return [x, y];
+  const c = Math.cos(th), s = Math.sin(th);
+  return [x * c + y * s, -x * s + y * c];
+}
+const origM2C = L.Map.prototype.mouseEventToContainerPoint;
+L.Map.prototype.mouseEventToContainerPoint = function (e) {
+  if (this._container !== mapEl) return origM2C.call(this, e);
+  const r = mapEl.getBoundingClientRect();   // AABB of the rotated square;
+  const [x, y] = unrotate(e.clientX - (r.left + r.width / 2),   // its center
+                          e.clientY - (r.top + r.height / 2));  // is the pivot
+  return L.point(x + mapEl.clientWidth / 2, y + mapEl.clientHeight / 2);
+};
+const origUpd = L.Draggable.prototype._updatePosition;
+L.Draggable.prototype._updatePosition = function () {
+  if (this._element === mapObj._mapPane && this._startPos && this._newPos) {
+    const ps = this._parentScale || {x: 1, y: 1};
+    const [dx, dy] = unrotate((this._newPos.x - this._startPos.x) * ps.x,
+                              (this._newPos.y - this._startPos.y) * ps.y);
+    this._newPos = this._startPos.add(L.point(dx, dy));
+  }
+  return origUpd.call(this);
+};
+// Popups: counter-rotate about the anchored lat/lon — the box bottom sits
+// 13px above it (20px margin − Leaflet's 7px default offset). Re-applied
+// after every reposition, so an open popup follows a turning map.
+function popupUpright(p) {
+  const c = p._container;
+  if (!c) return;
+  c.style.transformOrigin = '50% calc(100% + 13px)';
+  c.style.transform += ' rotate(var(--unrot))';
+}
+['_updatePosition', '_animateZoom'].forEach(m => {
+  const orig = L.Popup.prototype[m];
+  L.Popup.prototype[m] = function () {
+    const r = orig.apply(this, arguments); popupUpright(this); return r;
+  };
+});
+
+function setRotMode(mode) {
+  rotMode = mode;
+  localStorage.setItem('mapRot', mode);
+  updateRotation();
+}
+function updateRotation() {
+  const nv = lastNav;
+  const navOk = nv && nv.connected && nv.lat != null && !nv.stale;
+  let up = null;                // bearing that should point up; null = hold
+  let dim = false;
+  if (rotMode === 'heading') {
+    // COG is noise when parked (same gate as the nav arrow): hold the last
+    // heading, like a car's nav does at a stop
+    if (navOk && nv.cog_deg != null && nv.speed_mps != null
+        && nv.speed_mps >= 0.5) up = nv.cog_deg;
+    else dim = true;
+  } else if (rotMode === 'target') {
+    const t = targets.find(x => x.key === selTargetKey);
+    if (!t) { up = 0; dim = true; }
+    else if (navOk) up = bearingTo(nv.lat, nv.lon, t.lat, t.lon);
+    else dim = true;            // no fix: hold
+  } else {
+    up = 0;
+  }
+  if (up != null) {
+    const want = ((-up % 360) + 360) % 360;
+    const cur  = ((rotDeg % 360) + 360) % 360;
+    const step = ((want - cur + 540) % 360) - 180;
+    if (step) { rotDeg += step; tweenRot(); }
+  }
+  document.querySelectorAll('#rotCtl .rot-btn').forEach(b => {
+    const on = b.dataset.mode === rotMode;
+    b.classList.toggle('on', on);
+    b.classList.toggle('dim', on && dim);
+  });
+}
+
 // ── Channel strip chart (shared MM.StripChart, one scale for all channels) ───
 // Fed by the daemon's live sample stream, so it scrolls at the full ADC rate
 // whether or not there is a GPS fix or recording. Saved studies have no
@@ -698,7 +888,7 @@ const GPS_CFG_LABELS = {
 };
 
 // Curated view of the study's meta table. [meta key, label, formatter?].
-// Timing/geometry/fire keys are drift-aware: if the daemon recorded a
+// Timing/geometry keys are drift-aware: if the daemon recorded a
 // <key>_current diverging from the stamped header, both values show.
 const META_GROUPS = [
   ['Recording', [
@@ -711,7 +901,6 @@ const META_GROUPS = [
   ]],
   ['Detector firmware', [
     ['fw_git_hash',    'fw build'],
-    ['fire_mode',      'fire mode'],
     ['sample_rate_hz', 'sample rate',    v => v + ' Hz'],
     ['adc_oversample', 'adc oversample', v => v + '×'],
     ['adc_order',      'adc order'],
@@ -733,7 +922,7 @@ const META_GROUPS = [
     ['coil_offset_right_mm', 'right offset'],
   ]],
 ];
-const META_DRIFT_FLAGS = ['timing_changed', 'geometry_changed', 'fire_changed'];
+const META_DRIFT_FLAGS = ['timing_changed', 'geometry_changed'];
 
 function fmtEpoch(v) {
   const t = parseFloat(v);
@@ -965,6 +1154,7 @@ function updateNav(nv) {
   lastNavAt = Date.now();
   navLayer.update(nv);
   if (selTargetKey != null) updateApproach();
+  updateRotation();
   const el = document.getElementById('navLine');
   if (nv && nv.connected && nv.lat != null && !nv.stale) {
     el.className = 'nav-chip nav-ok';
@@ -1051,14 +1241,13 @@ function recalibrate() {
     });
 }
 
-function togglePause() {
-  isPaused = !isPaused;
-  const btn = document.getElementById('pauseBtn');
-  btn.querySelector('.ic-pause').hidden = isPaused;
-  btn.querySelector('.ic-play').hidden = !isPaused;
-  document.getElementById('pauseLbl').textContent =
-      isPaused ? 'Resume' : 'Pause';
-  btn.style.background = isPaused ? '#c62828' : '';
+function toggleFollow() {
+  followMap = !followMap;
+  const btn = document.getElementById('followBtn');
+  btn.classList.toggle('btn-green', followMap);
+  btn.classList.toggle('btn-grey', !followMap);
+  document.getElementById('followLbl').textContent =
+      followMap ? 'Follow ON' : 'Follow OFF';
 }
 
 // ── Study rename (label only — the .db filename / URL never changes) ─────────
@@ -1330,7 +1519,7 @@ function openSSE() {
       renderer.markDirty();
       document.getElementById('ptCount').textContent = store.length;
       const latest = rows[rows.length - 1];
-      if (!isPaused) mapObj.panTo([latest.lat, latest.lon],
+      if (followMap) mapObj.panTo([latest.lat, latest.lon],
                                   {animate: true, duration: 0.25});
     }
     // Sample stream feeds the strip chart at the full ADC rate — flowing
@@ -1375,6 +1564,7 @@ function openSSE() {
 }
 
 window.addEventListener('resize', relayout);
+updateRotation();
 </script>
 </body>
 </html>

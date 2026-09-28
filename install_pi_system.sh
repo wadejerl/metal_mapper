@@ -1,14 +1,21 @@
 #!/bin/bash
 # install_pi_system.sh — set up the system side of a fresh(ish) Pi from this
-# repo checkout. Idempotent: safe to re-run after adding a new .service file
+# repo checkout. Idempotent: safe to re-run after adding a new unit template
 # or moving the checkout. Grows as the system does — add new setup sections
 # at the bottom.
 #
 #   ./install_pi_system.sh
 #
-# Units are SYMLINKED into /etc/systemd/system (not copied), so a `git pull`
-# updates them in place — run `sudo systemctl daemon-reload` after a pull
-# that touches unit files.
+# Units are RENDERED from the *.service.in / *.timer.in templates in the
+# repo root into /etc/systemd/system (real files, not symlinks): the
+# @MM_*@ placeholders take the service user (whoever ran sudo), its home,
+# this checkout's path, and the RTK base host — `northpole` unless the
+# gitignored install.conf (see install.conf.example) says otherwise.
+# So after a `git pull` that touches a template, re-run this script — it
+# re-renders and daemon-reloads. (Pre-Sept-2026 installs symlinked the
+# unit files; run this right after the pull that brought the templates —
+# BEFORE any daemon-reload or reboot — and it replaces those links, which
+# dangle now that the files they pointed at are *.in templates.)
 set -euo pipefail
 
 command -v systemctl >/dev/null 2>&1 || {
@@ -34,20 +41,77 @@ if [ "$REPO" = "/opt/metal_mapper" ]; then
     exit 1
 fi
 
-# ── systemd units: symlink + enable every .service/.timer in the repo root ─
+# ── site config + the values the unit templates need ──────────────────────
+# install.conf is gitignored and sourced as shell (KEY=value lines only).
+if [ -f "$REPO/install.conf" ]; then
+    # shellcheck disable=SC1091
+    . "$REPO/install.conf"
+fi
+# The units run as the checkout's user; that user also owns the app dir so
+# python can drop __pycache__ there and overlays can be added sans sudo.
+SVC_USER="${MM_USER:-${SUDO_USER:-$(stat -c %U "$REPO/db_map.py")}}"
+if ! id -u "$SVC_USER" >/dev/null 2>&1; then
+    echo "error: service user '$SVC_USER' does not exist on this box — check" \
+         "MM_USER in install.conf, or run this from the account that owns the" \
+         "checkout. (Nothing has been changed.)" >&2
+    exit 1
+fi
+SVC_HOME="${MM_HOME:-$(getent passwd "$SVC_USER" | cut -d: -f6)}"
+SVC_HOME="${SVC_HOME:-/home/$SVC_USER}"
+# The RTK base station Pi's hostname (NTRIP caster on :2101), for the
+# jlw_rover_rtk* units. The base is called northpole — a fixed beacon.
+MM_BASE_HOST="${MM_BASE_HOST:-northpole}"
+# The values are spliced into the templates by sed and land unquoted in
+# ExecStart= lines: whitespace, sed's | & \ and systemd's $ % " ' would be
+# mangled or split — a checkout at "~/Metal Mapper" would exec "~/Metal".
+for kv in "MM_USER=$SVC_USER" "MM_HOME=$SVC_HOME" "MM_REPO=$REPO" "MM_BASE_HOST=$MM_BASE_HOST"; do
+    case "${kv#*=}" in
+        ''|*[[:space:]\|\&\\\$%\"\']*)
+            echo "error: ${kv%%=*}='${kv#*=}' is empty or contains whitespace or one" \
+                 "of | & \\ \$ % \" ' — that cannot be rendered into a systemd unit." \
+                 "Use a plainer path/name. (Nothing has been changed.)" >&2
+            exit 1;;
+    esac
+done
+echo "service user: $SVC_USER ($SVC_HOME)   rtk base: $MM_BASE_HOST"
+
+# ── systemd units: render + enable every template in the repo root ────────
 # (rtkbase/ units are the base Pi's and are deployed there by hand — only
 # the repo ROOT's units belong on a head unit.)
 shopt -s nullglob
-units=("$REPO"/*.service "$REPO"/*.timer)
-if [ ${#units[@]} -eq 0 ]; then
-    echo "error: no .service/.timer files found in $REPO" >&2
+templates=("$REPO"/*.service.in "$REPO"/*.timer.in)
+if [ ${#templates[@]} -eq 0 ]; then
+    echo "error: no *.service.in / *.timer.in templates found in $REPO" >&2
     exit 1
 fi
 
-for unit in "${units[@]}"; do
-    name="$(basename "$unit")"
-    ln -sfn "$unit" "/etc/systemd/system/$name"
-    echo "linked  /etc/systemd/system/$name -> $unit"
+units=()
+for tpl in "${templates[@]}"; do
+    name="$(basename "${tpl%.in}")"
+    dest="/etc/systemd/system/$name"
+    rendered="$(sed -e "s|@MM_USER@|$SVC_USER|g" -e "s|@MM_HOME@|$SVC_HOME|g" \
+                    -e "s|@MM_REPO@|$REPO|g" -e "s|@MM_BASE_HOST@|$MM_BASE_HOST|g" \
+                    "$tpl")"
+    left="$(printf '%s\n' "$rendered" | grep -o '@MM_[A-Z_]*@' | sort -u || true)"
+    if [ -n "$left" ]; then
+        echo "error: $name: unfilled placeholder(s): $(echo $left)" >&2
+        exit 1
+    fi
+    # an older install symlinked the repo file here — that link now points
+    # at a template full of @MM_*@, so it must become a real file
+    if [ -L "$dest" ]; then
+        rm -f "$dest"
+        echo "unlinked $dest (was a symlink into the checkout)"
+    fi
+    if [ -f "$dest" ] && [ "$(cat "$dest")" = "$rendered" ]; then
+        echo "current  $dest"
+    else
+        printf '%s\n' "$rendered" > "$dest.tmp"
+        chmod 644 "$dest.tmp"
+        mv -f "$dest.tmp" "$dest"
+        echo "rendered $dest <- $(basename "$tpl")"
+    fi
+    units+=("$dest")
 done
 
 systemctl daemon-reload
@@ -68,9 +132,7 @@ done
 # Symlinks, not copies: a `git pull` in the checkout updates the app in
 # place (restart gunicorn after — templates are cached at start).
 OPT=/opt/metal_mapper
-# The unit runs as the checkout's user; that user owns the app dir so
-# python can drop __pycache__ there and overlays can be added sans sudo.
-SVC_USER="${SUDO_USER:-$(stat -c %U "$REPO/db_map.py")}"
+# owned by the service user (see SVC_USER above)
 install -d -o "$SVC_USER" -g "$SVC_USER" "$OPT"
 
 app_files=(db_map.py serial_daemon.py nav_gps.py gunicorn_config.py

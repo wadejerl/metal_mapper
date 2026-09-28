@@ -29,6 +29,15 @@ import serial_daemon as sd  # noqa: E402
 
 SCRIPT = os.path.join(REPO, 'sync_studies.sh')
 
+# GNU rsync >= 3.1 (the Pis) skips a --files-from entry the hub lacks
+# silently when told --ignore-missing-args; openrsync (Mac bench) cannot,
+# so a few checks below relax to "tolerated" there. To run the battery the
+# way the field runs it, put a GNU rsync first on PATH.
+HAVE_IMA = subprocess.run(['rsync', '--ignore-missing-args', '--version'],
+                          capture_output=True).returncode == 0
+RSYNC_FLAVOR = subprocess.run(['rsync', '--version'], capture_output=True,
+                              text=True).stdout.splitlines()[0].strip()
+
 FAILED = []
 
 
@@ -105,7 +114,8 @@ def sidecar(tag, study_stem, owner, targets):
     return p
 
 
-print('sync_studies.sh:')
+print(f'sync_studies.sh:  (rsync on PATH: {RSYNC_FLAVOR}; '
+      f'--ignore-missing-args {"yes" if HAVE_IMA else "no"})')
 
 # ── disabled / unreachable are quiet no-ops ──────────────────────────────────
 nocfg = os.path.join(SCRATCH, 'nohub.json')
@@ -141,6 +151,11 @@ check('hub got study + sidecar + log',
       and os.path.exists(os.path.join(
           HUB, 'a1_1758000001__unitA.targets__unitA.json'))
       and os.path.exists(os.path.join(HUB, 'a1_1758000001__unitA.log')),
+      sorted(os.listdir(HUB)))
+# no live study this cycle: the stage's own work files (the sidecar
+# validity list, rsync lists) must not ride the snapshot push to the hub
+check('no stage work file leaks to the hub (no dotfiles)',
+      not [n for n in os.listdir(HUB) if n.startswith('.')],
       sorted(os.listdir(HUB)))
 
 r = run_sync('unitB')
@@ -297,6 +312,52 @@ btrap = os.path.join(UNITS['unitB']['sdir'], 'my__probe_1758.db')
 check('legacy pulled where absent',
       points_in(bleg) == 2 and points_in(btrap) == 2)
 
+# steady state with studies nobody ever flagged on (every legacy one, the
+# closed own ones): the restore pass asks the hub for sidecars it does not
+# have. GNU rsync is told to skip those silently — the journal shows only
+# the script's own lines; openrsync still logs one line per cycle, which
+# run_rsync tolerates
+r = run_sync('unitA')
+if HAVE_IMA:
+    check('un-flagged studies: quiet cycle, empty stderr (GNU rsync)',
+          r.returncode == 0 and 'cycle ok' in r.stdout and r.stderr == '',
+          (r.returncode, r.stdout, r.stderr))
+else:
+    check('un-flagged studies: cycle ok (openrsync: hub misses tolerated)',
+          r.returncode == 0 and 'cycle ok' in r.stdout,
+          (r.returncode, r.stdout, r.stderr))
+
+# a pre-sync session that crashed with its wal hot: --seed used to skip it
+# without a word. Now it ships a consistent snapshot WITH the wal's rows
+# and folds the wal in for later cycles, like the push loop does
+wleg = make_study('unitA', 'legacy_walhot', n_points=1)
+crash_code = f'''
+import os, sys
+sys.path.insert(0, {REPO!r})
+import serial_daemon as sd
+conn = sd.db_open({wleg!r})
+sd.insert_rows(conn, [{{'lat': 40.9, 'lon': -119.9, 'heading': 90.0,
+                        'fix': 4, 'adc': [5] * 8, 'gps_ts': '5'}}] * 3,
+               12.4, 25.0)
+os._exit(0)   # no close: -wal holds the 3 rows
+'''
+subprocess.run([sys.executable, '-c', crash_code], check=True)
+assert os.path.getsize(wleg + '-wal') > 0, 'legacy crash sim left no hot wal?'
+r = run_sync('unitA', '--seed')
+check('--seed ships a wal-hot legacy db as a snapshot WITH its wal rows',
+      r.returncode == 0
+      and 'seeding snapshot of wal-hot legacy_walhot.db' in r.stdout
+      and points_in(os.path.join(HUB, 'legacy_walhot.db')) == 4
+      and wal_gone(wleg + '-wal'),
+      (r.returncode, r.stdout, r.stderr,
+       points_in(os.path.join(HUB, 'legacy_walhot.db'))))
+r = run_sync('unitA', '--seed')
+check('re-seed after the heal: plain file, nothing re-shipped, no dotfiles on hub',
+      r.returncode == 0 and 'wal-hot' not in r.stdout
+      and points_in(os.path.join(HUB, 'legacy_walhot.db')) == 4
+      and not [n for n in os.listdir(HUB) if n.startswith('.')],
+      (r.returncode, r.stdout, sorted(os.listdir(HUB))))
+
 # B tweaks its local copy (view settings); hub's copy also changes. Neither
 # side may clobber B's local edit — legacy files are write-once in transit.
 conn = sqlite3.connect(bleg)
@@ -442,6 +503,11 @@ check('0-point study: sidecar and log held back too', r.returncode == 0
       and not os.path.exists(os.path.join(HUB, 'zs_1758000010__unitA.db'))
       and not os.path.exists(os.path.join(
           HUB, 'zs_1758000010__unitA.targets__unitA.json'))
+      and not os.path.exists(os.path.join(HUB, 'zs_1758000010__unitA.log')),
+      (r.returncode, r.stdout, sorted(os.listdir(HUB))))
+r = run_sync('unitA', '--seed')
+check("--seed holds back a 0-point study's log too", r.returncode == 0
+      and 'seed skipping zs_1758000010__unitA.log (0-point study)' in r.stdout
       and not os.path.exists(os.path.join(HUB, 'zs_1758000010__unitA.log')),
       (r.returncode, r.stdout, sorted(os.listdir(HUB))))
 conn = sd.db_open(zs)
@@ -677,6 +743,9 @@ try:
         make_study('unitD', 'd1_1758000009__unitD', n_points=2)
         sidecar('unitD', 'd1_1758000009__unitD', 'unitD',
                 [{'id': 1, 'lat': 40.0, 'lon': -119.0, 'created_at': 1.0}])
+        # a second own study nobody flagged on: its sidecar is a hub miss
+        # for the restore pass over the daemon — the field's noise case
+        make_study('unitD', 'd2_1758000014__unitD', n_points=1)
         shutil.copy(os.path.join(HUB, 'a1_1758000001__unitA.db'),
                     os.path.join(mod_dir, 'a1_1758000001__unitA.db'))
         r = run_sync('unitD')
@@ -700,9 +769,12 @@ try:
                   (r.returncode, r.stdout, r.stderr,
                    sorted(os.listdir(mod_dir))))
         else:
-            check('rsync:// daemon transport: full cycle ok',
+            # GNU daemon (the field): the missing sidecar must not print a
+            # 'link_stat ... No such file' line — that was the per-cycle
+            # journal noise on the rover
+            check('rsync:// daemon transport: full cycle ok, empty stderr',
                   r.returncode == 0 and 'cycle ok' in r.stdout
-                  and pushed and pulled,
+                  and pushed and pulled and r.stderr == '',
                   (r.returncode, r.stdout, r.stderr,
                    sorted(os.listdir(mod_dir))))
 finally:

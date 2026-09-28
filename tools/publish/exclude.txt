@@ -1,0 +1,51 @@
+# tools/publish/exclude.txt — paths dropped from every public snapshot.
+# One pattern per line; a line starting with '#' is a comment. A pattern ending in '/' is a
+# directory prefix; '*' matches across '/'; anything else is an exact path.
+# A line "vX.Y+ pattern" applies only from that milestone onward.
+
+# ST's copyrighted STM32G4 reference manual (37 MB) — kept in the journal
+# for offline use, never published
+docs/rm0440.pdf
+
+# CubeIDE build output and per-machine launch configs (the detector1/2
+# eras tracked their Debug/ trees; the makefiles embed absolute paths)
+*/Debug/*
+*/Release/*
+Debug/
+Release/
+*.launch
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.map
+*.list
+objects.list
+
+# the 2026-07-26 "checkpoint" dumped retired firmware trees at the repo
+# root (13 MB CMSIS math libs, IAR/EWARM project); removed 2026-08-10
+Core/
+Drivers/
+EWARM/
+Middlewares/
+stm32f303_detector/
+stm_pi_detector/
+boot.log
+.mxproject
+stm_detector3.ioc
+
+# the rewrite rules name the very strings they remove
+tools/publish/rewrite.txt
+
+# Claude Code per-project settings the H723 projects tracked
+*/.claude/*
+.claude/
+
+# ST USB Host Library — SLA0044, not GPL-compatible (detector1/2 only)
+*/Middlewares/ST/STM32_USB_Host_Library/*
+
+# the H723 prototypes retire when the custom board arrives
+v0.3+ stm_detector/
+v0.3+ stm_detector2/
+v0.3+ metal_mapper.ioc

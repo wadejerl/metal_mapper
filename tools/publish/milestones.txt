@@ -1,0 +1,14 @@
+# tools/publish/milestones.txt — the public release chain, oldest first.
+#   <journal commit> <tag> <one-line message>
+# build_public.py turns each line into one snapshot commit on the `public`
+# branch (tree of that commit minus exclude.txt, plus LICENSE). Lines whose
+# tag already exists are verified, new lines are appended onto the tip —
+# so add a line (or use --append) to publish, never edit an existing one.
+738a5047402ecb6527d2c542ebc560a447e1c201 v0.1 detector1 — STM32H723 prototype firmware, first serial map server, RTK base station script
+4fbc6ae9a798ade1b15f3dc11cdab0cc14b2ee36 v0.2 detector2 — working pulse timing; first Flask/SQLite web UI, offline Leaflet
+76363e5a081f54df5f9de1fcd8dbfcd2cbdd610c v0.3 detector3 — STM32G474 custom 8-channel board, new serial daemon, db_map rewrite (prototype freeze)
+6f7a01a5e83d6c82b29285eca266f2514c0ee419 v0.4 web UI — canvas renderer, Δ-array-mean filter, strip chart, study metadata panel
+2c0fa2e5293f8ee77b7d0b1e77041d90edf4a05a v0.5 Pi deployment — installer, kiosk UI, raw scope view, landing page, RTK feed gating
+033f907ca90c88be67b33a430b8978fefdb76965 v0.6 dig targets, sync filters, raster mode, two-unit studies sync via the base Pi hub
+14274ba333897407525569b225cb3c81aeb722ed v0.7 GPS/pacer fixes — free-running TIM7, GPS identity, late-boot config re-send
+d879b99109352f261f0230941928b1c7d408e1df v0.8 map orientation + Follow toggle, legacy pin migration, GPL-3.0 license, templated systemd units, publish tooling

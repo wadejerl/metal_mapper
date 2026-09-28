@@ -24,6 +24,10 @@
 {{ _open(px, cls, hid) }}<path d="M3 4v16h18"/><path d="M6.5 15l4-5.5 3.5 3 5-7"/></svg>
 {%- endmacro %}
 
+{% macro refresh(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+{%- endmacro %}
+
 {% macro map(px, cls='', hid=false) -%}
 {{ _open(px, cls, hid) }}<path d="M9 4L3 6v14l6-2 6 2 6-2V4l-6 2-6-2z"/><path d="M9 4v14M15 6v14"/></svg>
 {%- endmacro %}
@@ -50,6 +54,10 @@
 
 {% macro play(px, cls='', hid=false) -%}
 {{ _open(px, cls, hid) }}<path d="M8 5l11 7-11 7z" fill="currentColor"/></svg>
+{%- endmacro %}
+
+{% macro follow(px, cls='', hid=false) -%}
+{{ _open(px, cls, hid) }}<circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="1.5" fill="currentColor"/><path d="M12 2v3M12 19v3M2 12h3M19 12h3"/></svg>
 {%- endmacro %}
 
 {% macro save(px, cls='', hid=false) -%}

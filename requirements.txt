@@ -3,11 +3,5 @@ pyserial>=3.5
 flask>=2.3.0
 gunicorn>=21.0.0
 
-# Optional: timing plotter (plot_serial_stream.py)
-# pyqtgraph>=0.13.0
-# PyQt6>=6.5.0
-
-# Optional: other utility scripts (base_station.py, run_rover.py)
-# pynmeagps>=1.0.0
-# numpy>=1.24.0
-# folium>=0.14.0
+# Base Pi only (rtkbase/base_station.py, run by hand in its own venv):
+# pyserial, pynmeagps, pygnssutils (gnssserver)

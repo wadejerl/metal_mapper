@@ -1,7 +1,35 @@
 # Metal Mapper
 
+This is an 8 channel implementation of the common open-source pulse induction metal detector
+circuit known as Clone-PI.  Each channel comprises 4 signals: pulse control (when active, 
+the coil is exposed to a DC voltage converging on saturation), integrator reset (shorts an 
+integration cap on an op-amp) to enable only during the integration window (Rx Window), 
+the gain cut, and the integrator signal feed.  The gain is cut and integrator not fed 
+except during active measurement.  There are 4 ADCs, and 2 sets of the aforementioned 
+control signals, arranged even/odd for ch0-7.  As of this writing (9.26.2026), 200Hz
+all-at-once sampling is in use at 51/10/100 (blanking/window/pulse).  After determining 
+a bit of coil-to-coil skew, future versions will separate out the pulse firing circuitry.
+
+There is a heading and RTK equipped GPS receiver providing heading and location data 
+to the STM32 which is used to tag the PI detection values.  A default rate limit of 20mm/point
+is implemented so that sitting still doesn't cause the data file to grow uncontrollably.  
+
+The GPS has its own UART connection to the same pi that is connected to the STM32, and 
+the only purpose of that connection is for the pi to provide the RTK correction stream
+of data to the GPS receiver.  The STM32 is responsible for pairing the measured PI data
+with the location data.  The pi daemon will not log data unless an RTK fix + heading 
+has been achieved.  
+
+A web-based UI runs on the pi that is attached to the metal detector hardware and provides
+a live display of detector values from the db file that is written by the serial daemon 
+as it reads from the STM32 a CSV stream.  There is additionally a 3rd GPS antenna on the 
+mobile vehicle which provides navigation.  It also receives an RTK correction stream and is
+used for vehicle guidance and after-the-fact target finding.
+
+The rest of this shit is mostly the AI, but is useful in general and factual.  
+
 A field instrument system for GPS-tagged pulse-induction metal detection. The STM32G474
-embedded firmware pulses two coil sets, samples 8 analog channels at 500 Hz, and streams
+embedded firmware pulses two coil sets, samples 8 analog channels at up to 500 Hz, and streams
 them over serial; a Raspberry Pi runs a Python daemon that reconstructs sample positions
 between RTK fixes and records them into SQLite studies, and a Flask/Leaflet web front-end
 lets you browse saved studies or watch a live survey in real time.
@@ -27,7 +55,7 @@ appended); exactly one field group populated per line:
 
 ```
 lat,lon,fix,adc0..adc7,gps_ts,heading,tick[,vin_V,temp_C]
-,,,33421,33398,33440,33415,33402,33388,33429,33410,,,184223        ← sample (500 Hz)
+,,,33421,33398,33440,33415,33402,33388,33429,33410,,,184223        ← sample (200 Hz as run; up to 500 Hz)
 40.786213504,-119.204512395,4,,,,,,,,,123519.050000,87.25,184225   ← anchor (~20 Hz)
 ```
 
@@ -57,8 +85,9 @@ per-host dig-target sidecars): [`docs/studies_sync.md`](docs/studies_sync.md).
 
 ### `serial_daemon.py` — Data collection daemon
 
-Connects to the STM32 serial port, reconstructs where each 500 Hz sample was
-taken by interpolating between RTK anchors, and writes distance-binned rows into
+Connects to the STM32 serial port, reconstructs where each sample (200 Hz as
+the instrument is run; the firmware goes to 500 Hz) was taken by interpolating
+between RTK anchors, and writes distance-binned rows into
 a SQLite study file. A FIFO at `/tmp/metal_detector_cmd.fifo` lets the web UI
 send single-byte commands back to the STM32 (timing adjustment keys).
 
@@ -75,8 +104,9 @@ python serial_daemon.py \
 
 **Distance binning**: interpolated samples accumulate in a running bin; each
 time one lands `--min-dist` mm from the last saved row the bin flushes as a
-single row (centroid position, per-channel mean ADC). At 500 Hz and 20 mm
-spacing that averages ~25 samples per row at survey speed — the oversampling
+single row (centroid position, per-channel mean ADC). At the 200 Hz the
+instrument runs at and 20 mm spacing that averages ~10 samples per row at
+survey speed (~25 at 500 Hz) — the oversampling
 becomes SNR instead of database bloat — and a stationary detector writes
 nothing at all. Recording requires RTK-fixed + dual-antenna heading on both
 ends of a segment (unless `--no-gate`); the live recording state is written
@@ -156,12 +186,12 @@ keeps that value.
 | Study name | Click to rename (Enter saves, Esc cancels) — changes the label shown everywhere; the `.db` filename and URL stay the same |
 | ⓘ Meta | Collapsible panel of the study's acquisition provenance: recording setup (gate, min distance, serial port), firmware build, ADC oversample and channel order, GPS id/version, PI timing, and coil geometry. Values that drifted mid-study show `stamped → current` and an incomplete header is flagged |
 | 🎯 Re-zero | Set per-channel zero baselines from average of last 20 points |
-| ⏸ Pause / ▶ Resume | Freeze map pan/add; data still streams |
+| ◎ Follow ON / OFF | Map auto-pans to the newest recorded point. OFF frees the map to pan/zoom/mark a live study (e.g. from a laptop at base) — display-only, per browser; recording and marks keep streaming |
 | − Range slider | ADC counts below zero that map to full green (default 450, max 2000) |
 | + Range slider | ADC counts above zero that map to full red (default 450, max 2000) |
 | Offset slider | Shifts effective zero of all channels, in counts (default −140, range ±2000) |
 | 💾 Save View | Persists slider/zero settings into the study's meta table |
-| Filter | `absolute` (raw counts vs zero) or `Δ array mean` (common-mode rejection) |
+| Filter | `Δ` subtracts the array mean at each instant (common-mode rejection), grouped `2×4` — even and odd coils, the pairs the four ADCs convert together — or `all 8`; `sync` subtracts the study's average GPS-second-synchronous waveform (fold period ½/1/2 s, template 50/25/10 ms) — for the once-per-second interference in recordings made before the September 2026 firmware pacer fix |
 | Combine | on: overlapping passes accumulate (re-pass adds); off: newest dots cover older |
 | Channel strip chart | scrolling graph of all 8 channels' deviation from their zero baselines (so the lines overlay instead of fanning out by DC offset), one shared scale, one line color per channel, newest samples at the right; current raw values listed vertically beside it, colored by the map's value color. Live sessions feed it from the daemon's full-rate sample stream, so it scrolls with or without a GPS fix and whether or not anything is being recorded; saved studies seed it from their recorded rows |
 
@@ -198,16 +228,10 @@ a target seen twice reads roughly twice as strong. Overlap within a single
 visit doesn't add (a pixel keeps its extreme value), so slow driving gains
 nothing. Unchecked: classic painting, newest dots cover older ones.
 
-**Toolbar controls (live sessions only):**
-
-| Control | What it does |
-|---------|-------------|
-| Motion: NNN mm/pt | Distance from last saved point; shows PAUSED when stationary |
-| Blanking ±1µs | Send `a`/`z` key to STM32 via FIFO |
-| RX Window ±1µs | Send `s`/`x` key to STM32 via FIFO |
-| TX Pulse ±1µs | Send `f`/`v` key to STM32 via FIFO |
-| Rate slider | Browse the 20/40/100/200/500 Hz sample-rate list — each stop away from the current rate sends one `g`/`b` step |
-| 💾 Save Settings | Send the word `SAVE` + newline — saves timing to STM32 internal flash (word-gated so console-line noise can't trigger it). Sits beside the timing panel |
+**Toolbar (live sessions only)**: `Motion: NNN mm/pt` shows the distance
+from the last saved point and reads PAUSED when stationary. The detector
+timing controls (blanking, RX window, TX pulse, sample rate, Save Settings)
+live on the View Raw page, below.
 
 **Incremental SSE**: initial load fetches all points; SSE `/stream/<study_id>` then
 delivers only new rows every 0.5 s. The heartbeat event also carries motion status
@@ -233,14 +257,24 @@ System-test and calibration screen (`/raw`; the study list's View Raw button
 starts it in one touch): a compact telemetry strip across the top (fix
 quality, heading, position, GPS time, Vin, temperature, measured sample
 rate, firmware build, port — sized to stay one row on an 800px-wide
-display), the same Detector Timing controls, range/offset sliders and
-filter select as the map view — and in place of the map, a large version of
+display), the Detector Timing controls, and the same range/offset sliders
+and filter as the map view — and in place of the map, a large version of
 the channel chart fed at the full sample rate, taking all remaining screen
 height. **Nothing is written to the points database**: the button launches
 `serial_daemon.py --raw` against a throwaway db in the temp dir (never
 listed as a study), where the daemon keeps its live row and sample ring for
 the UI but drops every recordable row, with the recording flag pinned 0.
 No GPS needed — bench units stream with no antenna connected.
+
+**Detector Timing controls** (sent to the STM32 through the daemon's FIFO):
+
+| Control | What it does |
+|---------|-------------|
+| Blanking ±1µs | `a`/`z` key |
+| RX Window ±1µs | `s`/`x` key |
+| TX Pulse ±1µs | `f`/`v` key |
+| Rate slider | Browse the 20/40/100/200/500 Hz sample-rate list — each stop away from the current rate sends one `g`/`b` step |
+| 💾 Save Settings | Sends the word `SAVE` + newline — saves timing to the STM32's flash (word-gated so console-line noise can't trigger it) |
 
 - **Scale select**: `autoscale` fits ONE shared axis (gain and offset) to
   the raw counts, so channel levels and amplitudes compare directly —
@@ -283,7 +317,7 @@ No GPS needed — bench units stream with no antenna connected.
 
 Built by `install_pi_system.sh` (see Setup below): the app files —
 `db_map.py`, `serial_daemon.py`, `nav_gps.py`, `gunicorn_config.py`,
-`static/`, `templates/`, and every `*.geojson` overlay — are **symlinked**
+`sync_studies.sh`, `static/`, `templates/`, and every `*.geojson` overlay — are **symlinked**
 from the git checkout, and a venv is created from `requirements.txt`.
 A `git pull` in the checkout therefore updates the app in place; restart
 gunicorn afterwards (templates are cached at start). A missing
@@ -341,11 +375,29 @@ server {
 
 ### systemd services
 
-The unit files live in the repo root (`jlw_metalmap.service` runs the web
-UI; the `jlw_rover_*` units feed it GPS; `jlw_ui_mm.service` is the kiosk
-browser). They are symlinked into `/etc/systemd/system` by the install
-script, so they too update on `git pull` — run
-`sudo systemctl daemon-reload` after a pull that touches them.
+The unit files live in the repo root as templates (`jlw_metalmap.service.in`
+runs the web UI; the `jlw_rover_*` units feed it GPS; `jlw_ui_mm.service.in`
+is the kiosk browser; `jlw_mm_sync.timer.in` + `.service.in` run the studies
+sync, see [`docs/studies_sync.md`](docs/studies_sync.md);
+`jlw_rover_outfeed_mmdebug.service.in` is a debug tap that mirrors a third
+serial port to TCP 50011 — installed like the rest, not used in normal
+operation). `install_pi_system.sh` renders them into
+`/etc/systemd/system`, filling the `@MM_*@` placeholders with the service
+user (whoever ran `sudo`), its home, the checkout path and the RTK base host
+(`northpole` unless `MM_BASE_HOST` in the gitignored `install.conf` says
+otherwise — see `install.conf.example`). No account names or paths live in
+the unit templates (the base Pi's `rtkbase/` units are deployed by hand and
+assume an `rtk` account).
+After a `git pull` that touches a template, re-run the installer: it
+re-renders, daemon-reloads, and is idempotent.
+
+Upgrading a Pi installed before September 2026, when the units were
+symlinked into `/etc/systemd/system`: run the installer right after the pull
+that brought the templates, before any `systemctl daemon-reload` or reboot.
+The files those links pointed at were renamed to `*.in`, so the links dangle
+until the installer replaces them with rendered files. A plain `systemctl
+restart` still works meanwhile (systemd keeps the loaded unit), but a reload
+or reboot before the installer runs leaves every `jlw_*` unit `not-found`.
 
 The two `jlw_rover_rtk*` units gate their start on the GPS tty existing
 and the base station's caster answering (steady amber dot on the home
@@ -357,11 +409,15 @@ GPS may be absent.
 ### Setup commands
 
 ```bash
-# One script from the repo checkout sets up the system: symlinks + enables
-# every *.service in the repo root, builds /opt/metal_mapper (app symlinks
-# + venv from requirements.txt), creates the gunicorn log dir, and puts the
-# service user in dialout for the detector's serial port. Idempotent —
-# re-run after adding a service file, an overlay, or a dependency.
+# Optional: override a default (service user, its home, RTK base host)
+# cp install.conf.example install.conf && nano install.conf
+
+# One script from the repo checkout sets up the system: renders + enables
+# every unit template in the repo root, builds /opt/metal_mapper (app
+# symlinks + venv from requirements.txt), creates the gunicorn log dir, and
+# puts the service user in dialout for the detector's serial port.
+# Idempotent — re-run after a pull that touches a unit template, an
+# overlay, or a dependency.
 ./install_pi_system.sh
 
 # Tail daemon log while a study is running
@@ -389,30 +445,71 @@ python serial_daemon.py --port /dev/cu.usbmodem1103 \
 
 MCU: STM32G474CBT6 (LQFP48, 128 KB flash, DBANK=0). FreeRTOS, HAL, CubeMX.
 See [`docs/detector3.md`](docs/detector3.md) for the serial protocol, console
-keys, and settings persistence.
+keys, and settings persistence, and [`docs/analog_channel.md`](docs/analog_channel.md)
+for the analog channel as built, from the schematic.
 
 **Key facts:**
 - Pulse chain is a hardware timer timeline (TIM2 master); TIM7 paces ADC
-  frames at a fixed 500 Hz (runtime-selectable 20–500 Hz), 25 per GPS fix
-- Dual coil sets (odd on PA5, even on PB4), both fire every cycle
+  frames at the saved sample rate — 200 Hz as run (10 frames per GPS fix),
+  selectable 20–500 Hz, 500 Hz being the ceiling
+- Dual coil sets — Set A (even channels, TX on PA5) and Set B (odd channels,
+  TX on PB4) — both fire every cycle
 - USART1 @ 460800 baud → host (Pi daemon)
 - USART2 @ 460800 baud → Quectel dual-antenna RTK GNSS, 20 Hz GGA + THS
   true heading, configured by the firmware at boot
-- Runtime keys: blanking, RX window, TX pulse, coil spacing, sample rate;
+- Runtime keys: blanking, RX window, TX pulse, coil spacing, sample rate,
+  raster mode (channels fired one at a time) and its pulse spacing;
   typing `SAVE` + enter saves to a flash append-log (page 31, survives
   reflash)
 - ADC: 16× hardware oversampling (sum, no shift → 0–65520 counts)
 - Flashing a factory-fresh chip needs the DBANK option bit cleared first:
   use `stm_detector3/provision_virgin_board.sh`
 
-The predecessor `stm_detector2/` (STM32H723 Nucleo-144 prototype) remains in
-the repo for reference.
+The STM32H723 Nucleo-144 predecessors (`stm_detector`, `stm_detector2`) were
+retired from the tree in August 2026; they survive in the history and in the
+`v0.1` / `v0.2` release tags.
 
 ---
 
-## Legacy Scripts
+## License
 
-These remain in the repo but are superseded by the two-script architecture above:
+Metal Mapper is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version. See [LICENSE](LICENSE). Copyright (C) 2025–2026 Jeremy Wade.
 
-- **`map_serial_stream.py`** — original all-in-one Flask serial mapper (no persistence)
-- **`test_data_generator.py`** — simulated GPS data for offline testing
+Third-party components keep their own licenses, unchanged:
+
+| Component | Where | License |
+|---|---|---|
+| STM32G4 HAL (STMicroelectronics) | `stm_detector3/Drivers/STM32G4xx_HAL_Driver` | BSD-3-Clause |
+| STM32G4 CMSIS device headers (STMicroelectronics) | `stm_detector3/Drivers/CMSIS/Device/ST/STM32G4xx` | Apache-2.0 |
+| CMSIS core (Arm) | `stm_detector3/Drivers/CMSIS/Include` | Apache-2.0 |
+| FreeRTOS kernel (Amazon) | `stm_detector3/Middlewares/Third_Party/FreeRTOS` | MIT |
+| minmea NMEA parser (Kosma Moczek) | `stm_detector3/Core/Src/minmea.c`, `Core/Inc/minmea.h` | [WTFPL](http://www.wtfpl.net/txt/copying/) |
+| Leaflet 1.9.4 (Vladimir Agafonkin) | `static/leaflet.js`, `static/leaflet.css` | [BSD-2-Clause](https://github.com/Leaflet/Leaflet/blob/v1.9.4/LICENSE) |
+| STM32CubeMX-generated init code (outside the `USER CODE` blocks), startup, linker scripts | `stm_detector3/Core`, `stm_detector3/*.ld` | STMicroelectronics, AS-IS per the file headers |
+
+Everything not listed is Metal Mapper and under the GPL above, whatever
+boilerplate header STM32CubeMX stamped on the file (`minmea_compat.h`, the
+`USER CODE` blocks of `main.c`, and so on).
+
+Map data: `street_outlines_2026.geojson` and `city_blocks_2026.geojson` are
+Black Rock City datasets from the Burning Man Project, used under the
+[Terms of Service for Burning Man APIs and Datasets](https://innovate.burningman.org/terms-of-service-for-burning-man-apis-and-datasets/).
+Online base-map tiles are © OpenStreetMap contributors (ODbL).
+
+The `v0.1`–`v0.4` release tags carry the previous season's files
+(`camp_outlines_2025.geojson`, `street_outlines.geojson`,
+`trash_fence.geojson`) under the same terms. `v0.1` and `v0.2` also carry the
+retired STM32H723 prototypes (`stm_detector/`, `stm_detector2/`) and their
+third-party code: STM32H7 HAL (BSD-3-Clause), STM32H7 CMSIS device headers
+and CMSIS core (Apache-2.0), FreeRTOS (MIT), LwIP (BSD-3-Clause, per-file
+headers), minmea (WTFPL), and ST's BSP drivers under `Drivers/BSP` —
+BSD-3-Clause in the STM32CubeH7 package, though CubeIDE did not copy that
+`LICENSE.md`, so their headers read AS-IS. ST's USB Host Library (SLA0044)
+was removed from those snapshots.
+
+The firmware comments cite ST's RM0440 reference manual (STM32G4) by
+section; the public repository does not include that document — download it
+from st.com.

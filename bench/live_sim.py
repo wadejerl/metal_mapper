@@ -12,8 +12,9 @@ real. g/b step the ADVERTISED sample rate through the firmware's
 scaled-down real rate; the daemon is rate-agnostic so nothing downstream
 cares).
 
-Writes the study into the scratchpad studies dir where the db_map demo
-server is looking. Ctrl-C / kill to stop (daemon is SIGTERMed on exit).
+Writes the study to bench/studies/live_demo.db (gitignored); run db_map
+with --studies-dir bench/studies to view it. Ctrl-C / kill to stop (the
+daemon is SIGTERMed on exit).
 """
 import math
 import os

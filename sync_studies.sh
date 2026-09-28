@@ -129,6 +129,19 @@ if [[ "$HUB" == rsync://* ]] \
     CONTIMEOUT=(--contimeout=10)
 fi
 
+# A --files-from entry the hub lacks is routine, not an error: our sidecar
+# for a study nobody ever flagged on from this unit (every legacy study,
+# every unflagged own one), a foreign file its owner hasn't pushed yet, a
+# hub prune. GNU rsync >= 3.1 can be told so: --ignore-missing-args skips
+# the entry silently — no per-file stderr line, no rc 23 — and still
+# reports a file that vanishes AFTER it was listed. openrsync (Mac bench)
+# lacks the flag; there the FIRST miss aborts that files-from pull (one
+# stderr line, rc 23, tolerated by run_rsync) — the field is all GNU.
+MISSING_OK=()
+if rsync --ignore-missing-args --version >/dev/null 2>&1; then
+    MISSING_OK=(--ignore-missing-args)
+fi
+
 # ── hub reachable? ────────────────────────────────────────────────────────
 # The base Pi is off/away whenever the unit is home-benched — that must be
 # a quiet no-op, not a red 'failed' unit every 30 s.
@@ -232,7 +245,10 @@ shopt -s nullglob
 # interpreter per file per pass (~0.2 s each on the Pi) would eat the 30 s
 # cycle budget over a season of flagged studies. Both the push loop and the
 # restore pass consult this list; the rare corrupt path re-checks fresh.
-SC_BAD="$STAGE/.sc_bad"
+# It lives under our lock dir (gone at exit), NOT in the stage: the stage
+# is what the snapshot push ships, and a cycle with no live study must
+# leave nothing on the hub.
+SC_BAD="$LOCK/sc_bad"
 python3 - "$SDIR"/*.targets__"$H".json > "$SC_BAD" <<'PY'
 import json, os, sys
 for p in sys.argv[1:]:
@@ -300,8 +316,10 @@ run_rsync() {
 }
 
 # ── push: the live snapshot, then everything tagged with OUR host ─────────
-if [ -n "$(ls -A "$STAGE" 2>/dev/null)" ]; then
-    "${RSYNC[@]}" "$STAGE"/ "$HUB"/ || warn "push of live snapshot failed"
+# the snapshot file itself, never the stage directory: the stage also
+# holds this cycle's work files, and none of them belong on the hub
+if [ -n "$LIVE" ] && [ -s "$STAGE/$LIVE" ]; then
+    "${RSYNC[@]}" "$STAGE/$LIVE" "$HUB"/ || warn "push of live snapshot failed"
 fi
 
 push=()
@@ -383,12 +401,46 @@ if [ "$SEED" = 1 ]; then
     for f in "$SDIR"/*.db "$SDIR"/*.log; do
         base="$(basename "$f")"
         [ "$base" = "$LIVE" ] && continue
-        [ -s "$f-wal" ] && [ "${f##*.}" = "db" ] && continue
-        # same phantom logic as the push loop: purge fodder stays local
-        if [ "${f##*.}" = "db" ] && [ "$(wc -c < "$f")" -lt 262144 ] \
-                && no_points "$f"; then
-            note "seed skipping 0-point $base"
-            continue
+        if [ "${f##*.}" = "db" ]; then
+            if [ -s "$f-wal" ]; then
+                # a pre-sync session that crashed or lost power left its
+                # wal hot — it may hold ALL the points, and nothing else
+                # ever reopens an old id. Same recipe as the push loop:
+                # fold the wal in for next time, ship a consistent
+                # snapshot now, never the raw file. Silently skipping it
+                # (as before) left a db off the hub with no line to say so.
+                heal_db "$f" || true
+                if snapshot_db "$f" "$STAGE/$base"; then
+                    if no_points "$STAGE/$base"; then
+                        note "seed skipping 0-point wal-hot $base"
+                        rm -f "$STAGE/$base"
+                    else
+                        note "seeding snapshot of wal-hot $base"
+                        seedlist+=("$STAGE/$base")
+                    fi
+                else
+                    note "seed skipping wal-hot $base (unreadable)"
+                    rm -f "$STAGE/$base"
+                fi
+                continue
+            fi
+            # same phantom logic as the push loop: purge fodder stays local
+            if [ "$(wc -c < "$f")" -lt 262144 ] && no_points "$f"; then
+                note "seed skipping 0-point $base"
+                continue
+            fi
+        else
+            # a .log obeys its study's phantom gate, as in the push loop:
+            # an orphan or 0-point study's log must not outlive it on the hub
+            db="$SDIR/${base%.log}.db"
+            if [ ! -e "$db" ]; then
+                note "seed skipping orphan $base (no local study db)"
+                continue
+            fi
+            if [ "$(wc -c < "$db")" -lt 262144 ] && no_points "$db"; then
+                note "seed skipping $base (0-point study)"
+                continue
+            fi
         fi
         seedlist+=("$f")
     done
@@ -421,7 +473,8 @@ run_rsync --ignore-existing \
 # present-but-unparseable sidecar is set aside first, since it would block
 # its own repair (push already refused to ship it). --ignore-existing
 # means a healthy sidecar is never touched; entries the hub doesn't have
-# are the tolerated rc 23.
+# (most of them: a sidecar exists only once someone flagged) are skipped
+# silently with MISSING_OK, or are the tolerated rc 23 without it.
 restore="$STAGE/.restorelist"
 : > "$restore"
 for f in "$SDIR"/*.db; do
@@ -445,7 +498,8 @@ for f in "$SDIR"/*.db; do
     [ -e "$SDIR/$sc" ] || echo "$sc" >> "$restore"
 done
 if [ -s "$restore" ]; then
-    run_rsync --ignore-existing --files-from="$restore" "$HUB"/ "$SDIR"/ \
+    run_rsync --ignore-existing ${MISSING_OK[@]+"${MISSING_OK[@]}"} \
+        --files-from="$restore" "$HUB"/ "$SDIR"/ \
         || warn "own-sidecar restore failed"
     # a hub copy that is itself corrupt must not be accepted — left in
     # place it would quarantine-and-restore ping-pong every 30 s; only
@@ -488,8 +542,10 @@ for f in "$SDIR"/*.db "$SDIR"/*.json "$SDIR"/*.log; do
 done
 if [ -s "$pull2" ]; then
     # files missing on the hub (a study the other unit recorded but hasn't
-    # pushed yet, a hub prune) are the rc 23/24 run_rsync tolerates
-    run_rsync --files-from="$pull2" "$HUB"/ "$SDIR"/ \
+    # pushed yet, a hub prune) are skipped silently with MISSING_OK, or
+    # are the rc 23/24 run_rsync tolerates without it
+    run_rsync ${MISSING_OK[@]+"${MISSING_OK[@]}"} --files-from="$pull2" \
+        "$HUB"/ "$SDIR"/ \
         || warn "pull of foreign updates failed"
 fi
 

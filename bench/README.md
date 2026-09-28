@@ -23,7 +23,8 @@ python3 bench/live_sim.py
 ```
 
 Opens a pty "firmware" that speaks the detector3 protocol — `I` handshake,
-10 Hz CSV, tuning-key echoes (`a/z s/x f/v S`) — and launches the **real**
+sample lines at 50 Hz plus GPS/heading anchor lines at 10 Hz, tuning-key
+echoes (`a/z s/x f/v g/b`) and the word-gated `SAVE`/`CLEAR` — and launches the **real**
 `serial_daemon.py` against it, writing `bench/studies/live_demo.db`.
 Cycles every 60 s: RTK-fixed recording → RTK-float degraded → idle/no-fix,
 so every banner state and the timing round-trip can be exercised from the

@@ -1,7 +1,0 @@
-{
-  "last_port": "/dev/ttyUSB2",
-  "nav_host": "127.0.0.1",
-  "nav_port": 50010,
-  "serial_port": "/dev/ttyUSB2",
-  "baud": 460800
-}
