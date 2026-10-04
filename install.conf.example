@@ -9,5 +9,3 @@
 # Normally derived, override only if the defaults are wrong for your box:
 #MM_USER=pi            # account the services run as (default: the sudo user /
 #                      #   owner of the checkout)
-#MM_HOME=/home/pi      # its home — the pygnssutils venv is expected at
-#                      #   $MM_HOME/pygpsclient (gnssserver, gnssntripclient)

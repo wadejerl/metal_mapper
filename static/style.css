@@ -37,3 +37,24 @@ svg.ic { vertical-align: -3px; }
             font-weight: bold; display: inline-block; }
 .nav-ok    { background: #123c12; color: #a5d6a7; }
 .nav-down  { background: #37474f; color: #90a4ae; }
+
+/* Nav marker on the map view (map_core.js NavLayer): when the nav receiver
+   is anything short of RTK fixed the 26px shape gets a pulsing ring and a
+   label underneath — the lock state has to be visible on the fix itself. */
+.nav-mk   { position: relative; width: 26px; height: 26px; }
+/* halo + tag read upright while #map turns (view.html sets --unrot on
+   #mapWrap in heading-up / target-up); the course arrow stays outside this
+   layer so it keeps pointing up. 0deg fallback for pages without rotation. */
+.nav-up   { position: absolute; inset: 0; transform-origin: 50% 50%;
+            transform: rotate(var(--unrot, 0deg)); pointer-events: none; }
+.nav-halo { position: absolute; left: -4px; top: -4px; width: 34px; height: 34px;
+            border-radius: 50%; border: 2px solid; box-sizing: border-box;
+            pointer-events: none; }
+.nav-halo-warn { animation: nav-halo-pulse 1s ease-in-out infinite alternate; }
+.nav-halo-bad  { animation: nav-halo-pulse 0.5s ease-in-out infinite alternate; }
+.nav-tag  { position: absolute; top: 28px; left: 50%; transform: translateX(-50%);
+            white-space: nowrap; font: bold 11px/13px monospace; letter-spacing: .5px;
+            text-shadow: 0 0 3px #000, 0 0 3px #000, 0 1px 2px #000;
+            pointer-events: none; }
+@keyframes nav-halo-pulse { from { opacity: 1; transform: scale(1); }
+                            to   { opacity: .35; transform: scale(1.35); } }

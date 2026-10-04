@@ -37,15 +37,29 @@ const MM = (() => {
   }
 
   /* Geometry from a study meta dict (strings), with safe defaults.
-   * rot_deg comes from the per-study view setting, not the hardware. */
-  function geomFromMeta(meta) {
-    const rot   = parseFloat(meta.sl_heading_offset_deg);
-    const right = parseFloat(meta.coil_offset_right_mm);
+   *
+   * Stamped values come from the board via the daemon: coil_spacing_mm and
+   * coil_offset_right_mm (the ARRAY CENTRE's offset from the antenna, +
+   * starboard). The view's Cal panel may override them per study, saved
+   * with the view: sl_cal_pitch_mm, and sl_cal_ant_mm — the ANTENNA's
+   * offset from the array centre, − port / + starboard, i.e. the negative
+   * of right_mm (the operator's frame: where antenna 1 sits across the
+   * array). Rotation: sl_cal_heading_deg if set, else sl_heading_offset_deg
+   * (the unit's config.json, or a pre-move study's own saved value).
+   * {stamped: true} ignores the Cal keys — the baseline the panel's reset
+   * returns to and the alt-cal banner flag compares against. */
+  function geomFromMeta(meta, opts) {
+    const stamped = !!(opts && opts.stamped);
+    const num = k => { const v = parseFloat(meta[k]); return Number.isFinite(v) ? v : null; };
+    const cal = k => stamped ? null : num(k);
+    const pitch = cal('sl_cal_pitch_mm'), ant = cal('sl_cal_ant_mm');
+    const rot = cal('sl_cal_heading_deg');
+    const right = num('coil_offset_right_mm'), rot0 = num('sl_heading_offset_deg');
     return {
-      spacing_mm: parseFloat(meta.coil_spacing_mm) || 330,
-      fore_mm:    parseFloat(meta.coil_offset_fore_mm) || 0,
-      right_mm:   Number.isFinite(right) ? right : 500,
-      rot_deg:    Number.isFinite(rot) ? rot : 270,
+      spacing_mm: pitch != null && pitch > 0 ? pitch : (num('coil_spacing_mm') || 330),
+      fore_mm:    num('coil_offset_fore_mm') || 0,
+      right_mm:   ant != null ? -ant : (right != null ? right : 500),
+      rot_deg:    rot != null ? rot : (rot0 != null ? rot0 : 270),
     };
   }
 
@@ -77,6 +91,30 @@ const MM = (() => {
     return '#ffaa00';
   }
 
+  /* Nav-receiver lock status for the seeking HUD — one vocabulary for the
+   * approach arrow, its badge and the map marker. Pins sit where an
+   * RTK-FIXED trailer receiver said they were; a nav receiver that is
+   * anything less puts the driver metres off the hole while the arrow
+   * looks exactly the same, so the state has to live on the arrow.
+   *   nav   = /navfix snapshot (null/undefined = never arrived)
+   *   fresh = the page's transport gate (false = no tick lately; omit when
+   *           the caller has no such gate)
+   * → {code, level, label, color, ok}. ok only for a live RTK-fixed fix;
+   * level 'warn' = RTK working but unconverged (wait), 'bad' = no RTK at
+   * all / no fix / nothing live (check the corrections link). */
+  function navFixStatus(nav, fresh) {
+    const bad = (code, label) => ({code, level: 'bad', label, color: '#ff4444', ok: false});
+    if (!nav || !nav.connected) return bad('down', 'NAV DOWN');
+    if (fresh === false)        return bad('dead', 'NAV STALE');
+    const q = nav.quality;
+    if (nav.lat == null || q == null || q === 0) return bad('nofix', 'NO FIX');
+    if (nav.stale)              return bad('stale', 'NAV STALE');
+    if (q === 4) return {code: 'fixed', level: 'ok', label: 'RTK FIXED', color: fixColor(4), ok: true};
+    if (q === 5) return {code: 'float', level: 'warn', label: 'RTK FLOAT', color: fixColor(5), ok: false};
+    const name = (FIX_LABELS[q] || `FIX ${q}`).toUpperCase();
+    return {code: 'nortk', level: 'bad', label: name + ' · NO RTK', color: fixColor(q), ok: false};
+  }
+
   /* Operator-friendly text for the daemon's live.reason vocabulary. */
   function reasonText(reason) {
     if (!reason) return '';
@@ -103,18 +141,32 @@ const MM = (() => {
     function iconFor(nav) {
       const moving = (nav.speed_mps != null && nav.speed_mps >= NAV_MIN_SPEED_MPS
                       && nav.cog_deg != null);
-      const color = nav.stale ? '#888' : fixColor(nav.quality);
+      const st = navFixStatus(nav);
+      const color = nav.stale ? '#888' : st.color;   // shape: fix-colour legend
+      // Anything short of RTK fixed wears a pulsing halo and says why, right
+      // on the marker. Halo/tag speak the badge's language — red = no RTK /
+      // no fix, amber = float, grey = stale — not the fix palette, which
+      // shares one yellow between DGPS and RTK float. They sit in .nav-up,
+      // which counter-rotates with the page's --unrot so the label reads
+      // upright while the map turns in heading-up / target-up; the course
+      // arrow stays outside it so it keeps pointing up (style.css).
+      const sev = nav.stale ? '#888' : (st.level === 'bad' ? '#ff4444' : st.color);
+      const warn = st.ok ? '' :
+        `<div class="nav-up">` +
+          `<div class="nav-halo nav-halo-${st.level}" style="border-color:${sev}"></div>` +
+          `<div class="nav-tag" style="color:${sev}">${st.label}</div>` +
+        `</div>`;
       if (moving) {
         return {
           mode: 'arrow',
           icon: L.divIcon({
             className: 'nav-icon',
-            html: `<div style="transform: rotate(${nav.cog_deg}deg);
+            html: `<div class="nav-mk">${warn}<div style="transform: rotate(${nav.cog_deg}deg);
                      width:0;height:0;margin:2px auto;
                      border-left:9px solid transparent;
                      border-right:9px solid transparent;
                      border-bottom:22px solid ${color};
-                     filter: drop-shadow(0 0 2px #000);"></div>`,
+                     filter: drop-shadow(0 0 2px #000);"></div></div>`,
             iconSize: [26, 26], iconAnchor: [13, 13],
           }),
         };
@@ -123,9 +175,9 @@ const MM = (() => {
         mode: 'dot',
         icon: L.divIcon({
           className: 'nav-icon',
-          html: `<div style="width:14px;height:14px;border-radius:50%;
+          html: `<div class="nav-mk">${warn}<div style="width:14px;height:14px;border-radius:50%;
                    background:${color};border:2px solid #000;
-                   margin:5px auto;"></div>`,
+                   margin:5px auto;"></div></div>`,
           iconSize: [26, 26], iconAnchor: [13, 13],
         }),
       };
@@ -162,6 +214,41 @@ const MM = (() => {
    * gt = the row's interpolated GPS timestamp in seconds (the firmware's
    * seconds-of-minute, wrapping at 60), NaN = none — the sync filter folds
    * on it, nothing else reads it. */
+  /* ── /points wire format → typed-array views ─────────────────────────────
+   * Server (db_map.py POINT_COLUMNS): 'MMP1', uint32 header length, JSON
+   * header {n, last_id, cols: [[name, dtype, offset, count]]}, then the
+   * columns, little-endian, each 8-byte aligned, offsets relative to the
+   * data start. Views alias the fetched ArrayBuffer — no per-value parse,
+   * which is the point: JSON.parse of a 100 MB body was its own memory
+   * spike on the Pi's chromium. Throws on anything malformed. */
+  const POINT_DTYPES = {u32: Uint32Array, f64: Float64Array, f32: Float32Array,
+                        u8: Uint8Array, u16: Uint16Array};
+  function decodePoints(buf) {
+    const dv = new DataView(buf);
+    if (buf.byteLength < 8 || dv.getUint32(0, true) !== 0x31504D4D)   // 'MMP1'
+      throw new Error('points: bad magic');
+    const hlen = dv.getUint32(4, true);
+    if (8 + hlen > buf.byteLength) throw new Error('points: truncated header');
+    const hdr = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 8, hlen)));
+    const base = (8 + hlen + 7) & ~7;
+    const out = {n: hdr.n, last_id: hdr.last_id, adc: new Array(8)};
+    for (const [name, dtype, off, count] of hdr.cols) {
+      const T = POINT_DTYPES[dtype];
+      if (!T || count !== hdr.n) throw new Error('points: bad column ' + name);
+      const at = base + off;
+      if (at % T.BYTES_PER_ELEMENT || at + count * T.BYTES_PER_ELEMENT > buf.byteLength)
+        throw new Error('points: column ' + name + ' out of range');
+      const view = new T(buf, at, count);
+      const m = /^adc([0-7])$/.exec(name);
+      if (m) out.adc[+m[1]] = view; else out[name] = view;
+    }
+    for (const k of ['id', 'lat', 'lon', 'heading', 'fix', 'gps_ts'])
+      if (!out[k]) throw new Error('points: missing column ' + k);
+    for (let ch = 0; ch < 8; ch++)
+      if (!out.adc[ch]) throw new Error('points: missing column adc' + ch);
+    return out;
+  }
+
   function PointStore() {
     let cap = 1024, n = 0;
     let id  = new Uint32Array(cap);
@@ -196,18 +283,19 @@ const MM = (() => {
         for (let ch = 0; ch < 8; ch++) adc[n * 8 + ch] = p.adc[ch];
         n++;
       },
-      fillColumns(cols) {                      // bulk /data columns
-        const m = cols.lat.length;
+      fillBinary(cols) {                       // decodePoints() output
+        const m = cols.n;
+        if (!m) return;
         ensure(n + m);
-        const gcol = cols.gps_ts;              // absent on a pre-sync server
-        for (let i = 0; i < m; i++) {
-          id[n]  = cols.id[i]; lat[n] = cols.lat[i]; lon[n] = cols.lon[i];
-          hdg[n] = (cols.heading[i] == null) ? NaN : cols.heading[i];
-          fix[n] = (cols.fix[i] == null) ? 255 : cols.fix[i];
-          gt[n]  = (gcol && gcol[i] != null) ? gcol[i] : NaN;
-          for (let ch = 0; ch < 8; ch++) adc[n * 8 + ch] = cols.adc[ch][i];
-          n++;
+        // Same dtypes and none-sentinels as push(), so bulk columns copy
+        // straight in; only adc needs interleaving (8 columns → 8 per point).
+        id.set(cols.id, n);  lat.set(cols.lat, n); lon.set(cols.lon, n);
+        hdg.set(cols.heading, n); fix.set(cols.fix, n); gt.set(cols.gps_ts, n);
+        for (let ch = 0; ch < 8; ch++) {
+          const src = cols.adc[ch];
+          for (let i = 0, j = n * 8 + ch; i < m; i++, j += 8) adc[j] = src[i];
         }
+        n += m;
       },
       get length() { return n; },
       view() { return {n, id, lat, lon, hdg, fix, adc, gt}; },  // live refs: re-fetch after push
@@ -257,8 +345,18 @@ const MM = (() => {
     let useCm   = false; // subtract the array's common mode ('cm' filters)
     let useSync = false; // subtract the GPS-synchronous template ('sync')
     let cmSets  = true;  // common mode per 2×4 same-instant ADC set (see cmOf)
-    let combine = true;  // true: overlaps accumulate (re-pass adds);
-                         // false: classic paint, newest dots cover older
+    /* Render mode — how overlapping coil samples resolve on screen:
+     *  PAINT   classic: newest dots cover older ones (no accumulation)
+     *  COMBINE per-visit extreme, and visits ADD (a re-pass reinforces)
+     *  MEAN    average of every sample that landed on the cell, so noise
+     *          cancels and ground that reads green on most visits stands
+     *          out as a hot spot
+     *  PEAK    the green-most (lowest) deviation the cell ever saw
+     * Every mode but PAINT accumulates in the value domain per screen cell
+     * — a pixel at full detail, a 4 px bin zoomed out (LOD). */
+    const M_PAINT = 0, M_COMBINE = 1, M_MEAN = 2, M_PEAK = 3;
+    const MODE_NAMES = ['paint', 'combine', 'mean', 'peak'];
+    let mode = M_COMBINE;
 
     /* ── GPS-synchronous noise template ('sync' filter) ──────────────────
      * Field finding (2026-09): a broadband transient hits the front end
@@ -418,9 +516,11 @@ const MM = (() => {
     let cellIdx = new Int32Array(0);     // LOD: winning point per cell
     let cellDev = new Float32Array(0);   // LOD: its deviation
     let cellCh  = new Int8Array(0);      // LOD: its channel
-    let accVal  = new Float32Array(0);   // detail: settled sum of past visits
-    let accSeg  = new Float32Array(0);   // detail: current visit's extreme
-    let accLast = new Int32Array(0);     // detail: last point index per cell
+    let accVal  = new Float32Array(0);   // cell: combine settled sum of past
+                                         // visits / mean running sum / peak min
+    let accSeg  = new Float32Array(0);   // combine: current visit's extreme
+    let accCnt  = new Int32Array(0);     // mean: samples landed on the cell
+    let accLast = new Int32Array(0);     // last point index per cell (-1 = empty)
     let accCanvas = null, accCtx = null, accImg = null;
 
     let dirty = false, raf = 0;
@@ -465,6 +565,26 @@ const MM = (() => {
                               / (4 * Math.PI)) - P.oy;
     }
 
+    /* Value-domain accumulation shared by the LOD and full-detail paths in
+     * every mode but PAINT. accReset sizes and clears the cell buffers;
+     * accOut is a touched cell's display value — the display offset is
+     * applied ONCE here, else a re-pass would double it into the tint. The
+     * accumulation step itself is inlined at both call sites: it runs per
+     * pixel per coil sample. */
+    function accReset(cells) {
+      if (accVal.length < cells) {
+        accVal = new Float32Array(cells); accSeg = new Float32Array(cells);
+        accCnt = new Int32Array(cells);   accLast = new Int32Array(cells);
+      }
+      accVal.fill(0, 0, cells); accSeg.fill(0, 0, cells);
+      accCnt.fill(0, 0, cells); accLast.fill(-1, 0, cells);
+    }
+    function accOut(c, off1) {
+      if (mode === M_COMBINE) return accVal[c] + accSeg[c] - off1;
+      if (mode === M_MEAN)    return accVal[c] / accCnt[c] - off1;
+      return accVal[c] - off1;                                    // PEAK
+    }
+
     function redraw() {
       dirty = false;
       const size = map.getSize();
@@ -505,7 +625,13 @@ const MM = (() => {
       if (syncMode) ensureSync(v);
 
       if (nVis > LOD_POINTS) {
-        /* ── LOD: bin COIL positions, keep the strongest hit per cell ──
+        /* ── LOD: bin COIL positions per 4 px cell ──
+         * Combine/Mean/Peak: the same value-domain accumulation as full
+         * detail, at cell resolution — a re-pass still adds / averages /
+         * keeps the green-most. Paint: keep the strongest hit per cell.
+         * (LOD used to be strongest-per-cell in every mode, so a busy view
+         * silently looked like Paint and flipped back when a small pan took
+         * the in-view count under LOD_POINTS.)
          * Binning the coils (not the antenna point) preserves the array's
          * true ground footprint at every zoom: the swath stays a band that
          * touches/overlaps the neighboring pass, exactly as the coils did,
@@ -518,6 +644,7 @@ const MM = (() => {
         }
         cellIdx.fill(-1, 0, cells);
         cellDev.fill(-1, 0, cells);
+        if (mode !== M_PAINT) accReset(cells);
         const spacingML = geom.spacing_mm / 1000;
         const rightM0L  = geom.right_mm / 1000, foreML = geom.fore_mm / 1000;
         const rotL = geom.rot_deg || 0;
@@ -546,6 +673,25 @@ const MM = (() => {
             const cx = (x / LOD_CELL) | 0, cy = (y / LOD_CELL) | 0;
             if (cx < 0 || cy < 0 || cx >= gw || cy >= gh) continue;
             const c = cy * gw + cx;
+            if (mode !== M_PAINT) {
+              /* raw zeroed deviation only — display offset applied once at
+               * colorize (accOut), else a re-pass would double it */
+              const dev = zero8
+                ? v.adc[i * 8 + ch] - scOf(sb, ch) - cm[ch & 1] - zero8[ch] : 0;
+              if (mode === M_COMBINE) {
+                if (i - accLast[c] > REVISIT_GAP) {  // new visit: settle old
+                  accVal[c] += accSeg[c]; accSeg[c] = dev;
+                } else if (Math.abs(dev) > Math.abs(accSeg[c])) {
+                  accSeg[c] = dev;                   // same visit: extreme
+                }
+              } else if (mode === M_MEAN) {
+                accVal[c] += dev; accCnt[c]++;
+              } else if (accLast[c] < 0 || dev < accVal[c]) {
+                accVal[c] = dev;                     // PEAK: green-most wins
+              }
+              accLast[c] = i;
+              continue;
+            }
             const e = zero8
               ? Math.abs(v.adc[i * 8 + ch] - scOf(sb, ch) - cm[ch & 1]
                          - (zero8[ch] + off)) : 0;
@@ -554,6 +700,19 @@ const MM = (() => {
         }
         /* Paint at the cell, sized so covered cells tile into a carpet. */
         const s = Math.max(d, LOD_CELL);
+        if (mode !== M_PAINT) {
+          const off1 = zero8 ? off : 0;    // uncalibrated stays neutral grey
+          for (let c = 0; c < cells; c++) {
+            if (accLast[c] < 0) continue;
+            const x = (c % gw) * LOD_CELL + LOD_CELL / 2;
+            const y = ((c / gw) | 0) * LOD_CELL + LOD_CELL / 2;
+            ctx.fillStyle = zero8
+              ? styleFor(accOut(c, off1), 0, minus, plus)
+              : 'rgb(128,128,128)';
+            ctx.fillRect(x - s / 2, y - s / 2, s, s);
+          }
+          return;
+        }
         for (let c = 0; c < cells; c++) {
           const i = cellIdx[c];
           if (i < 0) continue;
@@ -576,21 +735,20 @@ const MM = (() => {
       const rightM0  = geom.right_mm / 1000, foreM = geom.fore_mm / 1000;
       const rot = geom.rot_deg || 0;
 
-      if (combine) {
-        /* Combine mode: value-domain accumulation per screen pixel.
-         * Dots never paint over each other; their deviations COMBINE, so an
-         * earlier pass can't be hidden (or washed out) by a later one. Within
-         * one visit (points within REVISIT_GAP of each other) a cell keeps
-         * its extreme value — along-track dot overlap adds nothing — but when
-         * the array comes back over the same ground later, visits ADD: a
-         * signal seen on two passes reads ~twice as strong. */
+      if (mode !== M_PAINT) {
+        /* Value-domain accumulation per screen pixel. Dots never paint over
+         * each other; their deviations are resolved per mode:
+         * COMBINE — within one visit (points within REVISIT_GAP of each
+         *   other) a cell keeps its extreme value, so along-track dot
+         *   overlap adds nothing, but when the array comes back over the
+         *   same ground later the visits ADD: a signal seen on two passes
+         *   reads ~twice as strong and an earlier pass is never hidden.
+         * MEAN — every coil sample that lands on the pixel is averaged
+         *   (along-track overlap included), so uncorrelated noise cancels
+         *   and ground that is green on most visits stays green.
+         * PEAK — the pixel keeps the lowest (green-most) deviation seen. */
         const gw = size.x | 0, gh = size.y | 0, cells = gw * gh;
-        if (accVal.length < cells) {
-          accVal = new Float32Array(cells); accSeg = new Float32Array(cells);
-          accLast = new Int32Array(cells);
-        }
-        accVal.fill(0, 0, cells); accSeg.fill(0, 0, cells);
-        accLast.fill(-1, 0, cells);
+        accReset(cells);
         const dI = Math.max(1, Math.ceil(d));  // whole cells; ceil so rounding
                                                // can't open seams (overlap is
                                                // harmless: same-visit = max)
@@ -619,10 +777,16 @@ const MM = (() => {
             for (let cy = y0; cy < y1; cy++) {
               let c = cy * gw + x0;
               for (let cx = x0; cx < x1; cx++, c++) {
-                if (i - accLast[c] > REVISIT_GAP) {  // new visit: settle old
-                  accVal[c] += accSeg[c]; accSeg[c] = dev;
-                } else if (Math.abs(dev) > Math.abs(accSeg[c])) {
-                  accSeg[c] = dev;                   // same visit: extreme
+                if (mode === M_COMBINE) {
+                  if (i - accLast[c] > REVISIT_GAP) {  // new visit: settle
+                    accVal[c] += accSeg[c]; accSeg[c] = dev;
+                  } else if (Math.abs(dev) > Math.abs(accSeg[c])) {
+                    accSeg[c] = dev;                   // same visit: extreme
+                  }
+                } else if (mode === M_MEAN) {
+                  accVal[c] += dev; accCnt[c]++;
+                } else if (accLast[c] < 0 || dev < accVal[c]) {
+                  accVal[c] = dev;                     // PEAK: green-most
                 }
                 accLast[c] = i;
               }
@@ -641,7 +805,7 @@ const MM = (() => {
         for (let c = 0; c < cells; c++) {
           const o = c * 4;
           if (accLast[c] < 0) { px[o + 3] = 0; continue; }
-          const vv = accVal[c] + accSeg[c] - off1;
+          const vv = accOut(c, off1);
           let li;
           if (vv <= 0) {
             let t = minus > 0 ? (vv + minus) / minus : 0;
@@ -662,8 +826,8 @@ const MM = (() => {
         ctx.imageSmoothingEnabled = false;
         ctx.drawImage(accCanvas, 0, 0, gw, gh);
       } else {
-        /* Classic paint: 8 coil dots per point, newest drawn last (covers
-         * older overlapping passes — the un-combined comparison view). */
+        /* PAINT: 8 coil dots per point, newest drawn last (covers older
+         * overlapping passes — the classic comparison view). */
         for (let k = 0; k < nVis; k++) {
           const i = visIdx[k];
           const h = v.hdg[i];
@@ -762,6 +926,90 @@ const MM = (() => {
       return out;
     }
 
+    /* ── Green census: where the map is green, on a metre grid ────────────
+     * Field ask (2026-09, first live use): rank dig pins by how much green
+     * sits under them, and propose new pins where the most green is. Green
+     * is exactly what colorFor paints green — filter-corrected zeroed
+     * deviation <= Offset, per coil sample — so the ranking follows the
+     * sliders the operator tuned, not a second definition of a hit. Every
+     * coil sample of every point (not just in view) is binned into a
+     * sparse cell grid in local metres about the study's SW corner; sizes
+     * are then window counts over that grid (see MM.greenCount/greenPeaks).
+     * Sorted cell ids + binary search: ~4 B per green sample, no hash map,
+     * and a 950k-point study scans in about a second. A point without
+     * heading is skipped: at pin-placing zoom the full-detail paint draws
+     * it as an uncoloured antenna outline, never green (only the zoomed-out
+     * LOD path piles its 8 coils on the antenna), so counting it would
+     * rank spots the operator cannot see. Returns null when nothing is
+     * calibrated yet. */
+    function greenIndex(cellM) {
+      const zero8 = zEff();
+      if (!store || !store.length || !zero8) return null;
+      const v = store.view();
+      const cell = (cellM > 0 && Number.isFinite(cellM)) ? cellM : 0.1;
+      const off = calib.offset;
+      const cmMode = useCm, syncMode = useSync;
+      if (syncMode) ensureSync(v);
+      let laMin = Infinity, laMax = -Infinity, loMin = Infinity, loMax = -Infinity;
+      for (let i = 0; i < v.n; i++) {
+        const la = v.lat[i], lo = v.lon[i];
+        if (la < laMin) laMin = la; if (la > laMax) laMax = la;
+        if (lo < loMin) loMin = lo; if (lo > loMax) loMax = lo;
+      }
+      const spanM = (3.5 * geom.spacing_mm + Math.abs(geom.right_mm)
+                     + Math.abs(geom.fore_mm)) / 1000 + 2;
+      const mLon = M_PER_DEG_LAT * Math.cos((laMin + laMax) / 2 * D) || 1;
+      const lat0 = laMin - spanM / M_PER_DEG_LAT;
+      const lon0 = loMin - spanM / mLon;
+      const W = Math.ceil(((loMax - lon0) * mLon + spanM) / cell) + 1;
+      const H = Math.ceil(((laMax - lat0) * M_PER_DEG_LAT + spanM) / cell) + 1;
+      if (!(W > 0 && H > 0) || W * H > 2000000000) return null;
+      const spacingM = geom.spacing_mm / 1000;
+      const rightM0  = geom.right_mm / 1000, foreM = geom.fore_mm / 1000;
+      const rot = geom.rot_deg || 0;
+      /* pass 0 counts the green samples, pass 1 fills their cell ids */
+      let ids = null, g = 0;
+      for (let pass = 0; pass < 2; pass++) {
+        if (pass) { ids = new Int32Array(g); g = 0; }
+        for (let i = 0; i < v.n; i++) {
+          const h = v.hdg[i];
+          if (Number.isNaN(h)) continue;   // no heading: no coil positions
+          const sb = syncMode ? syncBinIdx[i] : NOSYNC;
+          const cm = cmMode ? cmOf(v, i, zero8, sb) : CM_OFF;
+          const a = (h + rot) * D;
+          const fwdN = Math.cos(a), fwdE = Math.sin(a);
+          const ax = (v.lon[i] - lon0) * mLon + foreM * fwdE;   // metres E
+          const ay = (v.lat[i] - lat0) * M_PER_DEG_LAT + foreM * fwdN; // N
+          for (let ch = 0; ch < 8; ch++) {
+            if (!visible[ch]) continue;
+            const dev = v.adc[i * 8 + ch] - scOf(sb, ch) - cm[ch & 1] - zero8[ch];
+            if (dev > off) continue;                 // not green
+            if (pass) {
+              const rightM = rightM0 + (ch - 3.5) * spacingM;
+              const ix = Math.floor((ax + rightM * fwdN) / cell);  // rgtE = fwdN
+              const iy = Math.floor((ay - rightM * fwdE) / cell);  // rgtN = -fwdE
+              if (ix < 0 || iy < 0 || ix >= W || iy >= H) { ids[g] = -1; g++; continue; }
+              ids[g] = iy * W + ix;
+            }
+            g++;
+          }
+        }
+      }
+      ids.sort();                                    // typed array: numeric
+      let k0 = 0;
+      while (k0 < g && ids[k0] < 0) k0++;            // out-of-grid (never, in practice)
+      let u = 0;
+      for (let k = k0; k < g; k++) if (k === k0 || ids[k] !== ids[k - 1]) u++;
+      const uid = new Int32Array(u), cnt = new Uint32Array(u);
+      for (let k = k0, j = -1; k < g; k++) {
+        if (k === k0 || ids[k] !== ids[k - 1]) { uid[++j] = ids[k]; cnt[j] = 1; }
+        else cnt[j]++;
+      }
+      return {cell, W, H, lat0, lon0, mLon, ids: uid, cnt, green: g - k0,
+              points: v.n, offset: off,
+              filter: (cmMode ? 'cm' : 'abs') + (syncMode ? '+sync' : '')};
+    }
+
     map.on('moveend zoomend viewreset resize', markDirty);
 
     return {
@@ -790,12 +1038,133 @@ const MM = (() => {
         if (on === cmSets) return;
         cmSets = on; markDirty();
       },
-      setCombine(on) { combine = !!on; markDirty(); },
+      /* 'paint' | 'combine' | 'mean' | 'peak' (see the M_* notes); an
+       * unknown name is ignored and reported false */
+      setMode(name) {
+        const m = MODE_NAMES.indexOf(String(name).toLowerCase());
+        if (m < 0) return false;
+        if (m !== mode) { mode = m; markDirty(); }
+        return true;
+      },
+      getMode() { return MODE_NAMES[mode]; },
+      setCombine(on) { this.setMode(on ? 'combine' : 'paint'); },
       setVisible(ch, on) { visible[ch] = on; markDirty(); },
       getVisible() { return visible.slice(); },
       markDirty,
       hitTest,
+      greenIndex,
     };
+  }
+
+  /* ── Green-census queries (pure functions over a greenIndex) ──────────────
+   * size(pin) = number of green coil samples whose grid cell centre lies
+   * within r metres of the pin (the cell under the pin always counts, so a
+   * radius smaller than a cell still reads the ground under the pin). Two
+   * passes over the same spot add up, as they do in Combine mode. */
+  function _findCell(ids, id) {
+    let lo = 0, hi = ids.length - 1;
+    while (lo <= hi) {
+      const m = (lo + hi) >> 1, t = ids[m];
+      if (t === id) return m;
+      if (t < id) lo = m + 1; else hi = m - 1;
+    }
+    return -1;
+  }
+  /* window count + count-weighted centroid about local (x, y) metres */
+  function _windowStat(idx, x, y, r) {
+    const c = idx.cell, r2 = r * r;
+    const cx = Math.floor(x / c), cy = Math.floor(y / c);
+    const ix0 = Math.max(0, Math.floor((x - r) / c));
+    const ix1 = Math.min(idx.W - 1, Math.floor((x + r) / c));
+    const iy0 = Math.max(0, Math.floor((y - r) / c));
+    const iy1 = Math.min(idx.H - 1, Math.floor((y + r) / c));
+    let s = 0, sx = 0, sy = 0;
+    for (let iy = iy0; iy <= iy1; iy++) {
+      const yc = (iy + 0.5) * c, dy = yc - y;
+      for (let ix = ix0; ix <= ix1; ix++) {
+        const xc = (ix + 0.5) * c, dx = xc - x;
+        if (dx * dx + dy * dy > r2 && !(ix === cx && iy === cy)) continue;
+        const k = _findCell(idx.ids, iy * idx.W + ix);
+        if (k < 0) continue;
+        const n = idx.cnt[k];
+        s += n; sx += n * xc; sy += n * yc;
+      }
+    }
+    return s ? {s, x: sx / s, y: sy / s} : {s: 0, x, y};
+  }
+  function _toLocal(idx, lat, lon) {
+    return [(lon - idx.lon0) * idx.mLon, (lat - idx.lat0) * M_PER_DEG_LAT];
+  }
+  function greenCount(idx, lat, lon, rM) {
+    if (!idx) return 0;
+    const [x, y] = _toLocal(idx, lat, lon);
+    return _windowStat(idx, x, y, rM).s;
+  }
+  /* The n biggest green spots not already marked: score every occupied
+   * cell by its window count, walk them largest-first, and keep a spot
+   * unless it is within minSep of an existing pin or an earlier pick (one
+   * target spreads over many cells — the first cell wins, the rest of the
+   * blob is suppressed). Each pick is refined to the count-weighted
+   * centroid of its window, so it lands on the middle of the green, not
+   * on a cell corner. Returned largest-first, so ids minted from this
+   * list ARE the stack rank. */
+  function greenPeaks(idx, rM, opts) {
+    opts = opts || {};
+    const n = Math.max(1, opts.n | 0 || 5);
+    const minSep = opts.minSep > 0 ? opts.minSep : Math.max(1.0, 2 * rM);
+    const minSize = opts.minSize > 0 ? opts.minSize : 1;
+    const excl = (opts.exclude || []).map(p => _toLocal(idx, p.lat, p.lon));
+    const U = idx.ids.length;
+    if (!U) return [];
+    const PACK = 16777216;                     // 2^24 > any cell count here
+    const score = new Float64Array(U);
+    for (let k = 0; k < U; k++) {
+      const id = idx.ids[k], ix = id % idx.W, iy = (id / idx.W) | 0;
+      const st = _windowStat(idx, (ix + 0.5) * idx.cell, (iy + 0.5) * idx.cell, rM);
+      score[k] = Math.min(st.s, PACK - 1) * PACK + k;
+    }
+    score.sort();
+    const picks = [], sep2 = minSep * minSep;
+    for (let q = U - 1; q >= 0 && picks.length < n; q--) {
+      const packed = score[q];
+      const s = Math.floor(packed / PACK), k = packed - s * PACK;
+      if (s < minSize) break;
+      const id = idx.ids[k], ix = id % idx.W, iy = (id / idx.W) | 0;
+      const cx = (ix + 0.5) * idx.cell, cy = (iy + 0.5) * idx.cell;
+      let near = false;
+      for (const p of excl) {
+        const dx = p[0] - cx, dy = p[1] - cy;
+        if (dx * dx + dy * dy < sep2) { near = true; break; }
+      }
+      if (!near) for (const p of picks) {
+        const dx = p.x - cx, dy = p.y - cy;
+        if (dx * dx + dy * dy < sep2) { near = true; break; }
+      }
+      if (near) continue;
+      /* refine to the centroid, then re-check separation THERE: two cells
+       * on the flanks of one blob both refine toward its middle and would
+       * otherwise pass the cell-centre test yet land on top of each other */
+      const st = _windowStat(idx, cx, cy, rM);
+      for (const p of picks) {
+        const dx = p.x - st.x, dy = p.y - st.y;
+        if (dx * dx + dy * dy < sep2) { near = true; break; }
+      }
+      if (!near) for (const p of excl) {
+        const dx = p[0] - st.x, dy = p[1] - st.y;
+        if (dx * dx + dy * dy < sep2) { near = true; break; }
+      }
+      if (near) continue;
+      /* size as a pin dropped here will later measure it (greenCount at
+       * the refined spot), so Rank agrees with Find */
+      const size = _windowStat(idx, st.x, st.y, rM).s;
+      picks.push({x: st.x, y: st.y, size,
+                  lat: idx.lat0 + st.y / M_PER_DEG_LAT,
+                  lon: idx.lon0 + st.x / idx.mLon});
+    }
+    // the walk is ordered by cell-centre score; the refined sizes can
+    // reorder neighbours, and the caller mints ids from THIS order
+    picks.sort((a, b) => b.size - a.size);
+    return picks;
   }
 
   /* ── Channel strip chart (shared by the map view and the raw view) ────────
@@ -960,7 +1329,7 @@ const MM = (() => {
     };
   }
 
-  return {coilPositions, geomFromMeta, colorFor, fixLabel, fixColor,
+  return {coilPositions, geomFromMeta, colorFor, fixLabel, fixColor, navFixStatus,
           reasonText, NavLayer, PointStore, ChannelRenderer, StripChart,
-          CH_COLORS, NAV_MIN_SPEED_MPS};
+          decodePoints, greenCount, greenPeaks, CH_COLORS, NAV_MIN_SPEED_MPS};
 })();

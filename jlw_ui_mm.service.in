@@ -2,7 +2,18 @@
 # filling the @MM_*@ placeholders from the checkout and install.conf.
 [Unit]
 Description=Metal Mapper UI
-After=lightdm.service
+# The display first, then what it shows: jlw_metalmap behind nginx.
+# Started side by side at boot, chromium loaded http://localhost before the
+# backend answered and sat on a white page, then nginx's error page, for
+# good — kiosk pages never reload themselves. After= is only as good as
+# what "started" means for jlw_metalmap: its ExecStartPost probe holds it
+# in "activating" until gunicorn's worker answers /healthz (gunicorn's own
+# READY=1 fires at socket bind, before the worker exists), so this unit
+# starts against a backend that renders. Wants (not Requires): a backend
+# that never comes up still gets a screen — nginx's retrying "starting…"
+# page says more than black, and reloads itself when the backend arrives.
+After=lightdm.service nginx.service jlw_metalmap.service
+Wants=nginx.service jlw_metalmap.service
 
 [Service]
 User=@MM_USER@

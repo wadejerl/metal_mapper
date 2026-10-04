@@ -1,13 +1,16 @@
 # Template — install_pi_system.sh renders this to /etc/systemd/system/jlw_rover_outfeed_mmdebug.service,
-# filling the @MM_*@ placeholders from the checkout and install.conf.
+# gnssserver comes from the venv the installer builds from requirements.txt.
 # Debug tap: mirrors the third serial port to TCP 50011. Not part of normal
 # operation — kept for bench work.
 [Unit]
 Description=Rover service to send the gps carriage data
 After=multi-user.target
+# Skip, don't fail, on a unit without this port — see the comment in
+# jlw_rover_outfeed_nav.service.in.
+ConditionPathExists=/dev/ttyUSB3
 
 [Service]
-ExecStart=@MM_HOME@/pygpsclient/bin/gnssserver -I /dev/ttyUSB3 --baudrate 460800 --outport 50011 --verbosity 1
+ExecStart=/opt/metal_mapper/venv/bin/gnssserver -I /dev/ttyUSB3 --baudrate 460800 --outport 50011 --verbosity 1
 Restart=always
 RestartSec=2
 

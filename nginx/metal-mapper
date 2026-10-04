@@ -6,6 +6,24 @@ server {
     listen 80;
     server_name _;
 
+    # The kiosk page never reloads itself, so an nginx error page it lands
+    # on at boot — 502 while gunicorn's worker is still importing, 504 when
+    # the first landing render outlasts the proxy timeout — stayed on the
+    # screen until someone restarted the kiosk. Answer those with our own
+    # page, which retries every 3 s until the app answers. Inline (no file
+    # www-data would have to reach inside the checkout); nothing in the
+    # body may contain '$' — nginx expands variables in return strings.
+    # App-generated errors are untouched: proxy_intercept_errors stays off.
+    error_page 502 503 504 @starting;
+    location @starting {
+        # a named location keeps the request URI, and a mime-mapped
+        # extension on it (…/x.txt) would beat default_type — nginx's
+        # documented idiom for "one type for everything here"
+        types { }
+        default_type text/html;
+        return 503 '<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3"><title>Metal Mapper — starting</title><style>body{background:#1a1a2e;color:#eee;font-family:Arial,sans-serif;margin:0;height:100vh;display:flex;align-items:center;justify-content:center;text-align:center}h1{color:#e94560;margin:0 0 12px}p{color:#a0a0c0;margin:0}</style></head><body><div><h1>Metal Mapper is starting…</h1><p>waiting for the web app — this page retries every 3 s</p></div></body></html>';
+    }
+
     # SSE — longer prefix wins over the catch-all below
     location /stream/ {
         proxy_pass         http://metal_mapper_app;

@@ -21,7 +21,6 @@ merge anything:
 | `<name>_<epoch>__<host>.db`       | `<host>` only     | read-only        |
 | `<study>.targets__<host>.json`    | `<host>` only     | read-only        |
 | `<name>_<epoch>__<host>.log`      | `<host>` only     | read-only        |
-| legacy files (no `__<host>` tag)  | write-once        | read-only        |
 
 New study ids get the recording unit's host tag appended by db_map
 (`new_study_id`), and dig targets flagged anywhere go into the flagging
@@ -33,8 +32,14 @@ target *found* works the same way: the annotation is written into the
 marking unit's own sidecar, keyed by the target's `src:id`, so either crew
 can retire any pin. **Un-marking**, though, only works on the unit that
 set the mark — the mark lives in that unit's file, and popping your own
-sidecar can't undo it. The UI only offers ↩ for your own marks, and the
-server refuses others' with a message naming the unit to un-mark on.
+sidecar can't undo it. The three status boxes (visited / found / skip)
+work the same way: a flag another unit set shows as a dimmed, disabled
+checkbox, and `POST /targets/<id>/status` refuses to clear it with a 403
+(`<flag> was set on another unit — clear it there`). Sidecar format
+version 2 adds `marks` (visited/skip) and `sets` (named, ordered pin
+lists) to the same one-writer file; a pin copied from another unit's pin
+by *save as set* carries `from`, and status marks for it are written
+under the SOURCE key, so even a v1 reader sees the find.
 
 The host tag is the short hostname with everything outside `[A-Za-z0-9-]`
 replaced by `-` (`db_map.HOST_TAG`; `sync_studies.sh` derives the same
@@ -72,15 +77,16 @@ contains `__`.
    longer parses) while its study db is present** is restored from the hub
    — losing it would reset the target numbering and let stale found-marks
    strike new targets. This covers our sidecars on every study we hold,
-   own, foreign, or legacy; a corrupt one is set aside as `*.corrupt`
+   own or foreign; a corrupt one is set aside as `*.corrupt`
    first (only the first set-aside is kept — it holds the recoverable
    bytes), and a restored copy that is itself corrupt is dropped rather
    than accepted (fix or prune that copy on the hub).
 4. **Pull pass 2**: in-place updates for files **another unit owns** (its
    growing live snapshot, its updated sidecars, its meta edits). Built as
-   an explicit file list with a real ownership parse, so a legacy id that
-   merely contains `__` can never be mistaken for foreign and get local
-   edits clobbered. A foreign db sitting under a stale local `-wal` or
+   an explicit file list with a real ownership parse, so an untagged id
+   (a file copied onto the hub by hand) that merely contains `__` can never
+   be mistaken for foreign and get local edits clobbered. A foreign db
+   sitting under a stale local `-wal` or
    `-journal` (a crashed non-owner settings write) is checkpointed/rolled
    back first — swapping the db file under a hot journal corrupts the
    copy — and skipped for the cycle if the journal won't resolve.
@@ -98,8 +104,7 @@ Consequences worth knowing:
 - **Non-owner in-db writes are ephemeral.** Saving view settings or
   re-zeroing on a study the *other* unit recorded writes into your local
   copy, and the next pull overwrites it. Targets are exempt — they live in
-  sidecars. (Legacy studies never update in transit, so local edits to
-  those stick.)
+  sidecars.
 - The empty-study purge (`purge_empty_studies`) skips foreign studies — a
   freshly-started study legitimately syncs in with 0 points — and skips
   legacy ones while `sync_hub` is configured, since a purge would just
@@ -110,13 +115,13 @@ Consequences worth knowing:
   number.
 - If the hub is unreachable (unit at home, base Pi off) the cycle is a
   quiet no-op — the timer keeps ticking, nothing turns red.
-- **Legacy pins don't travel.** Studies recorded before sidecars keep
+- **In-db pins don't travel.** Studies recorded before sidecars keep
   their dig pins in the db's own `targets` table; the map still draws them
-  (keys `db:N`, bare-number labels), but a legacy db is write-once in the
-  sync, so the peer only ever sees the rows the seed carried, and a
-  `db:N` pin deleted here stays on the peer. (Pins flagged since the
-  sidecar change go to sidecars and sync like any other — this is about
-  the old rows only.)
+  (keys `db:N`, bare-number labels), but only sidecars carry pins between
+  units, so a `db:N` pin deleted here stays on the peer.
+  `migrate_legacy_targets.py` moves such rows into a sidecar. (Pins flagged
+  since the sidecar change go to sidecars and sync like any other — this
+  is about the old rows only.)
 - **Hub misses are routine, and quiet on the Pis.** The own-sidecar
   restore pass and pass 2 ask the hub for explicit file lists, and an
   entry the hub lacks is normal: our sidecar for a study nobody ever
@@ -171,25 +176,6 @@ can leave a stale `.name.XXXXXX` temp file in the module dir; the units
 never pull dotfiles, so it's harmless — prune them whenever you're on the
 hub anyway.
 
-**One-time bootstrap** of the pre-sync library, from whichever unit holds
-it (safe to repeat; `--ignore-existing` means a re-seed can never clobber):
-
-```bash
-/opt/metal_mapper/sync_studies.sh --seed
-```
-
-Run it as the service user (the account `jlw_metalmap.service` runs as, not
-plain `sudo` — the config is read from `$HOME`) while the hub is up, and expect `seeding N file(s) to
-the hub` followed by `cycle ok`. `seed skipping 0-point` lines are empty
-or unreadable dbs that stay local on purpose. A legacy db whose `-wal` is
-non-empty (a pre-sync session that crashed or lost power) ships as a
-consistent snapshot with its wal folded in for later — look for `seeding
-snapshot of wal-hot`. If it says `another sync (pid N) is running —
-skipping`, a timer cycle held the lock: run it again. For a first seed of
-a big library over WiFi, stop `jlw_mm_sync.timer` for the duration — a
-cycle that steals the lock after an hour wipes the seed's staging files
-mid-transfer.
-
 ## Testing
 
 `python3 test_sync_studies.py` simulates both units and the hub in a temp
@@ -198,6 +184,6 @@ tree (a local directory stands in for the rsync module, plus a real
 snapshot + growth propagation + the 0-point gates, cross-unit sidecar
 flags, crashed-session checkpoint healing (own and foreign), delete
 non-propagation and the lost/corrupt-sidecar restore, corrupted-copy healing,
-hub temp-file exclusion, legacy seeding and the `__`-in-name trap, and
+hub temp-file exclusion, untagged files and the `__`-in-name trap, and
 the lock (including staleness and pid recycling). The web-side
 sidecar/merge/permission logic is covered in `test_db_map.py`.

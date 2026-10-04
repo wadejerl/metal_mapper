@@ -4,25 +4,21 @@
 # run by hand. Reads studies_dir and sync_hub from ~/metal_mapper/config.json
 # (sync_hub empty = disabled, exits 0).
 #
-#   ./sync_studies.sh           normal cycle
-#   ./sync_studies.sh --seed    one-time bootstrap: also push legacy studies
-#                               (ids without a '__<host>' tag) to the hub
+#   ./sync_studies.sh           one cycle, no options
 #
 # The whole scheme rests on one invariant, enforced here and in db_map.py:
 # EVERY SYNCED FILE HAS EXACTLY ONE WRITING UNIT, so rsync never merges.
 #   - '<name>_<epoch>__<host>.db'          written only by <host>
 #   - '<study>.targets__<host>.json'       written only by <host>
-#   - legacy files (no tag)                write-once: seeded to the hub,
-#                                          pulled if absent, never updated
 # Consequences:
 #   - push: only files tagged with OUR host (plus a consistent snapshot of
 #     the live study — never the hot WAL db itself)
 #   - pull: everything not ours; files tagged with another host also update
-#     in place (their owner is authoritative), legacy files never do
+#     in place (their owner is authoritative)
 #   - no --delete anywhere: a deletion never propagates. Removing a study
 #     for good = delete it on the OWNING unit first, then the hub (a hub-
 #     only delete resurrects from the owner's next push), then peers;
-#     local deletes of foreign/legacy files resurrect on the next pull.
+#     local deletes of foreign files resurrect on the next pull.
 #
 # Test hooks: MM_CONFIG_FILE, MM_PID_FILE, MM_HOST_TAG (must match db_map's
 # HOST_TAG derivation), and a local directory path works as sync_hub.
@@ -30,8 +26,10 @@ set -euo pipefail
 
 CONFIG="${MM_CONFIG_FILE:-$HOME/metal_mapper/config.json}"
 PIDFILE="${MM_PID_FILE:-/tmp/metal_detector_daemon.pid}"
-SEED=0
-[ "${1:-}" = "--seed" ] && SEED=1
+if [ $# -gt 0 ]; then
+    echo "usage: $0   (no options — every cycle pushes our files and pulls the rest)" >&2
+    exit 2
+fi
 
 note() { echo "[sync] $*"; }
 FAIL=0
@@ -130,8 +128,8 @@ if [[ "$HUB" == rsync://* ]] \
 fi
 
 # A --files-from entry the hub lacks is routine, not an error: our sidecar
-# for a study nobody ever flagged on from this unit (every legacy study,
-# every unflagged own one), a foreign file its owner hasn't pushed yet, a
+# for a study nobody ever flagged on from this unit (every unflagged own
+# one), a foreign file its owner hasn't pushed yet, a
 # hub prune. GNU rsync >= 3.1 can be told so: --ignore-missing-args skips
 # the entry silently — no per-file stderr line, no rc 23 — and still
 # reports a file that vanishes AFTER it was listed. openrsync (Mac bench)
@@ -394,63 +392,6 @@ if [ ${#push[@]} -gt 0 ]; then
     run_rsync "${push[@]}" "$HUB"/ || warn "push of own files failed"
 fi
 
-# --seed: bootstrap pre-sync history onto the hub. --ignore-existing means
-# a re-seed (or a seed from the second unit) can never clobber anything.
-if [ "$SEED" = 1 ]; then
-    seedlist=()
-    for f in "$SDIR"/*.db "$SDIR"/*.log; do
-        base="$(basename "$f")"
-        [ "$base" = "$LIVE" ] && continue
-        if [ "${f##*.}" = "db" ]; then
-            if [ -s "$f-wal" ]; then
-                # a pre-sync session that crashed or lost power left its
-                # wal hot — it may hold ALL the points, and nothing else
-                # ever reopens an old id. Same recipe as the push loop:
-                # fold the wal in for next time, ship a consistent
-                # snapshot now, never the raw file. Silently skipping it
-                # (as before) left a db off the hub with no line to say so.
-                heal_db "$f" || true
-                if snapshot_db "$f" "$STAGE/$base"; then
-                    if no_points "$STAGE/$base"; then
-                        note "seed skipping 0-point wal-hot $base"
-                        rm -f "$STAGE/$base"
-                    else
-                        note "seeding snapshot of wal-hot $base"
-                        seedlist+=("$STAGE/$base")
-                    fi
-                else
-                    note "seed skipping wal-hot $base (unreadable)"
-                    rm -f "$STAGE/$base"
-                fi
-                continue
-            fi
-            # same phantom logic as the push loop: purge fodder stays local
-            if [ "$(wc -c < "$f")" -lt 262144 ] && no_points "$f"; then
-                note "seed skipping 0-point $base"
-                continue
-            fi
-        else
-            # a .log obeys its study's phantom gate, as in the push loop:
-            # an orphan or 0-point study's log must not outlive it on the hub
-            db="$SDIR/${base%.log}.db"
-            if [ ! -e "$db" ]; then
-                note "seed skipping orphan $base (no local study db)"
-                continue
-            fi
-            if [ "$(wc -c < "$db")" -lt 262144 ] && no_points "$db"; then
-                note "seed skipping $base (0-point study)"
-                continue
-            fi
-        fi
-        seedlist+=("$f")
-    done
-    if [ ${#seedlist[@]} -gt 0 ]; then
-        note "seeding ${#seedlist[@]} file(s) to the hub"
-        run_rsync --ignore-existing "${seedlist[@]}" "$HUB"/ \
-            || warn "seed push failed"
-    fi
-fi
-
 # ── pull pass 1: anything we don't have yet (never ours, never WAL) ───────
 # --exclude='.*' keeps out the hub rsyncd's dot-temp files of the OTHER
 # unit's in-flight push ('.<name>.db.XXXXXX') — pulling one would plant a
@@ -469,7 +410,7 @@ run_rsync --ignore-existing \
 # deleted (SD card restored from a clone, hand cleanup): left alone, this
 # unit would restart seq at 1 and hand out 'host:N' keys that other units'
 # stale found-marks still point at. Covers our sidecars on EVERY study we
-# still hold — own, foreign (the whole point of cross-flagging), legacy. A
+# still hold — own or foreign (the whole point of cross-flagging). A
 # present-but-unparseable sidecar is set aside first, since it would block
 # its own repair (push already refused to ship it). --ignore-existing
 # means a healthy sidecar is never touched; entries the hub doesn't have
@@ -515,8 +456,9 @@ fi
 # ── pull pass 2: updates to files another unit owns ───────────────────────
 # Their owner is authoritative: a growing live snapshot, new flags in their
 # targets sidecar, meta edits to their study. Explicit list (not patterns)
-# so a LEGACY id that happens to contain '__' in its name part can never be
-# mistaken for foreign-owned and get local edits clobbered.
+# so an untagged id (a file copied onto the hub by hand) whose name part
+# happens to contain '__' can never be mistaken for foreign-owned and get
+# local edits clobbered.
 pull2="$STAGE/.pull2list"
 : > "$pull2"
 for f in "$SDIR"/*.db "$SDIR"/*.json "$SDIR"/*.log; do

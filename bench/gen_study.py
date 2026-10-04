@@ -8,6 +8,8 @@ is exactly what the real daemon produces.
 
 Study 'warn_demo': small study carrying drift flags + identity failure, to
 exercise the warning pills and banner states.
+On request: 'big' (400k-point scale test) and 'overlap' (every row surveyed
+twice — the Combine re-pass case, all of it in the renderer's LOD path).
 """
 import math
 import os
@@ -190,7 +192,57 @@ def gen_big(n_target=400_000):
     conn.close()
     print(f'big_demo: {n} points ({passes} passes over {field_w:.0f} m)')
 
+def gen_overlap(rows=60, field_w=100.0):
+    """Re-pass test: two full laps over the same rows, so every cell is
+    visited twice ~rows*per_pass points apart — the case the Combine view
+    exists for (re-pass ADDS). 120k points: zoomed out they all sit in view,
+    i.e. the renderer's LOD path, which must honour Combine too (a busy
+    view silently looked like combine-off until Sept 2026). 'overlap' argv."""
+    path = os.path.join(OUT, 'overlap_demo.db')
+    if os.path.exists(path):
+        os.unlink(path)
+    conn = sd.db_open(path)
+    sd.meta_set(conn, 'study_name', 'overlap_demo')
+    sd.meta_set(conn, 'created_at', str(time.time()))
+    for k, v in HEADER.items():
+        sd.meta_set(conn, k, v)
+    speed, hz = 2.0, 20.0
+    step = speed / hz
+    per_pass = int(field_w / step)
+    t = time.time() - 2 * rows * per_pass / hz
+    n = 0
+    conn.execute('BEGIN')
+    for _lap in range(2):
+        for row in range(rows):
+            east = (row % 2 == 0)
+            heading = 90.0 if east else 270.0
+            y = 2.0 + row * 3.5
+            for j in range(per_pass):
+                x = 2.0 + j * step if east else 2.0 + field_w - j * step
+                lat, lon = ll(x, y)
+                adc = []
+                for ch in range(8):
+                    v = 52000.0 + ch * 190
+                    for tx, ty, amp, rad in TARGETS:
+                        d2 = (x - tx % field_w) ** 2 + (y - ty) ** 2
+                        v += 16 * amp * math.exp(-d2 / (2 * rad * rad))
+                    v += 40.0 * math.sin(x * 7.3 + y * 3.1 + ch)
+                    adc.append(max(0, min(65520, int(v))))
+                conn.execute(
+                    'INSERT INTO points (ts,lat,lon,heading,fix,'
+                    'adc0,adc1,adc2,adc3,adc4,adc5,adc6,adc7,gps_ts,vin,temp) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (t, lat, lon, heading + 2.0 * math.sin(x / 5.0), 4,
+                     *adc, f'{(120000 + n / hz):.2f}', None, None))
+                t += 1 / hz
+                n += 1
+    conn.commit()
+    conn.close()
+    print(f'overlap_demo: {n} points ({rows} rows over {field_w:.0f} m, surveyed twice)')
+
 gen_serpentine()
 gen_warn()
 if 'big' in sys.argv[1:]:
     gen_big()
+if 'overlap' in sys.argv[1:]:
+    gen_overlap()

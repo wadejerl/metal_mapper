@@ -9,6 +9,10 @@ Studies land in `bench/studies/` (gitignored); point db_map at it with
 ```sh
 python3 bench/gen_study.py     # serpentine_demo (630-pt survey, 2 targets)
                                # + warn_demo (drift flags, identity failure)
+python3 bench/gen_study.py big     # + big_demo: 400k points, the LOD scale test
+python3 bench/gen_study.py overlap # + overlap_demo: 120k points, every row
+                               #   surveyed twice — the Combine re-pass case,
+                               #   all of it in the renderer's LOD path
 python3 bench/gen_drift.py     # drift_demo (300 heading-NULL points — the
                                # no-RTK "GPS wander fakes movement" case)
 ```

@@ -1,23 +1,30 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <title>Metal Mapper — Studies</title>
+  <title>{{ host }} — Metal Mapper</title>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <link rel="stylesheet" href="/static/style.css?v={{ asset_v }}">
   <style>
     body { padding: 24px; }
     h1   { color: #e94560; margin-top: 0; }
+    /* which unit this is — two Pis look identical otherwise */
+    h1 .host { color: #a0a0c0; font-weight: normal; font-size: 0.55em;
+               font-family: monospace; margin-left: 10px; vertical-align: middle; }
     .daemon-box { padding: 8px 16px; border-radius: 6px; display: inline-flex;
                   align-items: center; gap: 16px; margin: 0 12px 22px 0;
                   font-weight: bold; font-size: 13px; }
     .daemon-on  { background: #1b5e20; color: #a5d6a7; }
     .daemon-off { background: #37474f; color: #90a4ae; }
-    /* fits without scrolling at the Pi's 800px; pannable on a phone.
-       Headers, FW hash and the View Map button never wrap — the study
-       name and the two timestamp columns are the flexible ones. */
+    /* Study..View Map fit without scrolling at the Pi's 800px; pannable on
+       a phone. Headers, counts and the View Map button never wrap — the
+       study name and the date are the flexible columns. The FW column
+       comes last and, at the kiosk's width, hangs off the right edge (the
+       table is one FW column wider than its wrapper): a console or laptop
+       sees it, the 800x480 operator screen doesn't unless panned. */
     .tblwrap { overflow-x: auto; margin-bottom: 28px; }
     table { width: 100%; border-collapse: collapse; }
+    @media (max-width: 800px) { table { width: calc(100% + 120px); } }
     th { background: #16213e; color: #a0a0c0; text-align: left;
          padding: 8px; white-space: nowrap; }
     td { padding: 8px; border-bottom: 1px solid #252545; }
@@ -43,7 +50,9 @@
     .err { color: #ef9a9a; font-size: 13px; margin-top: 8px; }
     .empty { color: #555; text-align: center; padding: 20px; }
     .fwcol { color: #667; font-family: monospace; font-size: 11px;
-             white-space: nowrap; }
+             white-space: nowrap; width: 104px; }   /* +16px padding = the 120px overhang */
+    th.fwcol { color: #a0a0c0; font: inherit; }       /* header styled like the others */
+    .zero { color: #556; }
     /* the two things an operator actually does, as big touch targets */
     .action-row { display: flex; gap: 18px; flex-wrap: wrap;
                   margin: 4px 0 26px 0; }
@@ -149,7 +158,7 @@
   </div>
 </div>
 
-<h1>Metal Mapper</h1>
+<h1>Metal Mapper <span class="host">{{ host }}</span></h1>
 <div style="color:#555; font-size:11px; font-family:monospace; margin-top:-14px; margin-bottom:18px;">{{ git_hash }}</div>
 
 {% set ds = daemon_status %}
@@ -214,8 +223,9 @@
     <th>Study</th>
     <th>Created</th>
     <th>Points</th>
-    <th>FW</th>
+    <th title="dig targets flagged on this map — by this unit or synced in from another">Targets</th>
     <th></th>
+    <th class="fwcol">FW</th>
   </tr>
   {% for s in studies %}
   <tr>
@@ -229,13 +239,14 @@
        giving this date room to render on one line at 800px #}
     <td style="white-space:nowrap;">{{ s.created_at | ts_fmt }}</td>
     <td>{{ s.count }}</td>
-    <td class="fwcol">{{ s.fw }}</td>
+    <td{% if not s.targets %} class="zero"{% endif %}>{{ s.targets }}</td>
     <td><a class="view-btn" href="/view/{{ s.id }}">View Map</a></td>
+    <td class="fwcol">{{ s.fw }}</td>
   </tr>
   {% else %}
   {# the start panel is hidden while a daemon runs (e.g. a raw session on an
      otherwise-empty install) — don't point at a form that isn't there #}
-  <tr><td colspan="5" class="empty">No studies yet —
+  <tr><td colspan="6" class="empty">No studies yet —
     {% if ds.running %}stop the running daemon to start one.{% else %}start one above.{% endif %}
   </td></tr>
   {% endfor %}

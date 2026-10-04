@@ -373,7 +373,9 @@ no-hardware test rig. Beyond the design below: a heading offset
 (`heading_offset_deg` in `config.json`, default 270, added to the reported
 heading before all coil math — a property of the vehicle mounting, for a GPS
 that reports heading along the antenna baseline instead of the direction of
-travel; a study's own saved `sl_heading_offset_deg` takes precedence);
+travel; a study's own saved `sl_heading_offset_deg` takes precedence, and
+the view's **Cal** panel can override pitch, antenna-1 offset and heading per
+study as `sl_cal_*` — display side only, the recorded rows never change);
 heading-NULL points render as antenna dots + track instead of the coil
 carpet (no-gate / drift studies); Leaflet + tiles degrade offline with
 user geojson overlays still rendered. The SSE stream carries the daemon's

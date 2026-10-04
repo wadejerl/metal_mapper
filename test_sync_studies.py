@@ -293,28 +293,8 @@ run_sync('unitB')
 check("corrupted copy of other unit's study heals from hub",
       points_in(b_live) == 5, points_in(b_live))
 
-# ── legacy studies: seed once, never updated, never parsed as foreign ────────
-leg = make_study('unitA', 'legacy_run', n_points=2)
-trap = make_study('unitA', 'my__probe_1758', n_points=2)  # '__' in NAME part
-r = run_sync('unitA')
-check('legacy not pushed without --seed',
-      not os.path.exists(os.path.join(HUB, 'legacy_run.db'))
-      and not os.path.exists(os.path.join(HUB, 'my__probe_1758.db')),
-      sorted(os.listdir(HUB)))
-r = run_sync('unitA', '--seed')
-check('--seed pushes legacy', r.returncode == 0
-      and points_in(os.path.join(HUB, 'legacy_run.db')) == 2
-      and points_in(os.path.join(HUB, 'my__probe_1758.db')) == 2,
-      (r.returncode, r.stdout, r.stderr))
-run_sync('unitB')
-bleg = os.path.join(UNITS['unitB']['sdir'], 'legacy_run.db')
-btrap = os.path.join(UNITS['unitB']['sdir'], 'my__probe_1758.db')
-check('legacy pulled where absent',
-      points_in(bleg) == 2 and points_in(btrap) == 2)
-
-# steady state with studies nobody ever flagged on (every legacy one, the
-# closed own ones): the restore pass asks the hub for sidecars it does not
-# have. GNU rsync is told to skip those silently — the journal shows only
+# steady state with studies nobody ever flagged on (the closed own ones):
+# the restore pass asks the hub for sidecars it does not have. GNU rsync is told to skip those silently — the journal shows only
 # the script's own lines; openrsync still logs one line per cycle, which
 # run_rsync tolerates
 r = run_sync('unitA')
@@ -327,56 +307,34 @@ else:
           r.returncode == 0 and 'cycle ok' in r.stdout,
           (r.returncode, r.stdout, r.stderr))
 
-# a pre-sync session that crashed with its wal hot: --seed used to skip it
-# without a word. Now it ships a consistent snapshot WITH the wal's rows
-# and folds the wal in for later cycles, like the push loop does
-wleg = make_study('unitA', 'legacy_walhot', n_points=1)
-crash_code = f'''
-import os, sys
-sys.path.insert(0, {REPO!r})
-import serial_daemon as sd
-conn = sd.db_open({wleg!r})
-sd.insert_rows(conn, [{{'lat': 40.9, 'lon': -119.9, 'heading': 90.0,
-                        'fix': 4, 'adc': [5] * 8, 'gps_ts': '5'}}] * 3,
-               12.4, 25.0)
-os._exit(0)   # no close: -wal holds the 3 rows
-'''
-subprocess.run([sys.executable, '-c', crash_code], check=True)
-assert os.path.getsize(wleg + '-wal') > 0, 'legacy crash sim left no hot wal?'
-r = run_sync('unitA', '--seed')
-check('--seed ships a wal-hot legacy db as a snapshot WITH its wal rows',
-      r.returncode == 0
-      and 'seeding snapshot of wal-hot legacy_walhot.db' in r.stdout
-      and points_in(os.path.join(HUB, 'legacy_walhot.db')) == 4
-      and wal_gone(wleg + '-wal'),
-      (r.returncode, r.stdout, r.stderr,
-       points_in(os.path.join(HUB, 'legacy_walhot.db'))))
-r = run_sync('unitA', '--seed')
-check('re-seed after the heal: plain file, nothing re-shipped, no dotfiles on hub',
-      r.returncode == 0 and 'wal-hot' not in r.stdout
-      and points_in(os.path.join(HUB, 'legacy_walhot.db')) == 4
-      and not [n for n in os.listdir(HUB) if n.startswith('.')],
-      (r.returncode, r.stdout, sorted(os.listdir(HUB))))
-
-# B tweaks its local copy (view settings); hub's copy also changes. Neither
-# side may clobber B's local edit — legacy files are write-once in transit.
-conn = sqlite3.connect(bleg)
-conn.execute("INSERT OR REPLACE INTO meta VALUES ('sl_offset', '42')")
-conn.commit()
-conn.close()
+# ── untagged files (no '__<host>' in the id): whatever lands on the hub by hand ──
+# No unit ever pushes one. Pass 1 pulls them where absent; pass 2 never
+# updates them, because it parses ownership instead of matching '__' — an
+# untagged id whose NAME part contains '__' must not be mistaken for
+# foreign and have local edits clobbered.
+trap = make_study('unitA', 'my__probe_1758', n_points=2)  # '__' in NAME part
+r = run_sync('unitA')
+check('untagged file is never pushed',
+      r.returncode == 0 and not os.path.exists(os.path.join(HUB, 'my__probe_1758.db')),
+      sorted(os.listdir(HUB)))
+shutil.copy(trap, os.path.join(HUB, 'my__probe_1758.db'))      # by hand
+run_sync('unitB')
+btrap = os.path.join(UNITS['unitB']['sdir'], 'my__probe_1758.db')
+check('untagged hub file pulled where absent', points_in(btrap) == 2)
 conn = sqlite3.connect(os.path.join(HUB, 'my__probe_1758.db'))
 conn.execute("INSERT OR REPLACE INTO meta VALUES ('sl_offset', '99')")
 conn.commit()
 conn.close()
 run_sync('unitB')
-conn = sqlite3.connect(f'file:{bleg}?mode=ro', uri=True)
-v1 = dict(conn.execute('SELECT key,value FROM meta')).get('sl_offset')
-conn.close()
 conn = sqlite3.connect(f'file:{btrap}?mode=ro', uri=True)
 v2 = dict(conn.execute('SELECT key,value FROM meta')).get('sl_offset')
 conn.close()
-check('legacy local edits survive the pull (no pass-2 update)',
-      v1 == '42' and v2 is None, (v1, v2))
+check("untagged '__'-in-name file is not mistaken for foreign (no pass-2 update)",
+      v2 is None, v2)
+r = run_sync('unitA', '--seed')
+check('any argument is a usage error (the old --seed bootstrap is gone)',
+      r.returncode == 2 and 'usage' in r.stderr and 'cycle ok' not in r.stdout,
+      (r.returncode, r.stdout, r.stderr))
 
 # ── locking ──────────────────────────────────────────────────────────────────
 lock = os.path.join(UNITS['unitA']['sdir'], '.sync_lock')
@@ -503,11 +461,6 @@ check('0-point study: sidecar and log held back too', r.returncode == 0
       and not os.path.exists(os.path.join(HUB, 'zs_1758000010__unitA.db'))
       and not os.path.exists(os.path.join(
           HUB, 'zs_1758000010__unitA.targets__unitA.json'))
-      and not os.path.exists(os.path.join(HUB, 'zs_1758000010__unitA.log')),
-      (r.returncode, r.stdout, sorted(os.listdir(HUB))))
-r = run_sync('unitA', '--seed')
-check("--seed holds back a 0-point study's log too", r.returncode == 0
-      and 'seed skipping zs_1758000010__unitA.log (0-point study)' in r.stdout
       and not os.path.exists(os.path.join(HUB, 'zs_1758000010__unitA.log')),
       (r.returncode, r.stdout, sorted(os.listdir(HUB))))
 conn = sd.db_open(zs)

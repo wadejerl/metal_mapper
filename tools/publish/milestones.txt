@@ -11,4 +11,4 @@
 2c0fa2e5293f8ee77b7d0b1e77041d90edf4a05a v0.5 Pi deployment — installer, kiosk UI, raw scope view, landing page, RTK feed gating
 033f907ca90c88be67b33a430b8978fefdb76965 v0.6 dig targets, sync filters, raster mode, two-unit studies sync via the base Pi hub
 14274ba333897407525569b225cb3c81aeb722ed v0.7 GPS/pacer fixes — free-running TIM7, GPS identity, late-boot config re-send
-d879b99109352f261f0230941928b1c7d408e1df v0.8 map orientation + Follow toggle, legacy pin migration, GPL-3.0 license, templated systemd units, publish tooling
+4051614a32377d7b4e07fc7336aa3f52265e5377 v0.8 map orientation + Follow toggle, legacy pin migration, GPL-3.0 license, templated systemd units, publish tooling

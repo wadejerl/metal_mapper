@@ -27,6 +27,21 @@
     /* rotation is an inline transform driven per frame from JS — a CSS
        transition on rotate(var(--rot)) never left 0° in Chromium 152 */
     #map { position:absolute; transform-origin:50% 50%; }
+    /* load banner: big "please wait" over the map for the slow steps of
+       opening a view (outline computation, then the points load and first
+       paint). Lives in #mapWrap, not #map, so it does not turn with the map */
+    #loadBanner { position:absolute; left:0; right:0; top:50%;
+                  transform:translateY(-50%); z-index:1100; display:flex;
+                  justify-content:center; pointer-events:none; }
+    #loadBanner[hidden] { display:none; }
+    #loadBanner .box { background:rgba(0,0,0,0.72); color:#fff; padding:18px 30px;
+                       border-radius:10px; text-align:center; max-width:80%; }
+    #loadBanner .status { font:bold 30px/38px Arial,sans-serif; }
+    #loadBanner .status:empty { display:none; }
+    /* failures stay on screen in red — where it died is the point */
+    #loadBanner .err { color:#ff8a80; font:bold 18px/24px Arial,sans-serif;
+                       white-space:pre-line; }
+    #loadBanner .status:not(:empty) + .err:not(:empty) { margin-top:10px; }
     /* orientation control: bottom-right, above the attribution line */
     #rotCtl { position:absolute; right:8px; bottom:22px; z-index:1000;
               display:flex; align-items:center; gap:4px; padding:4px;
@@ -73,13 +88,22 @@
     /* marked found: retired but still on the map (struck number) */
     .tgt-pin.tgt-cleared { background:#666; }
     .tgt-pin.tgt-cleared span { text-decoration:line-through; color:#222; }
+    /* skip: leave it — dull brown, struck; visited: a dot after the number */
+    .tgt-pin.tgt-skip { background:#8d6e63; }
+    .tgt-pin.tgt-skip span { text-decoration:line-through; color:#2b1d1a; }
+    .tgt-pin.tgt-visited span::after { content:'·'; }
     /* selection trumps all of the above */
     .tgt-pin.tgt-sel { background:#00e5ff; }
     .tgt-pin.tgt-sel span { text-decoration:none; color:#000; }
     #map.marking { cursor:crosshair; }
+    /* Vertical budget: at 800x480 the panel starts at the toolbar's foot
+       (~175) and must end above the orientation buttons (#rotCtl, ~405)
+       or HDG↑/TGT↑ hide behind it — every row below is trimmed to fit.
+       A ranked pin adds the #tgtSize row; the 9px lat/lon line yields its
+       place then (updateApproach), so the budget holds either way. */
     #tgtPanel { display:none; position:fixed; right:10px; z-index:1100;
                 width:150px; background:rgba(10,10,10,0.88); color:#fff;
-                border:1px solid #555; border-radius:6px; padding:8px;
+                border:1px solid #555; border-radius:6px; padding:6px 8px;
                 text-align:center; font-size:12px; }
     #tgtHead { display:flex; align-items:center; gap:4px;
                justify-content:space-between; margin-bottom:4px; }
@@ -89,14 +113,75 @@
     .tgt-btn { background:#333; color:#ccc; border:1px solid #666;
                border-radius:3px; font-size:12px; width:22px; height:22px;
                padding:0; flex:none; }
-    #tgtArrow { font-size:64px; line-height:72px; transition:transform 0.2s; }
-    #tgtDist { font-size:26px; font-weight:bold; font-family:monospace; }
+    #tgtArrow { font-size:60px; line-height:60px; color:#888;
+                transition:transform 0.2s, color 0.3s; }
+    /* nav-receiver lock, on the arrow: pins sit where an RTK-FIXED receiver
+       said they were, so anything less on the nav receiver puts the driver
+       metres off the hole. Green = go; amber = RTK float, wait for it to
+       converge; red = no RTK at all / no fix / nav dead — check the
+       corrections link. Amber and red pulse so they can't be missed. */
+    #tgtFix { font:bold 13px/18px monospace; letter-spacing:.5px;
+              border-radius:4px; padding:1px 0; margin:0 0 2px;
+              background:#333; color:#bbb; }
+    #tgtFix.fix-ok   { background:#1b5e20; color:#c8e6c9; }
+    #tgtFix.fix-warn { color:#fff3e0; animation:fixpulse-warn 1s ease-in-out infinite alternate; }
+    #tgtFix.fix-bad  { color:#ffebee; animation:fixpulse-bad 0.5s ease-in-out infinite alternate; }
+    @keyframes fixpulse-warn { from { background:#7a4f00; } to { background:#ef8f00; } }
+    @keyframes fixpulse-bad  { from { background:#7f0000; } to { background:#e53935; } }
+    #tgtDist { font-size:26px; line-height:26px; font-weight:bold; font-family:monospace; }
     #tgtRef { font-size:10px; color:#999; }
-    #tgtDev { margin-top:4px; font-family:monospace; border-radius:4px;
+    #tgtDev { margin-top:2px; font-family:monospace; border-radius:4px;
               padding:1px 0; }
     #tgtDev.hot { background:#a00; }  #tgtDev.warm { background:#a60; }
     #tgtLL { font-size:9px; color:#888; font-family:monospace;
-             margin-top:4px; }
+             margin-top:2px; }
+    /* one line, always: a wrapped size row costs the row the lat/lon line
+       gave up (the green-index radius it used to carry is in the toolbar) */
+    #tgtSize { display:none; font:11px/12px monospace; color:#a5d6a7;
+               white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    /* status flags: big enough for a gloved thumb on the kiosk */
+    #tgtStatus { display:flex; justify-content:space-between; gap:4px;
+                 margin-top:4px; }
+    #tgtStatus label { display:flex; flex-direction:column; align-items:center;
+                       gap:2px; font-size:10px; color:#ccc; flex:1;
+                       background:#222; border:1px solid #555; border-radius:4px;
+                       padding:2px 0; cursor:pointer; }
+    #tgtStatus label.on { background:#2e7d32; border-color:#66bb6a; color:#fff; }
+    #tgtStatus label.theirs { opacity:.6; cursor:default; }
+    #tgtStatus input { width:18px; height:18px; margin:0; }
+    .tgt-btn.armed { background:#b71c1c; color:#fff; width:auto; padding:0 6px; }
+    /* pin-set chooser (toolbar) + the truck's big-type pin list */
+    #setRow { display:flex; align-items:center; gap:4px; }
+    #pinSetSel { background:#222; color:#fff; border:1px solid #666;
+                 border-radius:3px; font-size:11px; padding:2px; max-width:118px; }
+    #listBtn { background:#37474f; color:#cfd8dc; border:1px solid #546e7a;
+               border-radius:4px; font-size:14px; padding:1px 7px; cursor:pointer; }
+    #listPanel { display:none; position:fixed; left:8px; top:150px; z-index:1050;
+                 background:rgba(0,0,0,0.94); color:#eee;
+                 border:1px solid rgba(255,255,255,0.25); border-radius:6px;
+                 padding:8px; width:300px; overflow-y:auto; box-sizing:border-box; }
+    #listHead { display:flex; align-items:center; gap:6px; margin-bottom:6px; }
+    #listSetSel { flex:1; background:#222; color:#fff; border:1px solid #666;
+                  border-radius:4px; font-size:15px; padding:4px; min-width:0; }
+    .list-row { display:flex; align-items:center; gap:8px; min-height:42px;
+                padding:2px 6px; border-bottom:1px solid rgba(255,255,255,0.08);
+                cursor:pointer; font-size:16px; }
+    .list-row:hover { background:rgba(255,255,255,0.08); }
+    .list-row.sel { background:rgba(0,229,255,0.2); }
+    .list-row .ln { width:36px; font:bold 22px/1 sans-serif; text-align:right;
+                    color:#ffb74d; }
+    .list-row .ll { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                    white-space:nowrap; }
+    .list-row .ll small { color:#999; font-size:11px; margin-left:6px; }
+    .list-row .ls { font-size:14px; color:#ccc; white-space:nowrap; }
+    .list-row .ls .f { color:#81c784; }  .list-row .ls .k { color:#bcaaa4; }
+    .list-row .ls .v { color:#90caf9; }
+    .list-row.found .ll, .list-row.skip .ll { color:#888; text-decoration:line-through; }
+    .list-row .lz { width:40px; text-align:right; font:12px monospace; color:#a5d6a7; }
+    #rankBtns { display:flex; gap:4px; margin:2px 0 6px 0; }
+    #rankBtns button { flex:1; background:#333; color:#eee; border:1px solid #666;
+                       border-radius:3px; font-size:11px; padding:3px 4px; }
+    #rankBtns button:hover { filter:brightness(1.25); }
     /* per-channel offset-bias panel */
     #biasPanel { display:none; position:fixed; left:8px; top:150px;
                  z-index:1050; background:rgba(0,0,0,0.92); color:#ddd;
@@ -111,7 +196,76 @@
     .bias-btn { background:#333; color:#eee; border:1px solid #666;
                 border-radius:3px; width:26px; height:20px; padding:0;
                 font-size:13px; line-height:1; }
+    /* coil calibration — same corner and skin as the bias panel; sized
+       to clear the 800x480 kiosk (top 150 + ~230 tall) */
+    #calPanel { display:none; position:fixed; left:8px; top:150px; z-index:1050;
+                width:336px; box-sizing:border-box;
+                background:rgba(0,0,0,0.92); color:#ddd;
+                border:1px solid rgba(255,255,255,0.25); border-radius:6px;
+                padding:8px 10px; font-size:12px; font-family:monospace; }
+    #calPanel h4 { margin:0 0 4px 0; font-size:11px; color:#a5d6a7;
+                   display:flex; justify-content:space-between; gap:10px;
+                   align-items:center; }
+    #calSvg { display:block; margin:0 auto 4px auto; }
+    #calSvg text { font:10px monospace; fill:#ddd; }
+    .cal-row { display:flex; align-items:center; gap:5px; margin:3px 0;
+               white-space:nowrap; }
+    .cal-row label { width:80px; }
+    .cal-row input[type=number] { width:58px; background:#222; color:#fff;
+                                  border:1px solid #666; border-radius:3px;
+                                  font:inherit; padding:1px 3px; text-align:right; }
+    .cal-row input.cal-diff { border-color:#ffb300; color:#ffd54f; }
+    .cal-row .cu { color:#aaa; font-size:11px; }
+    .cal-row .cb { color:#888; font-size:11px; margin-left:auto; }
+    .cal-row .bias-btn { touch-action:none; }   /* hold-to-repeat, no scroll */
     .sliders-col { display:flex; flex-direction:column; gap:4px; }
+    /* pins-by-size column (saved studies; replaces the live strip chart) */
+    /* fixed width: the toolbar is 800px on the kiosk and clips — a long
+       status string here must ellipsize, never push the info column out */
+    #pinCol { display:flex; flex-direction:column; gap:4px; font-size:11px;
+              width:158px; flex:none; }
+    .pin-row { display:flex; align-items:center; gap:5px; white-space:nowrap; }
+    .pin-row select, .pin-row input[type=number] {
+      background:#222; color:#fff; border:1px solid #666; border-radius:3px;
+      font-size:11px; padding:1px 2px; }
+    .pin-row input[type=number] { width:40px; }
+    .pin-row .btn { font-size:11px; padding:2px 8px; }
+    #pinInfo { color:#999; font-family:monospace; font-size:10px; flex:1;
+               min-width:0; overflow:hidden; text-overflow:ellipsis;
+               white-space:nowrap; }
+    /* candidate (not yet saved) pin: dashed cyan ring, same tip anchor */
+    .cand-pin { width:22px; height:22px; border-radius:50% 50% 50% 0;
+                transform:rotate(-45deg); background:rgba(0,229,255,0.25);
+                border:2px dashed #00e5ff; box-shadow:0 0 3px #000;
+                cursor:pointer; }
+    .cand-pin span { display:block; transform:rotate(45deg);
+                     font:bold 11px/18px sans-serif; color:#fff;
+                     text-align:center; }
+    /* ranked pin list: same corner as the bias/meta panels */
+    #rankPanel { display:none; position:fixed; left:8px; top:150px;
+                 z-index:1050; background:rgba(0,0,0,0.92); color:#ddd;
+                 border:1px solid rgba(255,255,255,0.25); border-radius:6px;
+                 padding:8px 10px; font-size:12px; font-family:monospace;
+                 width:250px; overflow-y:auto; box-sizing:border-box; }
+    #rankPanel h4 { margin:0 0 4px 0; font-size:11px; color:#a5d6a7;
+                    display:flex; justify-content:space-between; gap:10px; }
+    #rankPanel h4.cand { color:#00e5ff; margin-top:8px; }
+    #rankNote { font-size:10px; color:#999; margin-bottom:4px; }
+    #rankNote.stale { color:#ffab91; }
+    .rank-row { display:flex; align-items:center; gap:6px; padding:2px 2px;
+                border-radius:3px; cursor:pointer; line-height:16px; }
+    .rank-row:hover { background:rgba(255,255,255,0.08); }
+    .rank-row.sel { background:rgba(0,229,255,0.18); }
+    .rank-row .rk { min-width:22px; color:#ffb74d; font-weight:bold; text-align:right; }
+    .rank-row .rl { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+                    white-space:nowrap; }
+    .rank-row .rl.foreign { color:#ce93d8; }
+    .rank-row .rl.cleared { color:#777; text-decoration:line-through; }
+    .rank-row .rs { width:44px; text-align:right; font-weight:bold; }
+    .rank-row .rb { width:50px; height:8px; background:rgba(255,255,255,0.08);
+                    border-radius:2px; overflow:hidden; }
+    .rank-row .rb i { display:block; height:100%; background:#43a047; }
+    .rank-row.cand .rb i { background:#00acc1; }
     /* per-channel strip chart + readout */
     #strip-wrap { display:flex; gap:6px; align-items:stretch; }
     #stripChart { background:rgba(255,255,255,0.05);
@@ -146,7 +300,7 @@
                  background:rgba(0,0,0,0.92); color:#ddd;
                  border:1px solid rgba(255,255,255,0.25); border-radius:6px;
                  padding:10px 14px; font-size:11px; font-family:monospace;
-                 max-width:420px; max-height:70vh; overflow-y:auto;
+                 max-width:420px; overflow-y:auto; box-sizing:border-box;
                  box-shadow:0 4px 16px rgba(0,0,0,0.5); }
     #metaPanel h4 { margin:9px 0 3px 0; color:#a5d6a7; font-size:10px;
                     text-transform:uppercase; letter-spacing:.05em; }
@@ -211,6 +365,14 @@
        without fearing for the survey. Recording never depends on it. #}
     <button id="followBtn" class="btn btn-green" onclick="toggleFollow()"
             title="Follow: the map pans to the newest recorded point as it arrives. Turn OFF to pan/zoom/mark freely while the study keeps recording — this only affects your screen, never the recording.">{{ ic.follow(14) }} <span id="followLbl">Follow ON</span></button>
+    {# Which pin set this screen shows (display-only, remembered per study
+       in this browser) and the truck's big-type pin list. #}
+    <div id="setRow">
+      <select id="pinSetSel" onchange="onSetChange(this.value)"
+              title="Pin set shown on the map: every unit's saved lists, all pins, or ＋ start new list (an empty list of yours — other pins drop off the map, and pins you Mark or add from Find join it)"></select>
+      <button id="listBtn" onclick="toggleListPanel()"
+              title="Pin list: pick a pin to navigate to">☰</button>
+    </div>
   </div>
 
   <div class="sliders-col">
@@ -225,10 +387,17 @@
       <input type="range" id="plusSl" min="5" max="2000" step="5" value="450"
              oninput="onSliders()">
       <span class="sv" id="plusV">450</span>
+      {# saved studies only: Cal corrects how a RECORDED study is drawn, and
+         the live banner carries no alt-cal flag. Disabled until meta is in. #}
+      {% if not is_live %}
+      <button id="calBtn" onclick="toggleCal()" disabled
+              style="font-size:11px;padding:1px 6px;"
+              title="Coil calibration: the coil pitch, where antenna 1 sits across the array and the THS-to-travel heading offset this study is DRAWN with — fix a setup error after the fact (the recorded data never changes). Save View keeps it with the study.">Cal</button>
+      {% endif %}
     </div>
     <div class="slider-row">
       <label>Offset</label>
-      <input type="range" id="offSl" min="-2000" max="2000" step="10" value="-140"
+      <input type="range" id="offSl" min="-4000" max="4000" step="10" value="-140"
              oninput="onSliders()">
       <span class="sv" id="offV">-140</span>
       <button id="biasBtn" onclick="toggleBias()"
@@ -262,8 +431,14 @@
       </select>
     </div>
     <div class="slider-row">
-      <label title="On: overlapping passes combine — nothing is painted over, and a signal seen on multiple passes adds up (extra confidence). Off: classic view, newest dots cover older ones.">Combine</label>
-      <input type="checkbox" id="combineChk" checked onchange="onCombine()">
+      <label title="How overlapping passes resolve on screen — see the Mode menu">Mode</label>
+      <select id="modeSel" onchange="onMode()" style="font-size:11px;"
+              title="Paint: classic, newest dots cover older ones. Combine: nothing is painted over — a spot seen on several passes adds up (extra confidence). Mean: every sample on a spot is averaged, at every zoom, so noise cancels and the hot spots stand out. Peak: a spot keeps the greenest reading it ever had.">
+        <option value="paint">paint</option>
+        <option value="combine" selected>combine</option>
+        <option value="mean">mean</option>
+        <option value="peak">peak</option>
+      </select>
       <button class="btn btn-blue"
               style="font-size:11px;padding:2px 8px;margin-left:8px;"
               onclick="saveSliders(this)">{{ ic.save(12) }} Save View</button>
@@ -280,7 +455,7 @@
      font defaults): the Pi's DejaVu fonts run ~1px/line taller than the
      bench and the toolbar clips at a fixed height — pinned, the column
      is 12+3+90+3+12 = 120px on any font, 10px inside the clip edge #}
-  <div>
+  <div id="stripCol"{% if not is_live %} style="display:none;"{% endif %}>
     <div style="font-size:10px;line-height:12px;color:#888;margin-bottom:3px;">
       Channels (adc counts)</div>
     <div id="strip-wrap">
@@ -292,6 +467,39 @@
     <div id="vinLiveRow" style="font-size:11px; line-height:12px; color:#bbb; margin-top:3px;">
       Vin <span id="vinVal" style="color:#fff; font-weight:bold;">—</span>
       &nbsp;&nbsp;T <span id="tempVal" style="color:#fff; font-weight:bold;">—</span>
+    </div>
+  </div>
+
+  {# Review of a saved study: no sample stream to chart, so this slot holds
+     the pins-by-size controls instead (see "Pins by size" in the JS). The
+     column stays in the DOM on a live page (display:none) so a daemon
+     stopping mid-review does not have to rebuild the toolbar. #}
+  <div id="pinCol"{% if is_live %} style="display:none;"{% endif %}>
+    <div style="font-size:10px;line-height:12px;color:#888;">
+      Pins by size (green within r)</div>
+    <div class="pin-row">
+      <label for="pinR">r</label>
+      <select id="pinR" title="Radius around a pin that counts toward its size">
+        <option value="0.1">0.1 m</option>
+        <option value="0.2" selected>0.2 m</option>
+        <option value="0.3">0.3 m</option>
+        <option value="0.5">0.5 m</option>
+        <option value="1">1 m</option>
+      </select>
+      <button class="btn btn-grey" id="rankBtn" onclick="rankPins()"
+              title="Size every pin = green coil samples within r of it (with the current sliders and filters) and list the pins biggest first">⇅ Rank</button>
+    </div>
+    <div class="pin-row">
+      <button class="btn btn-grey" id="findBtn" onclick="findPins()"
+              title="Propose the N biggest unmarked green spots as new pins, largest first. Nothing is saved until you add them.">✦ Find</button>
+      <label for="pinN">top</label>
+      <input id="pinN" type="number" value="10" min="1" max="100">
+    </div>
+    <div class="pin-row">
+      <label title="Draw each pin scaled to its size (area ∝ green count)">
+        <input type="checkbox" id="pinSizeChk" onchange="onSizePins()"> size pins
+      </label>
+      <span id="pinInfo">—</span>
     </div>
   </div>
 
@@ -316,6 +524,7 @@
 
 <div id="mapWrap">
   <div id="map"></div>
+  <div id="loadBanner" hidden><div class="box"><div class="status"></div><div class="err"></div></div></div>
   {# Map orientation. Big targets: this is tapped from the driver's seat. #}
   <div id="rotCtl">
     <div id="northArrow" title="Where north is"><div>▲</div>N</div>
@@ -333,17 +542,63 @@
 <div id="tgtPanel">
   <div id="tgtHead">
     <span>Target <b id="tgtNum"></b></span>
-    <button class="tgt-btn" id="tgtFoundBtn" onclick="toggleFound()"
-            title="Mark found">✓</button>
     <button class="tgt-btn" id="tgtDelBtn" onclick="deleteTarget()"
-            title="Delete this target">✕</button>
+            title="Delete this target (tap twice)">✕</button>
     <button class="tgt-btn" onclick="selectTarget(null)" title="Close guidance">–</button>
   </div>
   <div id="tgtArrowWrap"><div id="tgtArrow">⬆</div></div>
+  <div id="tgtFix" title="Nav GPS lock. Pins were recorded RTK fixed; the arrow is only as good as this.">—</div>
   <div id="tgtDist">—</div>
   <div id="tgtRef"></div>
   <div id="tgtDev">live dev —</div>
+  <div id="tgtSize"></div>
+  {# status flags any unit may set on any pin; one set on another unit
+     can't be cleared here (its file) — shown dimmed #}
+  <div id="tgtStatus">
+    <label id="stVisited"><input type="checkbox" onchange="setStatus('visited', this.checked)">visited</label>
+    <label id="stFound"><input type="checkbox" onchange="setStatus('found', this.checked)">found</label>
+    <label id="stSkip"><input type="checkbox" onchange="setStatus('skip', this.checked)">skip</label>
+  </div>
   <div id="tgtLL"></div>
+</div>
+
+{# The truck view: big rows, one tap selects a pin and starts guidance.
+   Shows the pin set chosen in the toolbar (chooser mirrored here, larger). #}
+<div id="listPanel">
+  <div id="listHead">
+    <select id="listSetSel" onchange="onSetChange(this.value)"></select>
+    <button class="bias-btn" onclick="toggleListPanel(false)" title="Close">✕</button>
+  </div>
+  <div id="listRows"></div>
+</div>
+
+{# Pins by size (saved-study review): existing pins listed biggest first,
+   then proposed new pins from the green census. Rows are built by JS. #}
+<div id="rankPanel">
+  <h4><span id="rankTitle">Pins by size</span>
+    <span>
+      <button class="bias-btn" style="width:auto;padding:0 6px;"
+              onclick="rankPins()" title="Re-rank with the current sliders and filters">↻</button>
+      <button class="bias-btn" onclick="toggleRankPanel(false)" title="Close">✕</button>
+    </span>
+  </h4>
+  <div id="rankNote"></div>
+  <div id="rankBtns">
+    <button onclick="renumberPins()" id="renumBtn"
+            title="Make the pin numbers follow this order. A set you own is reordered in place (saved now); anything else is saved as a new set of yours.">renumber</button>
+    <button onclick="saveAsSet()"
+            title="Save the pins in this order as a new named set of yours. Pins from other units are copied into your set.">save as set</button>
+  </div>
+  <div id="rankList"></div>
+  <h4 class="cand" id="candHead" style="display:none;">
+    <span>New pins (largest first)</span>
+    <span>
+      <button class="bias-btn" style="width:auto;padding:0 6px;"
+              onclick="addAllCandidates()" title="Save every proposed pin, biggest first — ids follow the rank">add all</button>
+      <button class="bias-btn" onclick="clearCandidates()" title="Discard proposals">✕</button>
+    </span>
+  </h4>
+  <div id="candList"></div>
 </div>
 
 {# Per-channel offset bias: trims each coil's zero to balance coil-to-coil
@@ -360,6 +615,67 @@
     </span>
   </h4>
   <div id="biasRows"></div>
+</div>
+
+{# Coil calibration: the geometry this study is DRAWN with. The db never
+   changes — a row is the antenna fix plus eight raw counts and the coils
+   are placed at render time — so a setup error (wrong pitch, antenna
+   mounted off the mark, THS baseline not where config.json says) is
+   fixable here, after the fact. Departures from the stamped values are
+   saved with the view (sl_cal_*) and flagged in the status banner; reset
+   returns to the stamped values. Pins already dropped keep their lat/lon.
+   The drawing follows the fields: forward is up, antenna 1 in orange. #}
+<div id="calPanel">
+  <h4><span>Coil calibration</span>
+    <span>
+      <button class="bias-btn" style="width:auto;padding:0 6px;"
+              onclick="resetCal()"
+              title="Back to the values the study is stamped with: the board's coil geometry, and the heading offset it drew with before any Cal (config.json, or the study's own saved value). Save View to keep.">reset to meta</button>
+      <button class="bias-btn" onclick="toggleCal()" title="Close">✕</button>
+    </span>
+  </h4>
+  <svg id="calSvg" viewBox="0 0 300 96" width="300" height="96" aria-hidden="true">
+    <defs>
+      <marker id="calArr" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M1 1L6 4L1 7" fill="none" stroke="#ccc" stroke-width="1.2"/></marker>
+      <marker id="calArrO" viewBox="0 0 8 8" refX="6" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+        <path d="M1 1L6 4L1 7" fill="none" stroke="#ff9500" stroke-width="1.2"/></marker>
+    </defs>
+    <line x1="18" y1="30" x2="18" y2="10" stroke="#ccc" stroke-width="1" marker-end="url(#calArr)"/>
+    <text x="24" y="20">travel</text>
+    <text x="268" y="22" text-anchor="end">THS</text>
+    <g id="calSvgThs" transform="rotate(-270 286 18)">
+      <line x1="286" y1="18" x2="286" y2="5" stroke="#ff9500" stroke-width="1" marker-end="url(#calArrO)"/></g>
+    <line x1="4" y1="44" x2="296" y2="44" stroke="#666" stroke-width="0.6"/>
+    <g id="calSvgCoils"></g>
+    <line x1="150" y1="33" x2="150" y2="55" stroke="#aaa" stroke-width="0.8" stroke-dasharray="2 2"/>
+    <text x="150" y="30" text-anchor="middle">centre</text>
+    <g id="calSvgAnt">
+      <circle r="4" cx="100" cy="44" fill="#ff9500"/>
+      <line x1="94" y1="44" x2="106" y2="44" stroke="#fff" stroke-width="0.8"/>
+      <line x1="100" y1="38" x2="100" y2="50" stroke="#fff" stroke-width="0.8"/></g>
+    <line id="calSvgDim" x1="150" y1="66" x2="100" y2="66" stroke="#ccc" stroke-width="1" marker-end="url(#calArr)"/>
+    <text id="calSvgAntTxt" x="125" y="80" text-anchor="middle"></text>
+    <text id="calSvgPitchTxt" x="4" y="93"></text>
+  </svg>
+  <div class="cal-row"><label for="calPitch">coil pitch</label>
+    <button class="bias-btn" onpointerdown="calHold('pitch_mm', -1, event)" title="−10 mm; hold to repeat">−</button>
+    <input type="number" id="calPitch" step="any" min="50" max="5000"
+           oninput="onCalInput('pitch_mm', this.value)" onchange="renderCalPanel(true)">
+    <button class="bias-btn" onpointerdown="calHold('pitch_mm', 1, event)" title="+10 mm; hold to repeat">+</button>
+    <span class="cu">mm</span><span class="cb" id="calPitchBase"></span></div>
+  <div class="cal-row"><label for="calAnt">antenna 1</label>
+    <button class="bias-btn" onpointerdown="calHold('ant_mm', -1, event)" title="10 mm to port; hold to repeat">−</button>
+    <input type="number" id="calAnt" step="any" min="-5000" max="5000"
+           oninput="onCalInput('ant_mm', this.value)" onchange="renderCalPanel(true)">
+    <button class="bias-btn" onpointerdown="calHold('ant_mm', 1, event)" title="10 mm to starboard; hold to repeat">+</button>
+    <span class="cu" title="antenna 1's offset from the array centre: negative = left (port), positive = right (starboard)">mm −L +R</span><span class="cb" id="calAntBase"></span></div>
+  <div class="cal-row"><label for="calHdg">THS→travel</label>
+    <button class="bias-btn" onpointerdown="calHold('heading_deg', -1, event)" title="−1°; hold to repeat">−</button>
+    <input type="number" id="calHdg" step="any" min="-360" max="360"
+           oninput="onCalInput('heading_deg', this.value)" onchange="renderCalPanel(true)">
+    <button class="bias-btn" onpointerdown="calHold('heading_deg', 1, event)" title="+1°; hold to repeat">+</button>
+    <span class="cu" title="added to the receiver's THS heading (its antenna baseline) to get the direction of travel">°</span><span class="cb" id="calHdgBase"></span></div>
 </div>
 
 <script>
@@ -423,9 +739,20 @@ function relayout() {
       ' width:' + W + 'px; height:' + H + 'px;' +
       ' transform-origin:50% 50%; transform:rotate(var(--unrot));';
   }
-  document.getElementById('metaPanel').style.top = (mapTop + 8) + 'px';
+  // the side panels are fixed and nothing behind them scrolls, so each
+  // must END above the bottom of the screen (480 px on the kiosk) or its
+  // last rows can never be reached
+  const fit = (id, top) => {
+    const el = document.getElementById(id);
+    el.style.top = top + 'px';
+    el.style.maxHeight = Math.max(80, window.innerHeight - top - 8) + 'px';
+  };
+  fit('metaPanel', mapTop + 8);
   document.getElementById('tgtPanel').style.top = (mapTop + 10) + 'px';
   document.getElementById('biasPanel').style.top = (mapTop + 10) + 'px';
+  fit('calPanel', mapTop + 10);
+  fit('rankPanel', mapTop + 10);
+  fit('listPanel', mapTop + 10);
   mapObj.invalidateSize();
 }
 
@@ -448,7 +775,17 @@ const blankLayer = new BlankLayer();
 const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
   {maxZoom: 25, maxNativeZoom: 19, attribution: '© OpenStreetMap contributors'});
 
-function applyMapMode(mode) {
+// Base layer defaults to OFFLINE. The units survey where the internet is
+// thin or absent, and a page waiting on OpenStreetMap tiles over a starved
+// link starves the nav marker and pin guidance drawn over them with it —
+// crews read that as "the map lags". The bundled geojson outlines are all a
+// crew needs to find a pin. The choice lives under its own key and is
+// written only by a tap on the toggle: the old page persisted its 'online'
+// DEFAULT on first load, so every deployed kiosk carries an 'online' nobody
+// chose, and flipping the default alone would never reach them.
+const MAP_BASE_KEY = 'mapBase';
+let mapMode = null;
+function applyMapMode(mode, persist) {
   const btn = document.getElementById('mapToggle');
   const off = mode === 'offline';
   if (off) { osmLayer.remove(); blankLayer.addTo(mapObj); }
@@ -458,12 +795,14 @@ function applyMapMode(mode) {
   btn.querySelector('.ic-plane').hidden = !off;
   document.getElementById('mapLbl').textContent = off ? 'Offline' : 'Map';
   btn.classList.toggle('offline', off);
-  localStorage.setItem('mapMode', mode);
+  mapMode = mode;
+  if (persist) localStorage.setItem(MAP_BASE_KEY, mode);
 }
 function toggleMapLayer() {
-  applyMapMode(localStorage.getItem('mapMode') === 'offline' ? 'online' : 'offline');
+  applyMapMode(mapMode === 'offline' ? 'online' : 'offline', true);
 }
-applyMapMode(localStorage.getItem('mapMode') || 'online');
+localStorage.removeItem('mapMode');     // the pre-flip key; never read again
+applyMapMode(localStorage.getItem(MAP_BASE_KEY) || 'offline', false);
 
 L.control.scale({imperial: true, metric: true, maxWidth: 200}).addTo(mapObj);
 
@@ -476,6 +815,66 @@ GEOJSON_FILES.forEach(name => {
     }).addTo(mapObj))
     .catch(() => {});
 });
+
+// ── Load banner ──────────────────────────────────────────────────────────────
+// Big "please wait" over the map for the slow steps of opening a view, in
+// order: a cold /coverage (every uncached study's outline is computed
+// server-side, seconds each on a Pi), then the points load + first paint of
+// a large study. Progressive on purpose: if the page dies part-way, the last
+// status (a hang) or the red failure line (an error) stays on screen and
+// says WHERE — a kiosk has no console to read. A status shows only once its
+// step has taken 250 ms, so the warm path never flashes it; errors show at
+// once and stay until a reload.
+let bannerTimer = 0, bannerStatus = null;
+const loadErrors = [];
+function renderLoadBanner() {
+  const el = document.getElementById('loadBanner');
+  el.querySelector('.status').textContent = bannerStatus || '';
+  el.querySelector('.err').textContent = loadErrors.join('\n');
+  el.hidden = !bannerStatus && !loadErrors.length;
+}
+function setLoadBanner(text) {
+  clearTimeout(bannerTimer);
+  bannerTimer = 0;
+  bannerStatus = text || null;
+  const up = !document.getElementById('loadBanner').hidden;
+  if (!text || up) renderLoadBanner();      // clearing, or swapping text: now
+  else bannerTimer = setTimeout(renderLoadBanner, 250);
+}
+function noteLoadError(step, e) {
+  const msg = step + ' failed: ' + ((e && e.message) || e);
+  loadErrors.push(msg);
+  console.error('[view]', msg, e);
+  renderLoadBanner();
+}
+function okOrThrow(r) {
+  if (!r.ok) throw new Error('http ' + r.status);
+  return r;
+}
+
+// Ground the OTHER studies on this unit have covered, as grey dashed
+// outlines with a faint grey wash inside, on their own pane under the data:
+// a crew starting new territory sees where the team has already been. None
+// of the data itself, and not interactive, so a tap on it still places a
+// pin. Rings are filled even-odd, so a hole (un-driven ground boxed in by
+// the track) stays clear without any nesting bookkeeping. Served from a
+// per-study cache (see /coverage): one small fetch per page load once warm.
+// Runs BEFORE the points load: a cold pass and the points transport are both
+// Python in the same worker, so back-to-back costs nothing over side-by-side
+// and the operator reads one message at a time.
+mapObj.createPane('coverage').style.zIndex = 350;   // tiles 200 < here < overlays 400
+function loadCoverage() {
+  setLoadBanner('Rendering surveyed-area outlines… please wait');
+  return fetch('/coverage/' + STUDY_ID)
+    .then(r => okOrThrow(r).json())
+    .then(fc => L.geoJSON(fc, {
+        pane: 'coverage', interactive: false,
+        style: {color: '#8c8c8c', weight: 2, opacity: 0.85, dashArray: '6 4',
+                fill: true, fillColor: '#8c8c8c', fillOpacity: 0.12,
+                fillRule: 'evenodd'},
+      }).addTo(mapObj))
+    .catch(e => noteLoadError('Surveyed-area outlines', e));
+}
 
 const renderer = MM.ChannelRenderer(mapObj);
 renderer.setStore(store);
@@ -510,6 +909,43 @@ let targetsJson = '';          // last rendered list, serialized — SSE ships
                                // the merged list every tick, repaint only
                                // when it actually changed
 let tgtMarkers = {};           // key ('src:id') -> L.marker
+// ── Pin sets: named ORDERED lists of one unit's pins ──
+// Every unit's sets arrive with the targets; which one THIS screen shows
+// is display-only, per browser, remembered per study. In a set a pin's
+// number is its POSITION (1..N) — the stack rank — so renumbering is a
+// reorder that never touches the 'host:N' keys other units' marks point
+// at. 'all' shows every pin under its id-based label, as before.
+let pinSets = [];              // [{key:'host/sid', host, sid, name, own, keys}]
+let setsJson = '';
+const SET_LS_KEY = 'mm_pinset_' + STUDY_ID;
+let curSet = (() => { try { return localStorage.getItem(SET_LS_KEY) || 'all'; }
+                      catch (e) { return 'all'; } })();
+function curSetObj() { return pinSets.find(s => s.key === curSet) || null; }
+function ownCurSid() { const s = curSetObj(); return s && s.own ? s.sid : null; }
+/* the targets this screen shows, in display order, numbered when in a set.
+ * 'all' hides a pin copied from another pin that is itself shown (save-as-
+ * set copies foreign pins; a copy and its source are one dig spot and
+ * share their status) — the original stands for both. */
+function allTargets() {
+  const have = new Set(targets.map(t => t.key));
+  return targets.filter(t => !(t.root && t.root !== t.key && have.has(t.root)));
+}
+function shownTargets() {
+  const st = curSetObj();
+  if (!st) return allTargets().map(t => Object.assign({}, t, {num: null}));
+  const byKey = new Map(targets.map(t => [t.key, t]));
+  const out = [];
+  st.keys.forEach(k => {
+    const t = byKey.get(k);
+    if (t) out.push(Object.assign({}, t, {num: out.length + 1}));
+  });
+  return out;
+}
+function shownNum(key) {
+  const t = shownTargets().find(x => x.key === key);
+  return t ? t.num : null;
+}
+let armedDelete = null, armedTimer = null;
 let selTargetKey = null;
 let markMode = false;
 let tgtLine = null;            // dashed guide line, nav fix → target
@@ -545,19 +981,27 @@ function tgtIcon(t) {
   let cls = '';
   if (t.src !== 'db' && !t.own) cls += ' tgt-foreign';
   if (t.cleared) cls += ' tgt-cleared';
+  else if (t.status && t.status.skip) cls += ' tgt-skip';
+  if (t.status && t.status.visited) cls += ' tgt-visited';
   if (t.key === selTargetKey) cls += ' tgt-sel';
   // The -45° rotation swings the pin's sharp corner to (13, 13+13·√2):
   // anchor THERE so the visible tip sits exactly on the marked lat/lon.
+  // "Size pins": scale about that same tip (the .tgt-rot origin), so a
+  // big pin grows up and out of the spot instead of sliding off it.
+  const sc = pinScale(t.key);
+  const st = sc === 1 ? '' : ` style="transform:rotate(var(--unrot)) scale(${sc})"`;
   return L.divIcon({className: '', iconSize: [26, 26], iconAnchor: [13, 31],
-    html: `<div class="tgt-rot"><div class="tgt-pin${cls}"><span>${t.id}</span></div></div>`});
+    html: `<div class="tgt-rot"${st}><div class="tgt-pin${cls}"><span>${t.num || t.id}</span></div></div>`});
 }
 
 function renderTargets() {
   const keys = new Set(targets.map(t => t.key));
+  const shown = shownTargets();
+  const shownKeys = new Set(shown.map(t => t.key));
   for (const k of Object.keys(tgtMarkers)) {
-    if (!keys.has(k)) { mapObj.removeLayer(tgtMarkers[k]); delete tgtMarkers[k]; }
+    if (!shownKeys.has(k)) { mapObj.removeLayer(tgtMarkers[k]); delete tgtMarkers[k]; }
   }
-  targets.forEach(t => {
+  shown.forEach(t => {
     let m = tgtMarkers[t.key];
     if (!m) {
       m = L.marker([t.lat, t.lon], {icon: tgtIcon(t), zIndexOffset: 900});
@@ -568,16 +1012,109 @@ function renderTargets() {
     }
   });
   if (selTargetKey != null && !keys.has(selTargetKey)) selTargetKey = null;
+  if (pinSizes) {
+    // a deleted pin must leave the ranking too, or "#k of N", the size
+    // bars and the pin scale keep normalising against a ghost
+    pinRank = pinRank.filter(k => keys.has(k));
+    for (const k of Array.from(pinSizes.keys())) if (!keys.has(k)) pinSizes.delete(k);
+  }
   updateApproach();
   updateRotation();
+  if (pinSizes) renderRankList();      // a pin added/removed: list follows
+  renderListPanel();
 }
 
-function setTargets(list) {
+let renderedSet = null;        // the set the markers on screen were drawn for
+function setTargets(list, sets) {
   const j = JSON.stringify(list);
-  if (j === targetsJson) return;
+  const sj = sets ? JSON.stringify(sets) : setsJson;
+  // same data, same set: nothing to redraw (the SSE tick may already have
+  // delivered exactly what a POST answers with)
+  if (j === targetsJson && sj === setsJson && curSet === renderedSet) return;
   targetsJson = j;
   targets = list;
+  if (sets) {
+    setsJson = sj;
+    pinSets = sets;
+    if (curSet !== 'all' && !curSetObj()) onSetChange('all', true);  // gone
+    renderSetSel();
+  }
+  renderedSet = curSet;
   renderTargets();
+}
+
+function renderSetSel() {
+  ['pinSetSel', 'listSetSel'].forEach(id => {
+    const sel = document.getElementById(id);
+    const opts = [`<option value="all">all pins (${allTargets().length})</option>`]
+      .concat(pinSets.map(s =>
+        `<option value="${s.key}">${s.own ? '' : s.host + ': '}${escHtml(s.name)} (${s.count})</option>`))
+      .concat(['<option value="__new__">＋ start new list</option>']);
+    sel.innerHTML = opts.join('');
+    sel.value = curSetObj() ? curSet : 'all';
+  });
+}
+function escHtml(x) {
+  return String(x).replace(/[&<>"]/g, c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c]));
+}
+function onSetChange(key, quiet) {
+  if (key === '__new__') {         // chooser action, not a set: snap back, create
+    renderSetSel();
+    startNewList();
+    return;
+  }
+  curSet = key || 'all';
+  try { localStorage.setItem(SET_LS_KEY, curSet); } catch (e) {}
+  if (!quiet) {
+    renderSetSel();
+    if (selTargetKey != null && !shownTargets().some(t => t.key === selTargetKey)) selTargetKey = null;
+    renderedSet = curSet;
+    renderTargets();
+  }
+}
+/* "＋ start new list": asks for a name (pre-filled 'list N'; blank keeps
+ * the server's 'list <sid>'; cancel does nothing), then an empty set of
+ * ours is created and shown at once. Showing it drops every other pin off
+ * the map until 'all pins' is picked again, and pins Marked or added from
+ * Find while it is shown join it (ownCurSid) — the easy way to build your
+ * own list over a study full of other units' pins. One request at a time:
+ * a double-tap must not mint two. Failures are said out loud: a silent
+ * catch here looked like "nothing happened, back to all pins". */
+let newListBusy = false;
+function startNewList() {
+  if (newListBusy) return;
+  const nextN = pinSets.filter(s => s.own).reduce((m, s) => Math.max(m, s.sid), 0) + 1;
+  const name = prompt('Name for the new list:', `list ${nextN}`);
+  if (name == null) return;                         // cancelled: stay put
+  newListBusy = true;
+  const body = {keys: []};
+  if (name.trim()) body.name = name.trim().slice(0, 60);
+  fetch(`/targets/${STUDY_ID}/sets`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).then(r => r.json().catch(() => ({error: `HTTP ${r.status}`})))
+  .then(d => {
+    if (d.error) { alert('start new list: ' + d.error); return; }
+    setTargets(d.targets, d.sets);
+    // the one thing the switch below is blind to: an answer naming a set
+    // it does not carry would leave curSet on a key the chooser cannot
+    // show — the chooser would read 'all pins' with no word why
+    if (!(d.sets || []).some(s => s.key === d.set_key)) {
+      alert(`start new list: ${d.set_key} was created but is missing from the answer`);
+      return;
+    }
+    onSetChange(d.set_key);        // switch + redraw even if the tick got there first
+    renderListPanel();
+    if (pinSizes) renderRankList();
+  }).catch(e => alert('start new list failed: ' + e))
+  .finally(() => { newListBusy = false; });
+}
+/* a pin just saved must be on screen: while another unit's set is shown a
+ * new pin of ours can't join it, so the view falls back to 'all pins' */
+function revealNew(keys) {
+  if (!keys || !keys.length) return;
+  const shown = new Set(shownTargets().map(t => t.key));
+  if (keys.some(k => !shown.has(k))) onSetChange('all');
 }
 
 function toggleMark() {
@@ -589,44 +1126,75 @@ function toggleMark() {
 }
 
 function addTarget(ll) {
+  const body = {lat: ll.lat, lon: ll.lng};
+  const sid = ownCurSid();
+  if (sid != null) body.set = sid;          // viewing our set: the pin joins it
   fetch('/targets/' + STUDY_ID, {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({lat: ll.lat, lon: ll.lng}),
+    body: JSON.stringify(body),
   }).then(r => r.json()).then(d => {
-    if (d.targets) setTargets(d.targets);
+    if (d.error) { alert(d.error); return; }
+    if (d.targets) {
+      setTargets(d.targets, d.sets);
+      revealNew(d.keys);
+    }
   }).catch(() => {});
 }
 
+/* Two taps within 3 s: a pin is a dig list entry the whole crew shares,
+ * and a sweaty thumb on the kiosk must not lose one. Marking it found or
+ * skip is the everyday action; delete is for mistakes. */
 function deleteTarget() {
   if (selTargetKey == null) return;
+  const b = document.getElementById('tgtDelBtn');
+  if (armedDelete !== selTargetKey) {
+    armedDelete = selTargetKey;
+    b.textContent = 'delete?'; b.classList.add('armed');
+    clearTimeout(armedTimer);
+    armedTimer = setTimeout(disarmDelete, 3000);
+    return;
+  }
+  disarmDelete();
   fetch('/targets/' + STUDY_ID + '/delete', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({key: selTargetKey}),
   }).then(r => r.json()).then(d => {
     // 403 = another unit's flag (its file, not ours) — the server says so
     if (d.error) { alert(d.error); return; }
-    if (d.targets) { selTargetKey = null; setTargets(d.targets); }
+    if (d.targets) { selTargetKey = null; setTargets(d.targets, d.sets); }
   }).catch(() => {});
 }
+function disarmDelete() {
+  armedDelete = null; clearTimeout(armedTimer);
+  const b = document.getElementById('tgtDelBtn');
+  b.textContent = '✕'; b.classList.remove('armed');
+}
 
-function toggleFound() {
+/* visited / found / skip on any unit's pin; the server refuses to clear a
+ * flag another unit set (it lives in their file) and says so */
+function setStatus(flag, on) {
   const t = targets.find(x => x.key === selTargetKey);
   if (!t) return;
-  fetch('/targets/' + STUDY_ID + '/clear', {
+  const body = {key: t.key}; body[flag] = !!on;
+  fetch('/targets/' + STUDY_ID + '/status', {
     method: 'POST', headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({key: t.key, cleared: !t.cleared}),
+    body: JSON.stringify(body),
   }).then(r => r.json()).then(d => {
-    // 403 = the mark lives in another unit's sidecar — the server says so
-    if (d.error) { alert(d.error); return; }
-    if (d.targets) setTargets(d.targets);
-  }).catch(() => {});
+    if (d.error) { alert(d.error); updateApproach(); return; }
+    if (d.targets) setTargets(d.targets, d.sets);
+  }).catch(() => updateApproach());
 }
 
 function selectTarget(key) {
   selTargetKey = key;
-  targets.forEach(t => tgtMarkers[t.key] && tgtMarkers[t.key].setIcon(tgtIcon(t)));
+  if (armedDelete !== key) disarmDelete();
+  shownTargets().forEach(t => tgtMarkers[t.key] && tgtMarkers[t.key].setIcon(tgtIcon(t)));
   updateApproach();
   updateRotation();
+  document.querySelectorAll('#rankList .rank-row').forEach(r =>
+    r.classList.toggle('sel', r.dataset.key === key));
+  document.querySelectorAll('#listRows .list-row').forEach(r =>
+    r.classList.toggle('sel', r.dataset.key === key));
 }
 
 function updateApproach() {
@@ -638,28 +1206,53 @@ function updateApproach() {
     return;
   }
   panel.style.display = 'block';
-  // legacy pins read '#3'; sidecar pins carry the flagging unit ('mm1-3')
+  // in a set the big number is the position; legacy pins read '#3';
+  // sidecar pins carry the flagging unit ('mm1-3')
+  const num = shownNum(t.key);
   document.getElementById('tgtNum').textContent =
-    (t.src === 'db' ? '#' : '') + t.label +
+    (num ? num + ' · ' : '') + (t.src === 'db' ? '#' : '') + t.label +
     (t.cleared ? ' ✓' + (t.cleared_own ? '' : ' ' + t.cleared_by) : '');
-  // delete only what lives in a file this unit owns; mark-found always,
-  // but un-mark only OUR OWN mark — another unit's lives in its sidecar,
-  // so popping ours would silently change nothing.
+  // delete only what lives in a file this unit owns
   document.getElementById('tgtDelBtn').style.display =
     t.deletable ? '' : 'none';
-  const fb = document.getElementById('tgtFoundBtn');
-  fb.style.display = (t.cleared && !t.cleared_own) ? 'none' : '';
-  fb.textContent = t.cleared ? '↩' : '✓';
-  fb.title = t.cleared ? 'Un-mark found' : 'Mark found';
+  // status boxes: checked if ANY unit set the flag; a flag set only by
+  // another unit can't be cleared here (its file) — shown dimmed
+  const stt = t.status || {}, mine = t.mine || {};
+  [['visited', 'stVisited'], ['found', 'stFound'], ['skip', 'stSkip']].forEach(([f, id]) => {
+    const lab = document.getElementById(id), box = lab.querySelector('input');
+    box.checked = !!stt[f];
+    const theirs = !!stt[f] && !mine[f];
+    box.disabled = theirs;
+    lab.classList.toggle('on', !!stt[f]);
+    lab.classList.toggle('theirs', theirs);
+    lab.title = theirs ? `${f} set on another unit — clear it there` : '';
+  });
   document.getElementById('tgtLL').textContent =
     t.lat.toFixed(7) + ', ' + t.lon.toFixed(7);
+  const szEl = document.getElementById('tgtSize');
+  const ranked = !!(pinSizes && pinSizes.has(t.key));
+  if (ranked) {
+    const rk = pinRank.indexOf(t.key) + 1;
+    szEl.textContent = `size ${pinSizes.get(t.key)} · #${rk} of ${pinRank.length}`;
+  }
+  szEl.style.display = ranked ? 'block' : 'none';
+  // the size row takes the lat/lon line's place — see the #tgtPanel budget
+  document.getElementById('tgtLL').style.display = ranked ? 'none' : '';
   const nv = lastNav;
   const distEl = document.getElementById('tgtDist');
   const refEl = document.getElementById('tgtRef');
   // The 5 s transport gate mirrors the sample gate below: ticks come every
   // 0.5 s, so a silent stream means the fix on screen is no longer live.
-  if (nv && nv.connected && nv.lat != null && !nv.stale
-      && Date.now() - lastNavAt < 5000) {
+  const navFresh = Date.now() - lastNavAt < 5000;
+  // Lock status on the arrow itself: the pin is an RTK-fixed position, so
+  // an arrow driven by a float / GPS-only / stale fix is a problem the
+  // driver must see without hunting for the toolbar chip (clipped at 800px).
+  const st = MM.navFixStatus(nv, navFresh);
+  const fixEl = document.getElementById('tgtFix');
+  fixEl.textContent = st.label;
+  fixEl.className = 'fix-' + st.level;
+  document.getElementById('tgtArrow').style.color = st.ok ? st.color : (st.level === 'warn' ? st.color : '#888');
+  if (nv && nv.connected && nv.lat != null && !nv.stale && navFresh) {
     const dm = distM(nv.lat, nv.lon, t.lat, t.lon);
     const brg = bearingTo(nv.lat, nv.lon, t.lat, t.lon);
     distEl.textContent = dm >= 100 ? Math.round(dm) + ' m' : dm.toFixed(1) + ' m';
@@ -715,7 +1308,14 @@ function updateApproach() {
 // caller is SSE-driven — if the transport itself dies (wifi drop, gunicorn
 // restart) no tick arrives and a hot "live dev" would freeze on the HUD. This
 // self-tick keeps the gate honest regardless of stream liveness.
-setInterval(() => { if (selTargetKey != null) updateApproach(); }, 1000);
+setInterval(() => {
+  if (selTargetKey != null) updateApproach();
+  // Same honesty for the fix marker on the map: with the stream dead no
+  // snapshot arrives to flip `stale`, and a green RTK-FIXED arrow would
+  // sit there lying. Grey it and tag it NAV STALE until a tick comes back.
+  if (lastNav && lastNav.connected && !lastNav.stale && Date.now() - lastNavAt >= 5000)
+    navLayer.update(Object.assign({}, lastNav, {stale: true}));
+}, 1000);
 
 // ── Map orientation: north-up / heading-up / target-up ──────────────────────
 // Leaflet 1.9 has no rotation. The whole #map (an oversized square, see
@@ -730,7 +1330,7 @@ setInterval(() => { if (selTargetKey != null) updateApproach(); }, 1000);
 //      pixel deltas (scaled by the parent's bounding box, which is the
 //      rotated square's AABB) — recompute the delta in the container frame.
 // Things that must read upright — pin numbers, popups, the zoom/scale
-// controls — counter-rotate by var(--unrot); the nav arrow does NOT, so in
+// controls, the nav marker's lock tag — counter-rotate by var(--unrot); the nav arrow does NOT, so in
 // heading-up it points up, as it should. Tooltips (hover only) turn with
 // the map. Angles are kept continuous (see arrowDeg): 359°→1° must be +2°,
 // not a wrong-way spin. The turn is tweened over 0.4 s in JS (rotShown
@@ -832,6 +1432,313 @@ function updateRotation() {
     b.classList.toggle('on', on);
     b.classList.toggle('dim', on && dim);
   });
+}
+
+// ── Pins by size (saved-study review) ─────────────────────────────────────────
+// Field ask after the first live use: "sort the pins by how much green is
+// near them, and make new pins where the most green is". Size = number of
+// green coil samples (green exactly as the map paints it: filter-corrected
+// deviation <= Offset, over the enabled channels) within r of the pin, over
+// the whole study. The census lives in the renderer (MM greenIndex); this
+// block owns the UI: Rank lists existing pins biggest first, Find proposes
+// the N biggest unmarked spots as candidates (dashed cyan rings — nothing
+// is saved until you add them), and "size pins" draws every pin scaled to
+// its size. Rank never renumbers by itself — the rank is the LIST order;
+// "renumber" reorders a set (displayed positions change, the host:N keys
+// other units' marks point at never do); pins minted by "add all" are
+// numbered in size order, biggest first.
+let greenIdx = null, greenIdxSig = '', greenIdxR = 0.2;
+let pinSizes = null;           // Map key -> green count (null: never ranked)
+let pinRank  = [];             // keys, biggest first
+let candidates = [];           // [{lat, lon, size}], biggest first
+let candMarkers = [];
+let wantFind = false;          // Find asked for a Rank first: propose after it
+
+/* Everything the census depends on; a change means a rebuild on next use. */
+function greenSig() {
+  return JSON.stringify([calib.zero8, calib.bias8, calib.offset, filterToken(),
+    document.getElementById('syncPer').value, document.getElementById('syncRes').value,
+    document.getElementById('cmGrp').value, renderer.getVisible(), store.length,
+    geom]);
+}
+function ensureGreenIndex() {
+  const sig = greenSig();
+  if (greenIdx && sig === greenIdxSig) return greenIdx;
+  const t0 = performance.now();
+  greenIdx = renderer.greenIndex(0.1);
+  greenIdxSig = sig;
+  if (greenIdx) console.log(`[pins] green census: ${greenIdx.green} green samples in `
+    + `${greenIdx.ids.length} cells, ${greenIdx.points} points, `
+    + `${(performance.now() - t0).toFixed(0)} ms`);
+  return greenIdx;
+}
+function pinRadius() { return parseFloat(document.getElementById('pinR').value) || 0.2; }
+
+/* Scale for a pin in "size pins" mode: area ∝ size, so the visible span
+ * goes as √size; 0.6× for a pin on nothing, up to 2.6× for the biggest. */
+function pinScale(key) {
+  if (!pinSizes || !document.getElementById('pinSizeChk').checked) return 1;
+  if (!pinSizes.has(key)) return 1;
+  const mx = pinSizes.get(pinRank[0]) || 0;
+  if (!mx) return 1;
+  return Math.round((0.6 + 2.0 * Math.sqrt(pinSizes.get(key) / mx)) * 100) / 100;
+}
+
+function rankPins() {
+  const btn = document.getElementById('rankBtn');
+  btn.textContent = '… scanning';
+  // let the label paint before the (≈1 s on a big study) synchronous scan
+  setTimeout(() => {
+    try {
+      const idx = ensureGreenIndex();
+      const r = pinRadius();
+      greenIdxR = r;
+      pinSizes = new Map();
+      // rank what this screen shows — the set being prioritised
+      const shown = shownTargets();
+      if (idx) shown.forEach(t => pinSizes.set(t.key, MM.greenCount(idx, t.lat, t.lon, r)));
+      pinRank = shown.map(t => t.key)
+        .sort((a, b) => (pinSizes.get(b) || 0) - (pinSizes.get(a) || 0));
+      // candidates were sized under the old settings — re-derive (or
+      // propose now, if Find is what asked for this Rank)
+      if (candidates.length || wantFind) { wantFind = false; findPins(true); }
+      toggleRankPanel(true);
+      renderTargets();
+      document.getElementById('pinInfo').textContent = idx
+        ? `${idx.green} green` : 'no calib';
+    } finally {
+      btn.textContent = '⇅ Rank';
+    }
+  }, 0);
+}
+
+function findPins(quiet) {
+  const idx = ensureGreenIndex();
+  if (!idx) { if (!quiet) alert('No calibration yet — nothing is green.'); return; }
+  const r = pinRadius();
+  // sizes must exist at this radius before proposals are listed against
+  // them: Rank first (it calls back here once, via wantFind)
+  if (!pinSizes || greenIdxR !== r) { wantFind = true; rankPins(); return; }
+  const n = Math.max(1, Math.min(100, parseInt(document.getElementById('pinN').value) || 10));
+  // an existing pin of any unit, found or not, claims its spot: the crew
+  // already knows about it, so a proposal there is noise
+  candidates = MM.greenPeaks(idx, r, {n, exclude: targets});
+  toggleRankPanel(true);
+  renderRankList();
+}
+
+function renderCandidates() {
+  candMarkers.forEach(m => mapObj.removeLayer(m));
+  candMarkers = candidates.map((c, i) => {
+    const icon = L.divIcon({className: '', iconSize: [26, 26], iconAnchor: [13, 31],
+      html: `<div class="tgt-rot"><div class="cand-pin" title="proposed pin: size ${c.size} — click to add"><span>${i + 1}</span></div></div>`});
+    const m = L.marker([c.lat, c.lon], {icon, zIndexOffset: 800});
+    m.on('click', () => addCandidate(c));
+    return m.addTo(mapObj);
+  });
+}
+
+function renderRankList() {
+  const idx = greenIdx;
+  const list = document.getElementById('rankList');
+  const note = document.getElementById('rankNote');
+  const stale = greenSig() !== greenIdxSig;
+  note.className = stale ? 'stale' : '';
+  note.textContent = !idx ? 'no calibration yet'
+    : (stale ? 'sliders/filters changed — ↻ to re-rank · ' : '')
+      + `r ${greenIdxR} m · ${idx.filter} · offset ${idx.offset} · ${idx.green} green`;
+  const mx = pinSizes && pinSizes.size ? (pinSizes.get(pinRank[0]) || 0) : 0;
+  const shown = shownTargets();
+  const byKey = new Map(shown.map(t => [t.key, t]));
+  const st = curSetObj();
+  document.getElementById('rankTitle').textContent =
+    'Pins by size' + (st ? ' · ' + st.name : '');
+  document.getElementById('renumBtn').textContent =
+    st && st.own ? 'renumber' : 'renumber → new set';
+  // pins added since the last Rank sit at the end, unsized
+  const keys = pinRank.filter(k => byKey.has(k))
+    .concat(shown.map(t => t.key).filter(k => !pinRank.includes(k)));
+  list.innerHTML = keys.length ? '' : '<div style="color:#777;">no pins yet</div>';
+  keys.forEach((k, i) => {
+    const t = byKey.get(k);
+    const sz = pinSizes && pinSizes.has(k) ? pinSizes.get(k) : null;
+    const row = document.createElement('div');
+    row.className = 'rank-row' + (k === selTargetKey ? ' sel' : '');
+    row.dataset.key = k;
+    const cls = (t.src !== 'db' && !t.own ? ' foreign' : '') + (t.cleared ? ' cleared' : '');
+    // left column = the number on the pin itself (position in the set, or
+    // the id on 'all'); rows read biggest first, so after renumber it IS
+    // the rank
+    row.innerHTML = `<span class="rk">${t.num || (t.src === 'db' ? '#' : '') + t.id}</span>`
+      + `<span class="rl${cls}">${t.label}</span>`
+      + `<span class="rs">${sz == null ? '?' : sz}</span>`
+      + `<span class="rb"><i style="width:${mx && sz ? Math.round(100 * sz / mx) : 0}%"></i></span>`;
+    row.onclick = () => { selectTarget(k); mapObj.panTo([t.lat, t.lon]); };
+    list.appendChild(row);
+  });
+  const ch = document.getElementById('candHead');
+  const cl = document.getElementById('candList');
+  ch.style.display = candidates.length ? '' : 'none';
+  cl.innerHTML = '';
+  const cmx = candidates.length ? Math.max(mx, candidates[0].size) : 0;
+  candidates.forEach((c, i) => {
+    const row = document.createElement('div');
+    row.className = 'rank-row cand';
+    row.innerHTML = `<span class="rk">${i + 1}</span><span class="rl">proposed</span>`
+      + `<span class="rs">${c.size}</span>`
+      + `<span class="rb"><i style="width:${cmx ? Math.round(100 * c.size / cmx) : 0}%"></i></span>`
+      + `<button class="bias-btn" title="Add this pin">+</button>`;
+    row.onclick = () => mapObj.panTo([c.lat, c.lon]);
+    row.querySelector('button').onclick = ev => { ev.stopPropagation(); addCandidate(c); };
+    cl.appendChild(row);
+  });
+  renderCandidates();
+}
+
+function postTargets(list) {
+  const body = {targets: list.map(c => ({lat: c.lat, lon: c.lon}))};
+  const sid = ownCurSid();
+  if (sid != null) body.set = sid;          // viewing our set: they join it
+  return fetch('/targets/' + STUDY_ID, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body),
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); return null; }
+    if (d.targets) {
+      // carry the candidate sizes onto the new pins: they were measured on
+      // exactly these spots, so the list needs no rescan to place them
+      if (pinSizes && d.keys) d.keys.forEach((k, i) => pinSizes.set(k, list[i].size));
+      setTargets(d.targets, d.sets);
+      revealNew(d.keys);
+      pinRank = shownTargets().map(t => t.key)
+        .sort((a, b) => (pinSizes && pinSizes.get(b) || 0) - (pinSizes && pinSizes.get(a) || 0));
+      renderRankList();
+    }
+    return d;
+  }).catch(e => { console.warn('[pins] add failed', e); return null; });
+}
+
+/* The rank panel's order as a key list: ranked pins first, unsized ones
+ * after, exactly as the rows read. */
+function rankOrderKeys() {
+  const shown = shownTargets();
+  const have = new Set(shown.map(t => t.key));
+  return pinRank.filter(k => have.has(k))
+    .concat(shown.map(t => t.key).filter(k => !pinRank.includes(k)));
+}
+/* Renumber = make the displayed numbers follow the rank. On a set we own
+ * that is a reorder, saved now; on 'all' or another unit's set it is a
+ * new set of ours (their pins are copied), since we can't rewrite theirs. */
+function renumberPins() {
+  const st = curSetObj();
+  const keys = rankOrderKeys();
+  if (!keys.length) return;
+  if (!(st && st.own)) { saveAsSet(); return; }
+  fetch(`/targets/${STUDY_ID}/sets/${st.sid}`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({keys}),
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); return; }
+    setTargets(d.targets, d.sets);
+    renderRankList();
+  }).catch(() => {});
+}
+function saveAsSet() {
+  const keys = rankOrderKeys();
+  if (!keys.length) { alert('No pins to save.'); return; }
+  const st = curSetObj();
+  const name = prompt('Name for the new pin set:',
+                      (st ? st.name : 'pins') + ' ranked');
+  if (name == null || !name.trim()) return;
+  fetch(`/targets/${STUDY_ID}/sets`, {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name: name.trim().slice(0, 60), keys}),
+  }).then(r => r.json()).then(d => {
+    if (d.error) { alert(d.error); return; }
+    // sizes measured on the source pins apply to the pins standing for
+    // them in the new set (same spot); d.resolved[i] is ours for keys[i]
+    if (pinSizes && d.resolved) {
+      d.resolved.forEach((k, i) => {
+        if (!pinSizes.has(k) && pinSizes.has(keys[i])) pinSizes.set(k, pinSizes.get(keys[i]));
+      });
+    }
+    const ns = (d.sets || []).find(s => s.key === d.set_key);
+    pinRank = ns ? ns.keys.slice() : [];
+    setTargets(d.targets, d.sets);
+    onSetChange(d.set_key);        // switch + redraw even if the tick got there first
+    renderRankList();
+  }).catch(() => {});
+}
+
+// ── Pin list (the truck view) ────────────────────────────────────────────────
+function toggleListPanel(open) {
+  const p = document.getElementById('listPanel');
+  if (open == null) open = p.style.display !== 'block';
+  p.style.display = open ? 'block' : 'none';
+  if (open) {
+    ['biasPanel', 'metaPanel', 'rankPanel', 'calPanel'].forEach(id =>
+      document.getElementById(id).style.display = 'none');
+    renderListPanel();               // renders only while shown
+  }
+}
+function renderListPanel() {
+  const p = document.getElementById('listPanel');
+  if (p.style.display !== 'block') return;
+  const rows = document.getElementById('listRows');
+  const shown = shownTargets();
+  rows.innerHTML = shown.length ? '' : '<div style="color:#777;padding:8px;">no pins in this set</div>';
+  shown.forEach(t => {
+    const stt = t.status || {};
+    const row = document.createElement('div');
+    row.className = 'list-row' + (t.key === selTargetKey ? ' sel' : '')
+      + (stt.found ? ' found' : stt.skip ? ' skip' : '');
+    row.dataset.key = t.key;
+    const sz = pinSizes && pinSizes.has(t.key) ? pinSizes.get(t.key) : null;
+    row.innerHTML = `<span class="ln">${t.num || t.id}</span>`
+      + `<span class="ll">${t.num ? escHtml(t.label) : (t.src === 'db' ? '#' : '') + escHtml(t.label)}`
+      + `${t.num ? '' : ''}</span>`
+      + `<span class="ls">${stt.visited ? '<span class="v">·</span>' : ''}`
+      + `${stt.found ? '<span class="f">✓</span>' : ''}${stt.skip ? '<span class="k">✗</span>' : ''}</span>`
+      + `<span class="lz">${sz == null ? '' : sz}</span>`;
+    row.onclick = () => { selectTarget(t.key); mapObj.panTo([t.lat, t.lon]); };
+    rows.appendChild(row);
+  });
+}
+/* By identity, not index: a double-tap on a ring (Leaflet fires a click
+ * per tap) or two quick '+' taps while the first POST is in flight must
+ * not save the neighbour that slid into the tapped slot. The list is
+ * redrawn before the request goes out, so a second tap finds nothing. */
+function addCandidate(c) {
+  const i = candidates.indexOf(c);
+  if (i < 0) return;
+  candidates.splice(i, 1);
+  renderRankList();
+  postTargets([c]).then(() => renderRankList());
+}
+function addAllCandidates() {
+  if (!candidates.length) return;
+  const list = candidates;                // already largest-first
+  candidates = [];
+  postTargets(list).then(() => renderRankList());
+}
+function clearCandidates() { candidates = []; renderRankList(); }
+
+function toggleRankPanel(open) {
+  const p = document.getElementById('rankPanel');
+  if (open == null) open = p.style.display !== 'block';
+  if (open) {
+    // same corner as the bias / meta / list panels — never show two
+    document.getElementById('biasPanel').style.display = 'none';
+    document.getElementById('metaPanel').style.display = 'none';
+    document.getElementById('listPanel').style.display = 'none';
+    document.getElementById('calPanel').style.display = 'none';
+    renderRankList();
+  }
+  p.style.display = open ? 'block' : 'none';
+}
+function onSizePins() {
+  if (document.getElementById('pinSizeChk').checked && !pinSizes) { rankPins(); return; }
+  renderTargets();
 }
 
 // ── Channel strip chart (shared MM.StripChart, one scale for all channels) ───
@@ -995,6 +1902,14 @@ function renderMetaPanel() {
       html += `<div class="meta-row"><span class="meta-key">${label}</span>` +
               `<span class="meta-val">${val}</span></div>`;
     }
+    // the stamped geometry is provenance; what this view DRAWS with may
+    // differ (Cal panel) — say so right under it
+    if (title.startsWith('Coil geometry') && calAltered()) {
+      html += '<div class="meta-row"><span class="meta-key">drawn with</span>' +
+              `<span class="meta-val meta-warn">pitch ${cal.pitch_mm}, antenna 1 ` +
+              `${cal.ant_mm > 0 ? '+' : ''}${cal.ant_mm} from centre, ` +
+              `THS→travel ${cal.heading_deg}° (Cal)</span></div>`;
+    }
   }
 
   // Whole-run environment stats (also in the toolbar, but the toolbar clips
@@ -1027,8 +1942,11 @@ function toggleMetaPanel() {
     p.style.display = 'none';
   } else {
     renderMetaPanel();               // rebuilt on every open: cheap, current
-    // same corner as the bias panel — never show both
+    // same corner as the bias / rank panels — never show two
     document.getElementById('biasPanel').style.display = 'none';
+    document.getElementById('rankPanel').style.display = 'none';
+    document.getElementById('listPanel').style.display = 'none';
+    document.getElementById('calPanel').style.display = 'none';
     p.style.display = 'block';
   }
 }
@@ -1046,7 +1964,7 @@ function updateStatus(st) {
     sb.textContent = '✖ DAEMON WEDGED — no heartbeat for ' +
                      (st.live_age_s != null ? st.live_age_s + ' s' : '?');
   } else {
-    sb.textContent = '◉ Saved study';
+    sb.textContent = '◉ Saved study' + calFlag();
     // The daemon is gone — the exit must become plain navigation, and a
     // NEUTERED form: a stale tab's POST could SIGTERM a daemon somebody
     // else started since. (Unlike /raw, a study id is never reattached —
@@ -1187,6 +2105,14 @@ function setSlider(id, valId, v) {
 function onSliders() {
   readSliders();
   renderer.setCalib(calib);   // repaint only — O(dots in view), not a rebuild
+  rankStale();
+}
+/* Sizes were counted under the previous sliders/filters: say so in the
+ * rank panel rather than silently showing numbers the map no longer
+ * agrees with. Cheap (a string compare) and idempotent. */
+function rankStale() {
+  const p = document.getElementById('rankPanel');
+  if (pinSizes && p.style.display === 'block') renderRankList();
 }
 
 /* Checkbox states compose into the same token the renderer (and the saved
@@ -1211,10 +2137,12 @@ function onFilter() {
                        bins: Math.round(+per.value * 1000 / +res.value)});
   renderer.setCmSets(grp.value === 'sets');
   renderer.setFilter(filterToken());
+  rankStale();
 }
 
-function onCombine() {
-  renderer.setCombine(document.getElementById('combineChk').checked);
+const RENDER_MODES = ['paint', 'combine', 'mean', 'peak'];
+function onMode() {
+  renderer.setMode(document.getElementById('modeSel').value);
 }
 
 function autoZero() {
@@ -1319,8 +2247,13 @@ function renderBiasRows() {
 function toggleBias() {
   const p = document.getElementById('biasPanel');
   const open = p.style.display !== 'block';
-  // same corner as the meta panel — never show both
-  if (open) document.getElementById('metaPanel').style.display = 'none';
+  // same corner as the meta / rank panels — never show two
+  if (open) {
+    document.getElementById('metaPanel').style.display = 'none';
+    document.getElementById('rankPanel').style.display = 'none';
+    document.getElementById('listPanel').style.display = 'none';
+    document.getElementById('calPanel').style.display = 'none';
+  }
   p.style.display = open ? 'block' : 'none';
 }
 
@@ -1378,6 +2311,7 @@ function autoBias() {
 
 function applyBias() {
   renderer.setCalib(calib);           // map: folds into zEff(), upstream of Δ
+  rankStale();                        // bias is part of the census signature
   chart.setZero(effZero8());          // strip chart deviations
   chart.draw();                       // stopped study: no SSE tick repaints it
   // stopped study never sets lastAdc — recolor from the last recorded row
@@ -1385,6 +2319,147 @@ function applyBias() {
                     (store.length ? store.adcRow(store.length - 1) : null));
 }
 renderBiasRows();   // populate now; restore re-renders if a saved bias8 loads
+
+// ── Coil calibration (Cal) ───────────────────────────────────────────────────
+// The geometry this study is DRAWN with (see the calPanel markup). cal is
+// the operator's frame — pitch, antenna 1's offset from the array centre
+// (− port / + starboard; the negative of the board's right_mm, which is
+// the centre's offset from the antenna), THS→travel rotation — and calBase
+// is what the study is stamped with: board geometry via the daemon, heading
+// offset from config.json (or a pre-move study's own). Edits apply at once
+// (the renderer re-places every dot from the same fixes); Save View keeps
+// only the departures, as sl_cal_*, and clears them on a reset.
+const CAL_LIM  = {pitch_mm: [50, 5000], ant_mm: [-5000, 5000], heading_deg: [-360, 360]};
+const CAL_STEP = {pitch_mm: 10, ant_mm: 10, heading_deg: 1};
+const CAL_FIELDS = [['calPitch', 'pitch_mm'], ['calAnt', 'ant_mm'], ['calHdg', 'heading_deg']];
+let calBase = null, cal = null;
+// what the operator touched since the last Save View: 'set' sends the
+// value (an explicit pin, even if it equals the baseline), 'clear' (reset)
+// sends null so the stored override is removed. Untouched keys are not
+// sent at all: the heading baseline is config.json at request time, so
+// "equals the baseline right now" must never delete a deliberate pin.
+let calTouched = {};
+function calFromGeom(g) {
+  return {pitch_mm: g.spacing_mm, ant_mm: -g.right_mm, heading_deg: g.rot_deg};
+}
+function calAltered() {
+  return !!(cal && calBase) && Object.keys(CAL_LIM).some(k => cal[k] !== calBase[k]);
+}
+function calFlag() { return calAltered() ? ' · alt coil cal' : ''; }
+function applyCal() {
+  geom = {spacing_mm: cal.pitch_mm, fore_mm: geom.fore_mm,
+          right_mm: -cal.ant_mm, rot_deg: cal.heading_deg};
+  renderer.setGeometry(geom);
+  const sb = document.getElementById('statusBanner');
+  if (sb.className.indexOf('st-stopped') >= 0) sb.textContent = '◉ Saved study' + calFlag();
+  renderCalPanel(false);
+  rankStale();
+}
+function setCal(k, v) {
+  if (!cal || !calBase) return;        // meta not in yet (or /data failed)
+  v = parseFloat(v);
+  if (!Number.isFinite(v)) return;
+  const [lo, hi] = CAL_LIM[k];
+  v = Math.max(lo, Math.min(hi, v));
+  calTouched[k] = 'set';
+  if (v === cal[k]) return;
+  cal[k] = v;
+  applyCal();
+}
+// typing: the field keeps its text until change/blur normalises it —
+// rewriting it per keystroke would fight a half-typed "-5"
+function onCalInput(k, v) { setCal(k, v); }
+function nudgeCal(k, dir) {
+  if (!cal || !calBase) return;
+  setCal(k, cal[k] + dir * CAL_STEP[k]);
+  renderCalPanel(true);
+}
+// press-and-hold on a nudge button repeats it, speeding up — the kiosk has
+// no keyboard and a wrong-side antenna is a hundred 10 mm steps away
+let calHoldTimer = 0;
+function calHold(k, dir, ev) {
+  ev.preventDefault();                // no focus steal / text selection
+  nudgeCal(k, dir);
+  let delay = 400;
+  const tick = () => {
+    nudgeCal(k, dir);
+    delay = Math.max(50, delay * 0.8);
+    calHoldTimer = setTimeout(tick, delay);
+  };
+  const stop = () => {
+    clearTimeout(calHoldTimer);
+    calHoldTimer = 0;
+    window.removeEventListener('pointerup', stop);
+    window.removeEventListener('pointercancel', stop);
+  };
+  clearTimeout(calHoldTimer);
+  calHoldTimer = setTimeout(tick, delay);
+  window.addEventListener('pointerup', stop);
+  window.addEventListener('pointercancel', stop);
+}
+function resetCal() {
+  if (!cal || !calBase) return;
+  cal = Object.assign({}, calBase);
+  Object.keys(CAL_LIM).forEach(k => { calTouched[k] = 'clear'; });
+  applyCal();
+  renderCalPanel(true);
+}
+function renderCalPanel(force) {
+  if (!cal) return;
+  CAL_FIELDS.forEach(([id, k]) => {
+    const el = document.getElementById(id);
+    if (force || document.activeElement !== el) el.value = cal[k];
+    el.classList.toggle('cal-diff', cal[k] !== calBase[k]);
+    document.getElementById(id + 'Base').textContent = '(' + calBase[k] + ')';
+  });
+  renderCalSvg();
+}
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function renderCalSvg() {
+  const pitch = cal.pitch_mm, ant = cal.ant_mm;
+  // one scale for the whole drawing: array and antenna both stay inside
+  let s = Math.min(0.1, 230 / (7 * pitch));
+  if (ant) s = Math.min(s, 136 / Math.abs(ant));
+  const cx = i => 150 + (i - 3.5) * pitch * s;
+  const coils = document.getElementById('calSvgCoils');
+  coils.textContent = '';
+  for (let i = 0; i < 8; i++) {
+    const c = document.createElementNS(SVG_NS, 'circle');
+    c.setAttribute('cx', cx(i)); c.setAttribute('cy', 44); c.setAttribute('r', 5);
+    c.setAttribute('fill', '#1D9E75'); c.setAttribute('stroke', '#9FE1CB');
+    c.setAttribute('stroke-width', '0.8');
+    coils.appendChild(c);
+  }
+  [0, 7].forEach(i => {
+    const t = document.createElementNS(SVG_NS, 'text');
+    t.setAttribute('x', cx(i)); t.setAttribute('y', 58); t.setAttribute('text-anchor', 'middle');
+    t.setAttribute('font-size', '9'); t.textContent = i;
+    coils.appendChild(t);
+  });
+  const ax = 150 + ant * s;
+  document.getElementById('calSvgAnt').setAttribute('transform', 'translate(' + (ax - 100) + ' 0)');
+  const dim = document.getElementById('calSvgDim');
+  dim.setAttribute('x2', ax);
+  dim.style.display = Math.abs(ax - 150) < 8 ? 'none' : '';
+  const t = document.getElementById('calSvgAntTxt');
+  t.setAttribute('x', Math.max(60, Math.min(240, (150 + ax) / 2)));
+  t.textContent = ant === 0 ? 'ant 1 at centre'
+    : 'ant 1: ' + (ant < 0 ? '−' : '+') + Math.abs(ant) + ' mm ' + (ant < 0 ? 'left' : 'right');
+  document.getElementById('calSvgPitchTxt').textContent = 'pitch ' + pitch + ' mm';
+  document.getElementById('calSvgThs').setAttribute('transform', 'rotate(' + (-cal.heading_deg) + ' 286 18)');
+}
+function toggleCal() {
+  if (!cal || !calBase) return;        // nothing to calibrate until meta is in
+  const p = document.getElementById('calPanel');
+  const open = p.style.display !== 'block';
+  if (open) {
+    // same corner as the bias / meta / rank / list panels — never show two
+    ['biasPanel', 'metaPanel', 'rankPanel', 'listPanel'].forEach(id =>
+      document.getElementById(id).style.display = 'none');
+    renderCalPanel(true);
+  }
+  p.style.display = open ? 'block' : 'none';
+}
 
 function saveSliders(btn) {
   fetch('/settings/' + STUDY_ID, {
@@ -1398,11 +2473,21 @@ function saveSliders(btn) {
       sync_period:    document.getElementById('syncPer').value,
       sync_res:       document.getElementById('syncRes').value,
       cm_group:       document.getElementById('cmGrp').value,
-      combine:        document.getElementById('combineChk').checked ? '1' : '0',
+      mode:           document.getElementById('modeSel').value,
+      // legacy mirror of the mode for a reader that predates the menu:
+      // every accumulating mode is nearer Combine than Paint
+      combine:        document.getElementById('modeSel').value !== 'paint' ? '1' : '0',
       zero8:          calib.zero8,
       bias8:          calib.bias8,
+      // Cal: the keys the operator touched — a value pins, null (after
+      // reset) clears the stored override; untouched keys are left alone
+      cal: cal && calBase && Object.keys(calTouched).length
+             ? Object.fromEntries(Object.entries(calTouched).map(([k, how]) =>
+                 [k, how === 'clear' ? null : cal[k]]))
+             : undefined,
     })
   }).then(r => r.json()).then(d => {
+    if (d.ok) calTouched = {};
     if (d.ok && btn) {
       // innerHTML round-trip: the button contains an inline SVG icon that
       // a textContent restore would erase
@@ -1414,10 +2499,37 @@ function saveSliders(btn) {
 }
 
 // ── Initial load, then SSE ────────────────────────────────────────────────────
-fetch('/data/' + STUDY_ID)
-  .then(r => r.json())
+// /data is the small part (meta, status, targets, where the points end);
+// the points themselves stream from /points as packed columns bounded at
+// that last_id, so the bulk load and the SSE cursor agree on a live study.
+// Retried: a server restart mid-transfer truncates the body (fetch rejects
+// on a short read against Content-Length) and nginx's 502 across a restart
+// lasts seconds — without a retry the map would sit empty until a reload.
+function fetchPoints(upto, tries) {
+  return fetch('/points/' + STUDY_ID + '?upto=' + upto)
+    .then(r => { if (!r.ok) throw new Error('http ' + r.status); return r.arrayBuffer(); })
+    .then(buf => MM.decodePoints(buf))
+    .catch(e => {
+      if (tries <= 1) throw e;
+      console.warn('[points] retrying after:', e);
+      return new Promise(res => setTimeout(res, 3000))
+        .then(() => fetchPoints(upto, tries - 1));
+    });
+}
+function loadStudy() {
+  setLoadBanner('Loading map… please wait');
+  return fetch('/data/' + STUDY_ID)
+  .then(r => okOrThrow(r).json())
   .then(d => {
-    store.fillColumns(d.points);   // /data is columnar: arrays per field
+    const n = d.n_points != null ? d.n_points.toLocaleString() + ' points' : '';
+    setLoadBanner('Loading map' + (n ? ' — ' + n : '') + '… please wait');
+    return fetchPoints(d.last_id, 3)
+    .then(cols => { store.fillBinary(cols); return d; })
+    // Meta/status/targets still apply without points; SSE from last_id
+    // keeps the page live and a reload recovers the history.
+    .catch(e => { noteLoadError('Points', e); return d; });
+  })
+  .then(d => {
     lastId    = d.last_id;
     meta      = d.meta || {};
     adcLabels = (meta.adc_order || '').split(',');
@@ -1428,6 +2540,13 @@ fetch('/data/' + STUDY_ID)
     // this study saved its own before the move to config.
     geom = MM.geomFromMeta(meta);
     renderer.setGeometry(geom);
+    // Cal panel: stamped baseline vs what this view draws with (sl_cal_*)
+    calBase = calFromGeom(MM.geomFromMeta(meta, {stamped: true}));
+    cal     = calFromGeom(geom);
+    calTouched = {};
+    renderCalPanel(true);
+    const cb = document.getElementById('calBtn');   // absent on a live view
+    if (cb) cb.disabled = false;
 
     // Restore persisted view settings; fall back to auto-zero.
     const mf = k => meta[k] != null ? parseFloat(meta[k]) : null;
@@ -1450,10 +2569,15 @@ fetch('/data/' + STUDY_ID)
       document.getElementById('cmGrp').value = meta.sl_cm_group;
     }
     onFilter();   // push filter + sync config, set the tuning-enable state
-    if (meta.sl_combine != null) {
-      const on = meta.sl_combine === '1';
-      document.getElementById('combineChk').checked = on;
-      renderer.setCombine(on);
+    // render mode: sl_mode when saved by this UI, else the old Combine
+    // switch maps onto paint/combine (a view saved before the menu existed)
+    let rmode = RENDER_MODES.includes(meta.sl_mode) ? meta.sl_mode : null;
+    if (!rmode && meta.sl_combine != null) {
+      rmode = meta.sl_combine === '1' ? 'combine' : 'paint';
+    }
+    if (rmode) {
+      document.getElementById('modeSel').value = rmode;
+      renderer.setMode(rmode);
     }
     readSliders();
     // saved arrays must be exactly 8 finite numbers — anything else (junk
@@ -1491,11 +2615,22 @@ fetch('/data/' + STUDY_ID)
 
     updateStatus(d.status);
     updateNav(d.nav);
-    setTargets(d.targets || []);
+    setTargets(d.targets || [], d.sets || []);
 
     openSSE();
     relayout();
+    // the first paint is the renderer's own animation frame (markDirty
+    // above); two frames later it is on screen and the banner can go
+    requestAnimationFrame(() => requestAnimationFrame(() => setLoadBanner(null)));
+  })
+  .catch(e => {
+    // fatal: the red line stays in place of "please wait" until a reload
+    noteLoadError('Map load', e);
+    setLoadBanner(null);
   });
+}
+// outlines first, map second — whatever happened to the outlines
+loadCoverage().then(loadStudy, loadStudy);
 
 // SSE runs for saved studies too: it carries nav fixes and status flips
 // (e.g. a daemon starting on this study while the page is open).
@@ -1549,7 +2684,7 @@ function openSSE() {
     // Merged target list rides every tick — a flag or found-mark synced in
     // from the other unit appears without a reload. setTargets no-ops when
     // nothing changed, so this costs a string compare per tick.
-    if (d.targets) setTargets(d.targets);
+    if (d.targets) setTargets(d.targets, d.sets);
   };
   es.onerror = () => {
     // Transport drops auto-reconnect (resuming via Last-Event-ID). A non-200

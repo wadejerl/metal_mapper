@@ -1,11 +1,21 @@
 # Template — install_pi_system.sh renders this to /etc/systemd/system/jlw_rover_outfeed_nav.service,
-# filling the @MM_*@ placeholders from the checkout and install.conf.
+# gnssserver comes from the venv the installer builds from requirements.txt.
 [Unit]
 Description=Rover service to send the gps nav data
 After=multi-user.target
+# A head unit without this GPS (a bench Pi, a nav GPS unplugged at boot)
+# skips the unit instead of failing it. Without the condition gnssserver
+# died on the missing port, Restart= relaunched it every 2 s until
+# systemd's start-rate limit parked it in 'failed' — a red dot on the
+# landing page for good, and boot-time CPU/SD churn under the kiosk's
+# first render. Checked at boot and on a manual start only: systemd does
+# not re-check conditions on Restart= relaunches, so a USB re-enumeration
+# mid-survey behaves as before; a GPS plugged in after boot needs
+# `systemctl start jlw_rover_outfeed_nav` (or a reboot).
+ConditionPathExists=/dev/ttyUSB0
 
 [Service]
-ExecStart=@MM_HOME@/pygpsclient/bin/gnssserver -I /dev/ttyUSB0 --baudrate 460800 --outport 50010 --verbosity 1
+ExecStart=/opt/metal_mapper/venv/bin/gnssserver -I /dev/ttyUSB0 --baudrate 460800 --outport 50010 --verbosity 1
 Restart=always
 RestartSec=2
 

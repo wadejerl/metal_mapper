@@ -3,5 +3,8 @@ pyserial>=3.5
 flask>=2.3.0
 gunicorn>=21.0.0
 
-# Base Pi only (rtkbase/base_station.py, run by hand in its own venv):
-# pyserial, pynmeagps, pygnssutils (gnssserver)
+# GNSS plumbing the jlw_rover_* units run from this venv: gnssserver
+# (nav GPS -> TCP :50010 for db_map) and gnssntripclient (RTK corrections
+# from the base station into each GPS). Brings pynmeagps/pyubx2/pyrtcm
+# along. The same package rtkbase/base_station.py needs on the base Pi.
+pygnssutils>=1.1
